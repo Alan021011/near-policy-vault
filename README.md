@@ -19,7 +19,7 @@ An NFT that **owns an account on another chain** and can only move its funds und
 | Threat model | Written and approved by the author (design stage) |
 | EIP-1559 signing hash and RLP encoder (`contract/src/evm.rs`) | Compiles; 9 unit tests pass; matches viem on 19 golden vectors (negative control checked) |
 | Chain Signatures on testnet (`scripts/a1-prepare.mjs`, `a1-verify.mjs`) | `sign` called from a NEAR account with a 1 yoctoNEAR deposit; returned signature recovers the derived address (checked with viem). **Broadcast to Sepolia and confirmed** (tx 0xfe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1, block 12064522, status success; `scripts/a1-broadcast.mjs`). Called from a NEAR account, not yet from a contract |
-| NFT base contract, NEP-171/177/178/181 (`contract/src/lib.rs`) | Anyone mints a vault for themselves; path `vault-<id>`; transfer clears approvals. 13 unit tests pass, negative control checked. Compiles to wasm (207,668 bytes). **Not deployed yet** |
+| NFT base contract, NEP-171/177/178/181 (`contract/src/lib.rs`) | Anyone mints a vault for themselves; path `vault-<id>`; transfer clears approvals. 13 unit tests pass, negative control checked. Deployed on testnet at `m3.alan-vault-2026.testnet`: mint, NEP-171 events, transfer and rejection of a non-owner checked on the live network. Vault 0 controls EVM address `0xb4bbbae0c0e057f0d85233d9394088e449d5b843` (derived, unfunded). The deployer key can still replace the code (threat 9) |
 | Policy, proposals, MPC integration from the contract, two-phase sale | Not started |
 | Web page, attack suite | Not started |
 
