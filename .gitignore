@@ -1,0 +1,13 @@
+# Rust
+target/
+# Node
+node_modules/
+# Secrets: never commit keys, seed phrases or credentials
+.env
+.env.*
+*.pem
+*.key
+.near-credentials/
+# Local data
+*.log
+scripts/a1-tx.json

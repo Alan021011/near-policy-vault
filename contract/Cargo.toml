@@ -1,0 +1,13 @@
+[package]
+name = "policy-vault"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Dependencies are added with `cargo add` once the author approves the downloads
+# (expected: near-sdk, near-contract-standards, sha3, hex).
+[dependencies]
+sha3 = "0.12.0"
