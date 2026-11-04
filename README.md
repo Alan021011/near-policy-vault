@@ -19,7 +19,8 @@ An NFT that **owns an account on another chain** and can only move its funds und
 | Threat model | Written and approved by the author (design stage) |
 | EIP-1559 signing hash and RLP encoder (`contract/src/evm.rs`) | Compiles; 9 unit tests pass; matches viem on 19 golden vectors (negative control checked) |
 | Chain Signatures on testnet (`scripts/a1-prepare.mjs`, `a1-verify.mjs`) | `sign` called from a NEAR account with a 1 yoctoNEAR deposit; returned signature recovers the derived address (checked with viem). **Broadcast to Sepolia and confirmed** (tx 0xfe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1, block 12064522, status success; `scripts/a1-broadcast.mjs`). Called from a NEAR account, not yet from a contract |
-| NFT contract, policy, MPC integration | Not started |
+| NFT base contract, NEP-171/177/178/181 (`contract/src/lib.rs`) | Anyone mints a vault for themselves; path `vault-<id>`; transfer clears approvals. 13 unit tests pass, negative control checked. Compiles to wasm (207,668 bytes). **Not deployed yet** |
+| Policy, proposals, MPC integration from the contract, two-phase sale | Not started |
 | Web page, attack suite | Not started |
 
 ## How to verify (will be filled in as pieces land)
@@ -31,7 +32,11 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
    Expect: `wrote 19 vectors to .../vectors/eip1559_signing_hash.tsv`.
 2. Run the Rust tests:
    `cd contract && cargo test`
-   Expect: 9 unit tests and the `rust_signing_hash_matches_viem` test pass. If you change one character in a vector, that test fails with the case name.
+   Expect: 22 unit tests (9 EVM helpers, 13 NFT) and the `rust_signing_hash_matches_viem` test pass.
+   On Windows, `contract/.cargo/config.toml` sets `AWS_LC_SYS_PREBUILT_NASM=1` so NASM is not needed. If you change one character in a vector, that test fails with the case name.
+3. Build the contract:
+   `cd contract && cargo near build non-reproducible-wasm --no-abi`
+   Expect: `policy_vault.wasm` is produced (ABI generation is skipped because it fails on Windows hosts).
 
 ## Known limits
 
