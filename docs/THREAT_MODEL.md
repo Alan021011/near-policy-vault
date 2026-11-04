@@ -25,7 +25,7 @@ The contract stores the transaction fields (chain id, nonce, fees, gas limit, de
 | 6 | Race on the daily cap | Reserve the amount when proposing; release it on veto, cancel or invalidation | Planned |
 | 7 | Permissions the seller left on the external chain | Only approvals to allowed spenders with a finite amount can ever be signed; the signing history is public so a buyer can audit it | Partial |
 | 8 | Trust in the MPC network | Not solved; declared | Residual |
-| 9 | Whoever controls the contract account can change the contract | Deploy to an account with no upgrade keys (decision pending) and declare it | Pending |
+| 9 | Whoever controls the contract account can change the contract | Today the deployer keeps a full-access key (used for `migrate`). Before submission: delete it and show "0 full access keys"; declared in the README | Pending (documented) |
 | 10 | Stuck nonce or missing gas on the external chain | Documented; the cancel transaction in threat 1 helps | Residual |
 | 11 | EIP-7702 authorizations or message signatures obtained from the contract | The contract never builds them | Planned |
 | 12 | Replay across chains | `chain_id` is inside the hash; one derivation path per chain | Planned |

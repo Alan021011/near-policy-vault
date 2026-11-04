@@ -1,0 +1,21 @@
+[package]
+name = "test-receiver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Test helper only: a minimal NFT receiver used to exercise nft_transfer_call on testnet.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-contract-standards = "5.30.0"
+near-sdk = "5.30.0"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
