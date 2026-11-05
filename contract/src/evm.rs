@@ -133,6 +133,30 @@ impl Eip1559Tx {
     }
 }
 
+/// Chain id of a raw signed EIP-1559 transaction (`0x02 || rlp([chain_id, ...])`): reads only
+/// the first item of the list. `None` if the bytes are not a well-formed type-2 transaction head.
+pub fn chain_id_of_signed(raw: &[u8]) -> Option<u64> {
+    if raw.first() != Some(&0x02) {
+        return None;
+    }
+    let header = *raw.get(1)?;
+    let start = match header {
+        0xc0..=0xf7 => 2,
+        0xf8..=0xff => 2 + (header - 0xf7) as usize,
+        _ => return None,
+    };
+    let first = *raw.get(start)?;
+    match first {
+        0x00..=0x7f => Some(first as u64),
+        0x80..=0x88 => {
+            let len = (first - 0x80) as usize;
+            let bytes = raw.get(start + 1..start + 1 + len)?;
+            Some(bytes.iter().fold(0u64, |acc, b| (acc << 8) | *b as u64))
+        }
+        _ => None,
+    }
+}
+
 fn strip_leading_zeros(b: &[u8]) -> &[u8] {
     let first = b.iter().position(|x| *x != 0).unwrap_or(b.len());
     &b[first..]
@@ -322,6 +346,22 @@ mod tests {
             "fe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1",
             "the Ethereum transaction hash seen on Sepolia"
         );
+    }
+
+    #[test]
+    fn chain_id_is_read_from_a_signed_transaction() {
+        let a1 = hex32("881294c1b52d631ab43fa2bd23d691209b548d11000000000000000000000000");
+        let mut to = [0u8; 20];
+        to.copy_from_slice(&a1[..20]);
+        let mut tx = sample_tx();
+        tx.to = to;
+        for chain in [1u64, 127, 128, 11155111, 560048, u64::MAX] {
+            tx.chain_id = chain;
+            let raw = tx.rlp_signed(1, &[0x11; 32], &[0x22; 32]);
+            assert_eq!(chain_id_of_signed(&raw), Some(chain), "chain {chain}");
+        }
+        assert_eq!(chain_id_of_signed(&[0x01, 0xc0]), None, "not type 2");
+        assert_eq!(chain_id_of_signed(&[0x02]), None, "truncated");
     }
 
     #[test]

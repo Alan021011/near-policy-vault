@@ -236,6 +236,7 @@ enum StorageKey {
     SignedVersions,
     Uncertain,
     Pinned,
+    VaultChain,
 }
 
 /// Fixed-size record (same storage whether resolved or not, so it is paid in full at mint).
@@ -343,11 +344,15 @@ pub struct PolicyVault {
     /// M7 review S3: proposal id -> the nonce it must be signed with (a retry after an uncertain
     /// outcome produces the identical transaction, so it can never be paid twice).
     pinned: LookupMap<u64, u64>,
+    /// General review G2: the EVM chain a vault has signed for. Its nonce counter belongs to that
+    /// chain, so the policy can never move to another one. Survives a sale. Vaults that signed
+    /// before this field existed get their chain from their signed history.
+    vault_chain: LookupMap<TokenId, u64>,
 }
 
-/// State layout deployed for M7 (commit f7e4716), used only by `migrate`.
+/// State layout deployed for the M7 review fixes (commit a00bed7), used only by `migrate`.
 #[near(serializers = [borsh])]
-struct PolicyVaultV6 {
+struct PolicyVaultV7 {
     tokens: NonFungibleToken,
     metadata: LazyOption<NFTContractMetadata>,
     next_token_id: u64,
@@ -359,6 +364,9 @@ struct PolicyVaultV6 {
     next_proposal_id: u64,
     inflight: LookupMap<TokenId, InFlight>,
     signed: LookupMap<String, SignedRecord>,
+    signed_versions: LookupMap<String, u32>,
+    uncertain: LookupMap<TokenId, Vec<UncertainNonce>>,
+    pinned: LookupMap<u64, u64>,
 }
 
 fn signed_key(token_id: &str, nonce: u64) -> String {
@@ -551,17 +559,16 @@ impl PolicyVault {
             signed_versions: LookupMap::new(StorageKey::SignedVersions),
             uncertain: LookupMap::new(StorageKey::Uncertain),
             pinned: LookupMap::new(StorageKey::Pinned),
+            vault_chain: LookupMap::new(StorageKey::VaultChain),
         }
     }
 
-    /// Upgrades the state written by the M7 deployment. Only the contract account can call it.
-    /// Calling it on the current layout fails, because the old layout no longer parses.
-    /// `InFlight` changed shape, so this is only safe when no vault has a signature in flight
-    /// (checked before deploying). Stored `SignedRecord`s keep their shape and stay readable.
+    /// Upgrades the state written by the M7-review deployment. Only the contract account can
+    /// call it. Calling it on the current layout fails, because the old layout no longer parses.
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: PolicyVaultV6 = env::state_read().expect("no V6 state to migrate");
+        let old: PolicyVaultV7 = env::state_read().expect("no V7 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
@@ -574,9 +581,10 @@ impl PolicyVault {
             next_proposal_id: old.next_proposal_id,
             inflight: old.inflight,
             signed: old.signed,
-            signed_versions: LookupMap::new(StorageKey::SignedVersions),
-            uncertain: LookupMap::new(StorageKey::Uncertain),
-            pinned: LookupMap::new(StorageKey::Pinned),
+            signed_versions: old.signed_versions,
+            uncertain: old.uncertain,
+            pinned: old.pinned,
+            vault_chain: LookupMap::new(StorageKey::VaultChain),
         }
     }
 
@@ -817,6 +825,7 @@ impl PolicyVault {
         );
         let owner = self.assert_owner(&token_id);
         let new = policy.normalized().unwrap_or_else(|e| env::panic_str(&e.to_string()));
+        self.assert_chain_allowed(&token_id, new.chain_id);
         let before = env::storage_usage();
         let mut st = self.policy_state(&token_id);
         let now = env::block_timestamp_ms();
@@ -853,6 +862,8 @@ impl PolicyVault {
         let mut st = self.policies.get(&token_id).unwrap_or_else(|| env::panic_str("No pending policy"));
         let pending = st.pending.take().unwrap_or_else(|| env::panic_str("No pending policy"));
         require!(env::block_timestamp_ms() >= pending.apply_after_ms, "Pending policy not ready yet");
+        // A change queued before the vault's first signature may name another chain.
+        self.assert_chain_allowed(&token_id, pending.policy.chain_id);
         st.policy = pending.policy;
         st.spend.prune_expired(env::block_timestamp_ms());
         self.policies.insert(&token_id, &st);
@@ -1242,6 +1253,13 @@ impl PolicyVault {
         self.inflight.get(&token_id)
     }
 
+    /// The EVM chain this vault has signed for (`None` if it never signed). Its policy can only
+    /// use this chain, also after a sale (general review G2).
+    pub fn get_vault_chain(&self, token_id: TokenId) -> Option<u64> {
+        require_token_exists(&self.tokens, &token_id);
+        self.vault_chain_of(&token_id)
+    }
+
     /// Nonces of a vault whose signature outcome is unknown.
     pub fn get_uncertain(&self, token_id: TokenId) -> Vec<UncertainNonce> {
         require_token_exists(&self.tokens, &token_id);
@@ -1275,6 +1293,30 @@ impl PolicyVault {
 }
 
 impl PolicyVault {
+    /// The chain the vault's nonce counter belongs to: recorded at the first signature, or, for
+    /// vaults that signed before it was recorded, read from their oldest signed transaction.
+    fn vault_chain_of(&self, token_id: &TokenId) -> Option<u64> {
+        if let Some(c) = self.vault_chain.get(token_id) {
+            return Some(c);
+        }
+        let next = self.nonces.get(token_id).unwrap_or(0);
+        (0..next).find_map(|n| {
+            self.signed_versions_of(token_id, n)
+                .first()
+                .and_then(|r| policy::parse_hex(&r.signed_tx))
+                .and_then(|raw| evm::chain_id_of_signed(&raw))
+        })
+    }
+
+    fn assert_chain_allowed(&self, token_id: &TokenId, chain_id: u64) {
+        if let Some(c) = self.vault_chain_of(token_id) {
+            require!(
+                chain_id == c,
+                format!("This vault has signed on chain {c}; its policy must keep chain_id {c}")
+            );
+        }
+    }
+
     fn assert_can_sign(&self, token_id: &TokenId) {
         require!(
             env::prepaid_gas() >= MIN_PREPAID_GAS_FOR_SIGNING,
@@ -1290,6 +1332,10 @@ impl PolicyVault {
     /// Records the signature in flight, settles the storage deposit and calls the signer.
     fn start_signing(&mut self, token_id: &TokenId, f: InFlight, before: u64, sign_deposit: Option<U128>) -> Promise {
         let deposit = sign_deposit.map(|d| NearToken::from_yoctonear(d.0)).unwrap_or(SIGN_DEPOSIT);
+        // G2: the first signature fixes the vault's chain (its nonce counter belongs to it).
+        if self.vault_chain.get(token_id).is_none() {
+            self.vault_chain.insert(token_id, &f.tx.chain_id);
+        }
         self.inflight.insert(token_id, &f);
         // Storage: whatever this call added, plus the record the callback will write.
         let added = env::storage_usage().saturating_sub(before) + SIGNED_RECORD_RESERVE_BYTES;
@@ -3234,6 +3280,78 @@ mod tests {
         let id = propose_as(&mut c, &alice, 1, T0_MS + 10);
         ctx_at(alice, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
         let _ = c.execute_proposal("0".into(), id, None, None);
+    }
+
+    // ---------- general review G2: a vault keeps the chain it signed for ----------
+
+    fn mainnet_policy() -> Policy {
+        let mut p = test_policy(100_000_000_000_000_000);
+        p.chain_id = 1;
+        p.allowed_destinations = vec![A1_ADDR.into()];
+        p
+    }
+
+    #[test]
+    fn the_first_signature_fixes_the_vault_chain() {
+        let (mut c, _, id) = ready_a1_proposal();
+        assert_eq!(c.get_vault_chain("0".into()), None, "nothing signed yet");
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert_eq!(c.get_vault_chain("0".into()), Some(11155111), "fixed when signing starts");
+    }
+
+    #[test]
+    #[should_panic(expected = "This vault has signed on chain 11155111; its policy must keep chain_id 11155111")]
+    fn after_signing_the_policy_cannot_move_to_another_chain() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 100 + HOUR_MS);
+        c.set_policy("0".into(), mainnet_policy());
+    }
+
+    #[test]
+    #[should_panic(expected = "This vault has signed on chain 11155111")]
+    fn a_pending_change_to_another_chain_cannot_apply_after_signing() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 20);
+        assert!(!c.set_policy("0".into(), mainnet_policy()), "queued before any signature");
+        ctx_at(alice.clone(), EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 20 + HOUR_MS);
+        c.apply_policy("0".into());
+    }
+
+    #[test]
+    #[should_panic(expected = "This vault has signed on chain 11155111")]
+    fn the_chain_survives_a_sale() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        ctx_at(alice, ONE_YOCTO, T0_MS + 100 + HOUR_MS);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+        ctx_at(accounts(2), POLICY_DEPOSIT, T0_MS + 101 + HOUR_MS);
+        c.set_policy("0".into(), mainnet_policy()); // the buyer's first policy, other chain
+    }
+
+    #[test]
+    fn the_buyer_can_set_a_policy_on_the_same_chain() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        ctx_at(alice, ONE_YOCTO, T0_MS + 100 + HOUR_MS);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+        ctx_at(accounts(2), POLICY_DEPOSIT, T0_MS + 101 + HOUR_MS);
+        assert!(c.set_policy("0".into(), test_policy(1)));
+    }
+
+    #[test]
+    fn vaults_that_signed_before_the_lock_read_their_chain_from_history() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        c.vault_chain.remove(&"0".to_string()); // as if signed before this field existed
+        assert_eq!(c.get_vault_chain("0".into()), Some(11155111));
     }
 
     #[test]

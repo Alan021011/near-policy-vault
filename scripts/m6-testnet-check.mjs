@@ -30,13 +30,22 @@ const check = (name, ok, detail = '') => {
   if (!ok) failures++;
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function view(method, args) {
-  const j = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'query', params: { request_type: 'call_function',
-      finality: 'final', account_id: VAULT, method_name: method,
-      args_base64: Buffer.from(JSON.stringify(args)).toString('base64') } }) }).then((r) => r.json());
-  if (j.error) throw new Error(JSON.stringify(j.error));
-  return JSON.parse(Buffer.from(j.result.result).toString());
+// The public RPC rate-limits bursts, so retry with growing waits.
+async function view(method, args, attempt = 1) {
+  try {
+    const res = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'query', params: { request_type: 'call_function',
+        finality: 'final', account_id: VAULT, method_name: method,
+        args_base64: Buffer.from(JSON.stringify(args)).toString('base64') } }) });
+    if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`);
+    const j = await res.json();
+    if (j.error) throw new Error(JSON.stringify(j.error));
+    return JSON.parse(Buffer.from(j.result.result).toString());
+  } catch (e) {
+    if (attempt >= 5) throw e;
+    await sleep(2000 * attempt);
+    return view(method, args, attempt + 1);
+  }
 }
 function call(signer, method, args, deposit) {
   const p = spawnSync(NEAR, ['contract', 'call-function', 'as-transaction', VAULT, method,

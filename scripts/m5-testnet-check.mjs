@@ -36,11 +36,20 @@ const check = (name, ok, detail = '') => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function rpc(method, params) {
-  const j = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }).then((r) => r.json());
-  if (j.error) throw new Error(`${method}: ${JSON.stringify(j.error)}`);
-  return j.result;
+// The public RPC rate-limits bursts, so retry with growing waits.
+async function rpc(method, params, attempt = 1) {
+  try {
+    const res = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+    if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`);
+    const j = await res.json();
+    if (j.error) throw new Error(`${method}: ${JSON.stringify(j.error)}`);
+    return j.result;
+  } catch (e) {
+    if (attempt >= 5) throw e;
+    await new Promise((r) => setTimeout(r, 2000 * attempt));
+    return rpc(method, params, attempt + 1);
+  }
 }
 async function view(method, args) {
   const r = await rpc('query', { request_type: 'call_function', finality: 'final', account_id: VAULT,
