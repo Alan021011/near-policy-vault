@@ -45,7 +45,7 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
    `cd scripts && node m4-testnet-check.mjs <owner>.testnet <vault-contract>.testnet`
    Expect: one `PASS` per vault comparing `vault_info` with an independent derivation (signer query + viem), the private-callback attack rejected, and `ALL CHECKS PASSED`.
 6. Check that the deployed code is this repository's code: compare the SHA-256 printed by step 3 with the `code_hash` of the contract account (`near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now`, or the RPC `view_account`, which gives it in base58).
-   On 2026-11-05 a fresh clone built `01b4939ad8c96fcaa17a5621375b64980bc684786423e154a7a391196587b88b`, identical to the deployed `code_hash`. This was on the author's machine and toolchain (Rust 1.99.1, cargo-near 0.22.0); a byte-identical build on any machine needs `cargo near build reproducible-wasm` (Docker), planned before submission.
+   The contract currently deployed (M4) has SHA-256 `0bfe0217748dd0cc77d49e1fb64940fb5896e1b1977cba380bc4744c72ea9463`, equal to the local build of the M4 commit. On 2026-11-05 a fresh clone of the previous commit also built byte-identical to what was deployed then (`01b4939a…`). Both were on the author's machine and toolchain (Rust 1.99.1, cargo-near 0.22.0); a byte-identical build on any machine needs `cargo near build reproducible-wasm` (Docker), planned before submission.
 
 ## Known limits
 
