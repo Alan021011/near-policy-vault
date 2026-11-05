@@ -92,6 +92,7 @@ enum StorageKey {
     TransferInfo,
     Vaults,
     Policies,
+    Nonces,
 }
 
 /// Fixed-size record (same storage whether resolved or not, so it is paid in full at mint).
@@ -182,17 +183,23 @@ pub struct PolicyVault {
     signer_id: AccountId,
     vaults: LookupMap<TokenId, VaultRecord>,
     policies: LookupMap<TokenId, VaultPolicyState>,
+    /// M6: next EVM nonce of each vault's account. Never reset on a sale: it belongs to the
+    /// external account, not to the owner. Absent means 0.
+    nonces: LookupMap<TokenId, u64>,
+    /// M6: proposal ids are unique across all vaults and owners.
+    next_proposal_id: u64,
 }
 
-/// State layout deployed for M4 (commit 5e31617), used only by `migrate`.
+/// State layout deployed for M5 (commit fc15205), used only by `migrate`.
 #[near(serializers = [borsh])]
-struct PolicyVaultV3 {
+struct PolicyVaultV4 {
     tokens: NonFungibleToken,
     metadata: LazyOption<NFTContractMetadata>,
     next_token_id: u64,
     transfer_info: LookupMap<TokenId, TransferInfo>,
     signer_id: AccountId,
     vaults: LookupMap<TokenId, VaultRecord>,
+    policies: LookupMap<TokenId, VaultPolicyState>,
 }
 
 // ---------- M5: policy state, inputs and views ----------
@@ -212,6 +219,67 @@ pub struct VaultPolicyState {
     pub policy: Policy,
     pub pending: Option<PendingPolicy>,
     pub spend: SpendState,
+    /// M6: queued transactions, oldest first. Lives here so a change of owner clears it too.
+    pub proposals: Vec<Proposal>,
+}
+
+// ---------- M6: proposals ----------
+
+/// Most proposals a vault may have queued at once.
+pub const MAX_QUEUED_PROPOSALS: usize = 8;
+
+/// A transaction as proposed: everything but the nonce, which is assigned when it is signed so
+/// that cancelled proposals never leave gaps in the external account's nonces.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalTx {
+    pub chain_id: u64,
+    pub max_priority_fee_per_gas: U128,
+    pub max_fee_per_gas: U128,
+    pub gas_limit: u64,
+    pub to: String,
+    pub value: U128,
+    pub data: String,
+}
+
+impl ProposalTx {
+    pub fn to_tx(&self, nonce: u64) -> Result<Eip1559Tx, String> {
+        TxInput {
+            chain_id: self.chain_id,
+            nonce,
+            max_priority_fee_per_gas: self.max_priority_fee_per_gas,
+            max_fee_per_gas: self.max_fee_per_gas,
+            gas_limit: self.gas_limit,
+            to: self.to.clone(),
+            value: self.value,
+            data: self.data.clone(),
+        }
+        .to_tx()
+    }
+}
+
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    pub id: u64,
+    /// Ownership changes of the vault when it was proposed (`vault_transfer_info.count`).
+    pub owner_epoch: u64,
+    pub tx: ProposalTx,
+    /// What it holds from the daily caps until it is cancelled, vetoed or signed.
+    pub reservation: Reservation,
+    pub created_ms: u64,
+    pub executable_after_ms: u64,
+}
+
+/// Whether a queued proposal could be signed now, and exactly what would be signed.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionCheck {
+    pub ready: bool,
+    pub reason: Option<String>,
+    /// The nonce it would get (the vault's next nonce).
+    pub nonce: u64,
+    pub signing_hash: Option<String>,
 }
 
 #[near(serializers = [json])]
@@ -305,16 +373,19 @@ impl PolicyVault {
             signer_id,
             vaults: LookupMap::new(StorageKey::Vaults),
             policies: LookupMap::new(StorageKey::Policies),
+            nonces: LookupMap::new(StorageKey::Nonces),
+            next_proposal_id: 0,
         }
     }
 
-    /// Upgrades the state written by the M4 deployment. Only the contract account can call it.
+    /// Upgrades the state written by the M5 deployment. Only the contract account can call it.
     /// Calling it on the current layout fails, because the old layout no longer parses.
-    /// Existing vaults start without a policy, that is, locked.
+    /// The stored policy entries gain a `proposals` field, so this is only safe if no vault has
+    /// a stored policy at migration time (checked before deploying; see the M6 notes).
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: PolicyVaultV3 = env::state_read().expect("no V3 state to migrate");
+        let old: PolicyVaultV4 = env::state_read().expect("no V4 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
@@ -322,7 +393,9 @@ impl PolicyVault {
             transfer_info: old.transfer_info,
             signer_id: old.signer_id,
             vaults: old.vaults,
-            policies: LookupMap::new(StorageKey::Policies),
+            policies: old.policies,
+            nonces: LookupMap::new(StorageKey::Nonces),
+            next_proposal_id: 0,
         }
     }
 
@@ -671,7 +744,158 @@ impl PolicyVault {
 }
 
 fn locked_state() -> VaultPolicyState {
-    VaultPolicyState { policy: Policy::locked(), pending: None, spend: SpendState::default() }
+    VaultPolicyState {
+        policy: Policy::locked(),
+        pending: None,
+        spend: SpendState::default(),
+        proposals: Vec::new(),
+    }
+}
+
+// ---------- M6: proposal entry points ----------
+
+#[near]
+impl PolicyVault {
+    /// Queues a transaction. Only the owner, with a deposit of at least 1 yoctoNEAR that also
+    /// covers the storage of the proposal. The transaction must pass the policy now; its spend
+    /// is reserved from the daily caps; it can be signed after the policy's delay (M7).
+    /// Returns the proposal id.
+    #[payable]
+    pub fn propose(&mut self, token_id: TokenId, tx: ProposalTx) -> u64 {
+        require!(
+            env::attached_deposit() >= NearToken::from_yoctonear(1),
+            "Requires attached deposit of at least 1 yoctoNEAR"
+        );
+        let owner = self.assert_owner(&token_id);
+        let before = env::storage_usage();
+        let mut st = self
+            .policies
+            .get(&token_id)
+            .unwrap_or_else(|| env::panic_str("vault has no policy (locked)"));
+        require!(st.proposals.len() < MAX_QUEUED_PROPOSALS, "Too many queued proposals");
+        // The nonce does not take part in the policy; 0 is a placeholder.
+        let candidate = tx.to_tx(0).unwrap_or_else(|e| env::panic_str(&e));
+        let now = env::block_timestamp_ms();
+        let reservation = policy::check(&st.policy, &st.spend, &candidate, now)
+            .unwrap_or_else(|e| env::panic_str(&e.to_string()));
+        st.spend.reserve(&reservation, now);
+        let id = self.next_proposal_id;
+        self.next_proposal_id += 1;
+        let executable_after_ms = now.saturating_add(st.policy.delay_ms);
+        st.proposals.push(Proposal {
+            id,
+            owner_epoch: self.owner_epoch(&token_id),
+            tx,
+            reservation,
+            created_ms: now,
+            executable_after_ms,
+        });
+        self.policies.insert(&token_id, &st);
+        settle_storage(before, &owner);
+        emit_policy_event(
+            "proposal_created",
+            &token_id,
+            json!({ "proposal_id": id, "executable_after_ms": executable_after_ms }),
+        );
+        id
+    }
+
+    /// The owner withdraws a queued proposal; its reservation is released.
+    #[payable]
+    pub fn cancel_proposal(&mut self, token_id: TokenId, proposal_id: u64) {
+        assert_one_yocto();
+        let owner = self.assert_owner(&token_id);
+        self.remove_proposal(&token_id, proposal_id, &owner);
+        emit_policy_event("proposal_cancelled", &token_id, json!({ "proposal_id": proposal_id }));
+    }
+
+    /// The guardian of the policy in force vetoes a queued proposal; its reservation is released.
+    #[payable]
+    pub fn veto_proposal(&mut self, token_id: TokenId, proposal_id: u64) {
+        assert_one_yocto();
+        let owner = self.owner_of(&token_id);
+        let st = self.policies.get(&token_id).unwrap_or_else(|| env::panic_str("Proposal not found"));
+        require!(
+            st.policy.guardian.as_ref() == Some(&env::predecessor_account_id()),
+            "Only the guardian can veto"
+        );
+        self.remove_proposal(&token_id, proposal_id, &owner);
+        emit_policy_event(
+            "proposal_vetoed",
+            &token_id,
+            json!({ "proposal_id": proposal_id, "guardian": env::predecessor_account_id() }),
+        );
+    }
+
+    pub fn list_proposals(&self, token_id: TokenId) -> Vec<Proposal> {
+        require_token_exists(&self.tokens, &token_id);
+        self.policies.get(&token_id).map(|s| s.proposals).unwrap_or_default()
+    }
+
+    /// The nonce the vault's next signed transaction will carry.
+    pub fn get_next_nonce(&self, token_id: TokenId) -> u64 {
+        require_token_exists(&self.tokens, &token_id);
+        self.nonces.get(&token_id).unwrap_or(0)
+    }
+
+    /// Could this proposal be signed now? Read-only; M7's `execute` runs the same checks.
+    pub fn check_execution(&self, token_id: TokenId, proposal_id: u64) -> ExecutionCheck {
+        require_token_exists(&self.tokens, &token_id);
+        let nonce = self.nonces.get(&token_id).unwrap_or(0);
+        match self.prepare_execution(&token_id, proposal_id, env::block_timestamp_ms()) {
+            Ok(tx) => ExecutionCheck {
+                ready: true,
+                reason: None,
+                nonce,
+                signing_hash: Some(hex0x(&tx.signing_hash())),
+            },
+            Err(reason) => ExecutionCheck { ready: false, reason: Some(reason), nonce, signing_hash: None },
+        }
+    }
+}
+
+impl PolicyVault {
+    /// Owner epoch: how many times the vault has changed owner. A proposal is only valid for
+    /// the epoch it was made in (defense in depth: the queue is also cleared on every change).
+    fn owner_epoch(&self, token_id: &TokenId) -> u64 {
+        self.transfer_info.get(token_id).map(|i| i.count).unwrap_or(0)
+    }
+
+    fn remove_proposal(&mut self, token_id: &TokenId, proposal_id: u64, owner: &AccountId) -> Proposal {
+        let before = env::storage_usage();
+        let mut st = self.policies.get(token_id).unwrap_or_else(|| env::panic_str("Proposal not found"));
+        let i = st
+            .proposals
+            .iter()
+            .position(|p| p.id == proposal_id)
+            .unwrap_or_else(|| env::panic_str("Proposal not found"));
+        let p = st.proposals.remove(i);
+        st.spend.release(&p.reservation);
+        self.policies.insert(token_id, &st);
+        settle_storage(before, owner);
+        p
+    }
+
+    /// The transaction that would be signed for a proposal at `now_ms`, with the vault's next
+    /// nonce, or why not. Checks: the proposal exists, it belongs to the current owner epoch,
+    /// its delay has passed, and it still passes the policy in force (tightened since?) with
+    /// its own reservation given back first.
+    fn prepare_execution(&self, token_id: &TokenId, proposal_id: u64, now_ms: u64) -> Result<Eip1559Tx, String> {
+        let st = self.policies.get(token_id).ok_or("Proposal not found")?;
+        let p = st.proposals.iter().find(|p| p.id == proposal_id).ok_or("Proposal not found")?;
+        if p.owner_epoch != self.owner_epoch(token_id) {
+            return Err("Proposal belongs to a previous owner".into());
+        }
+        if now_ms < p.executable_after_ms {
+            return Err("Proposal delay has not passed yet".into());
+        }
+        let nonce = self.nonces.get(token_id).unwrap_or(0);
+        let tx = p.tx.to_tx(nonce)?;
+        let mut spend = st.spend.clone();
+        spend.release(&p.reservation);
+        policy::check(&st.policy, &spend, &tx, now_ms).map_err(|e| format!("Policy now refuses it: {e}"))?;
+        Ok(tx)
+    }
 }
 
 fn emit_policy_event(event: &str, token_id: &TokenId, extra: near_sdk::serde_json::Value) {
@@ -1601,6 +1825,191 @@ mod tests {
         assert_eq!(c.nft_token("0".into()).unwrap().owner_id, alice);
         assert!(!c.get_policy("0".into()).has_policy, "the receiver's policy survived the return");
         assert!(transfers().iter().any(|(to, _)| *to == bob), "bob paid for that storage");
+    }
+
+    // ---------- M6: proposals ----------
+
+    const ONE_HUNDREDTH_ETH: u128 = 10_000_000_000_000_000;
+    const GAS_RESERVE: u128 = 20_000_000_000 * 21_000;
+
+    fn ptx(value: u128) -> ProposalTx {
+        let t = tx_input(value);
+        ProposalTx {
+            chain_id: t.chain_id,
+            max_priority_fee_per_gas: t.max_priority_fee_per_gas,
+            max_fee_per_gas: t.max_fee_per_gas,
+            gas_limit: t.gas_limit,
+            to: t.to,
+            value: t.value,
+            data: t.data,
+        }
+    }
+
+    fn propose_as(c: &mut PolicyVault, who: &AccountId, value: u128, ms: u64) -> u64 {
+        ctx_at(who.clone(), POLICY_DEPOSIT, ms);
+        c.propose("0".into(), ptx(value))
+    }
+
+    #[test]
+    fn propose_queues_and_reserves_the_spend() {
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 4 * ONE_HUNDREDTH_ETH, T0_MS + 10);
+        let q = c.list_proposals("0".into());
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, id);
+        assert_eq!(q[0].executable_after_ms, T0_MS + 10 + HOUR_MS);
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 4 * ONE_HUNDREDTH_ETH + GAS_RESERVE);
+        assert!(get_logs().iter().any(|l| l.contains("\"proposal_created\"")));
+    }
+
+    #[test]
+    fn proposal_ids_are_unique() {
+        let (mut c, alice) = vault_with_policy();
+        let a = propose_as(&mut c, &alice, 1, T0_MS + 10);
+        let b = propose_as(&mut c, &alice, 1, T0_MS + 11);
+        assert_eq!((a, b), (0, 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "vault has no policy (locked)")]
+    fn locked_vault_cannot_propose() {
+        let mut c = setup_with_vault(accounts(1));
+        propose_as(&mut c, &accounts(1), 1, T0_MS);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn stranger_cannot_propose() {
+        let (mut c, _) = vault_with_policy();
+        propose_as(&mut c, &accounts(3), 1, T0_MS + 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "destination not allowed")]
+    fn proposal_must_pass_the_policy() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        let mut t = ptx(1);
+        t.to = "0x2222222222222222222222222222222222222222".into();
+        c.propose("0".into(), t);
+    }
+
+    #[test]
+    #[should_panic(expected = "ETH daily cap exceeded")]
+    fn queued_proposals_hold_their_share_of_the_cap() {
+        let (mut c, alice) = vault_with_policy();
+        propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 10);
+        propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 11); // 0.12 > 0.1
+    }
+
+    #[test]
+    fn cancel_releases_the_reservation() {
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 10);
+        ctx_at(alice.clone(), ONE_YOCTO, T0_MS + 11);
+        c.cancel_proposal("0".into(), id);
+        assert!(c.list_proposals("0".into()).is_empty());
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 0);
+        propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 12); // fits again
+        assert!(transfers().is_empty() || transfers().iter().all(|(to, _)| *to == alice));
+    }
+
+    #[test]
+    fn guardian_veto_releases_the_reservation() {
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 10);
+        ctx_at(guardian(), ONE_YOCTO, T0_MS + 11);
+        c.veto_proposal("0".into(), id);
+        assert!(c.list_proposals("0".into()).is_empty());
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 0);
+        assert!(transfers().iter().any(|(to, _)| *to == alice), "freed storage goes to the owner");
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the guardian can veto")]
+    fn stranger_cannot_veto_a_proposal() {
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 1, T0_MS + 10);
+        ctx_at(accounts(3), ONE_YOCTO, T0_MS + 11);
+        c.veto_proposal("0".into(), id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn guardian_cannot_cancel_as_owner() {
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 1, T0_MS + 10);
+        ctx_at(guardian(), ONE_YOCTO, T0_MS + 11);
+        c.cancel_proposal("0".into(), id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal not found")]
+    fn cancel_of_unknown_proposal_fails() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, ONE_YOCTO, T0_MS + 11);
+        c.cancel_proposal("0".into(), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "Too many queued proposals")]
+    fn queue_is_bounded() {
+        let (mut c, alice) = vault_with_policy();
+        for i in 0..=MAX_QUEUED_PROPOSALS as u64 {
+            propose_as(&mut c, &alice, 1, T0_MS + 10 + i);
+        }
+    }
+
+    #[test]
+    fn execution_waits_the_delay_then_reports_nonce_and_hash() {
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 4 * ONE_HUNDREDTH_ETH, T0_MS + 10);
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS - 1);
+        let early = c.check_execution("0".into(), id);
+        assert!(!early.ready);
+        assert_eq!(early.reason.as_deref(), Some("Proposal delay has not passed yet"));
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS);
+        let ok = c.check_execution("0".into(), id);
+        assert!(ok.ready, "{ok:?}");
+        assert_eq!(ok.nonce, 0);
+        let expected = hex0x(&ptx(4 * ONE_HUNDREDTH_ETH).to_tx(0).unwrap().signing_hash());
+        assert_eq!(ok.signing_hash.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn tightening_the_policy_also_stops_queued_proposals() {
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 4 * ONE_HUNDREDTH_ETH, T0_MS + 10);
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 20);
+        assert!(c.set_policy("0".into(), test_policy(ONE_HUNDREDTH_ETH)), "lowering the cap applies at once");
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS);
+        let r = c.check_execution("0".into(), id);
+        assert!(!r.ready);
+        assert_eq!(r.reason.as_deref(), Some("Policy now refuses it: ETH daily cap exceeded"));
+    }
+
+    #[test]
+    fn proposal_from_a_previous_owner_epoch_is_refused() {
+        // The queue is cleared on every change of owner; this checks the second line of defense
+        // by moving the epoch while a proposal is still queued.
+        let (mut c, alice) = vault_with_policy();
+        let id = propose_as(&mut c, &alice, 1, T0_MS + 10);
+        let mut info = c.transfer_info.get(&"0".to_string()).unwrap_or_default();
+        info.count += 1;
+        c.transfer_info.insert(&"0".to_string(), &info);
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS);
+        let r = c.check_execution("0".into(), id);
+        assert_eq!(r.reason.as_deref(), Some("Proposal belongs to a previous owner"));
+    }
+
+    #[test]
+    fn transfer_clears_the_queue() {
+        let (mut c, alice) = vault_with_policy();
+        propose_as(&mut c, &alice, 1, T0_MS + 10);
+        ctx_at(alice, ONE_YOCTO, T0_MS + 20);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+        assert!(c.list_proposals("0".into()).is_empty());
+        assert_eq!(c.get_next_nonce("0".into()), 0);
     }
 
     #[test]

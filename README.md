@@ -1,6 +1,6 @@
 # near-policy-vault
 
-> **Status: work in progress.** The signing path (A1), the NFT base contract (M3) the per-vault EVM address (M4) and the spending policy (M5) run on testnet; the spending policy and the sale protection are not built yet.
+> **Status: work in progress.** The signing path (A1), the NFT base contract (M3) the per-vault EVM address (M4), the spending policy (M5) and the proposal queue (M6) run on testnet; the spending policy and the sale protection are not built yet.
 > Built for the NEAR HACKATHON 2026, track `nfts` (also aiming at `security` and `open` only if they work end to end).
 
 An NFT that **owns an account on another chain** and can only move its funds under a spending policy enforced by a NEAR contract.
@@ -22,7 +22,8 @@ An NFT that **owns an account on another chain** and can only move its funds und
 | NFT base contract, NEP-171/177/178/181 (`contract/src/lib.rs`) | Anyone mints a vault for themselves; path `vault-<id>`. 25 unit tests pass (negative controls checked). Deployed on testnet at `m3.alan-vault-2026.testnet` and upgraded in place with `migrate`. `scripts/m3-testnet-check.mjs` passes 16/16 live checks (approved transfers, `nft_transfer_call` kept / returned / receiver panic, approval refunds). Vault 0 has EVM address `0xb4bbbae0c0e057f0d85233d9394088e449d5b843` (derived, unfunded) |
 | Vault EVM address published by the contract (M4) | At mint the contract asks the Chain Signatures contract (`v1.signer-prod.testnet`) for `derived_public_key(vault-<id>, predecessor = contract, domain 0)`, checks the answer in a private callback and stores the key and the address; `vault_info` returns them. 11 unit tests (incl. the real testnet key of vault 0), negative control checked. `scripts/m4-testnet-check.mjs`: 12/12 live checks, every vault equals an independent derivation |
 | Spending policy (M5, `contract/src/policy.rs`) | Per vault: chain, ETH daily cap (value + worst-case gas), max gas cost, allowed destinations, allowed spenders, ERC-20 tokens with daily cap and **max approval**, delay and guardian. Loosening waits the delay and can be vetoed by the guardian; tightening applies at once; any change of owner deletes the policy. `check_transaction` returns allowed / reason / the exact signing hash. 29 unit tests, negative controls checked. `scripts/m5-testnet-check.mjs`: 22/22 live checks (signing hash equals viem) |
-| Proposals, MPC signing from the contract, two-phase sale | Not started |
+| Proposal queue (M6) | `propose` checks the policy and reserves the spend; the transaction waits the delay; the owner cancels or the guardian vetoes (reservation released); at most 8 queued. The EVM nonce is assigned at signing time, so cancelled proposals leave no gaps; `get_next_nonce` never resets on a sale. `check_execution` re-checks the current policy and the owner epoch and returns the exact hash to sign. 16 unit tests, negative controls checked. `scripts/m6-testnet-check.mjs`: 15/15 live checks |
+| MPC signing from the contract (M7), two-phase sale (M8) | Not started |
 | Web page, attack suite | Not started |
 
 ## How to verify (will be filled in as pieces land)
@@ -34,7 +35,7 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
    Expect: `wrote 19 vectors to .../vectors/eip1559_signing_hash.tsv` and `git status` shows no change (the committed vectors are reproduced exactly). `npm ci` installs the exact versions in `package-lock.json`.
 2. Run the Rust tests:
    `cd contract && cargo test`
-   Expect: 74 unit tests (9 EVM helpers, 11 policy, 54 contract) and `rust_signing_hash_matches_viem` pass. If you change one character in a vector, that test fails with the case name.
+   Expect: 90 unit tests (9 EVM helpers, 11 policy, 70 contract) and `rust_signing_hash_matches_viem` pass. If you change one character in a vector, that test fails with the case name.
    On Windows, `contract/.cargo/config.toml` sets `AWS_LC_SYS_PREBUILT_NASM=1` so NASM is not needed.
 3. Build the contract:
    `cd contract && cargo near build non-reproducible-wasm --no-abi`
@@ -48,8 +49,11 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
 6. Check the spending policy on testnet (about 2 minutes; the third account acts as guardian):
    `cd scripts && node m5-testnet-check.mjs <owner>.testnet <vault-contract>.testnet <guardian>.testnet`
    Expect: 22 `PASS` lines and `ALL CHECKS PASSED`.
-7. Check that the deployed code is this repository's code: compare the SHA-256 printed by step 3 with the `code_hash` of the contract account (`near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now`, or the RPC `view_account`, which gives it in base58).
-   The contract currently deployed (M5) has SHA-256 `275ed393f9a46c0e2485fb613345839dac057744c9588ed359c33768f75cb30c`, equal to the local build of the M5 commit. On 2026-11-05 a fresh clone of the previous commit also built byte-identical to what was deployed then (`01b4939a…`). Both were on the author's machine and toolchain (Rust 1.99.1, cargo-near 0.22.0); a byte-identical build on any machine needs `cargo near build reproducible-wasm` (Docker), planned before submission.
+7. Check the proposal queue on testnet (about 2 minutes):
+   `cd scripts && node m6-testnet-check.mjs <owner>.testnet <vault-contract>.testnet <guardian>.testnet`
+   Expect: 15 `PASS` lines and `ALL CHECKS PASSED`.
+8. Check that the deployed code is this repository's code: compare the SHA-256 printed by step 3 with the `code_hash` of the contract account (`near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now`, or the RPC `view_account`, which gives it in base58).
+   The contract currently deployed (M6) has SHA-256 `c4ecef5281fa91f698e5cb5a9e0fce302d7f8e49bab92bfe7ae6ae2b6fda7650`, equal to the local build of the M6 commit. On 2026-11-05 a fresh clone of the previous commit also built byte-identical to what was deployed then (`01b4939a…`). Both were on the author's machine and toolchain (Rust 1.99.1, cargo-near 0.22.0); a byte-identical build on any machine needs `cargo near build reproducible-wasm` (Docker), planned before submission.
 
 ## Known limits
 
