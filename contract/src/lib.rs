@@ -16,6 +16,16 @@
 //!   R4: the library keeps the storage deposit of cleared approvals; this contract refunds
 //!       it to the owner who paid it.
 //!
+//!
+//! Module M4: the contract learns each vault's EVM account from the signer itself.
+//! - At mint, the contract calls `derived_public_key(path, predecessor = this contract,
+//!   domain_id = 0)` on the Chain Signatures contract (`signer_id`, fixed at init) and, in a
+//!   private callback, checks the answer (prefix, base58, 64 bytes) and stores the key and
+//!   `keccak256(key)[12..]` as the vault's EVM address. Nobody has to trust an off-chain
+//!   script to know where a vault's funds live: `vault_info` returns it.
+//! - If that call fails (for example out of gas), the vault stays "unresolved" and anyone can
+//!   retry with `resolve_vault_address`. A resolved address is never overwritten.
+//!
 //! Not here yet: policy, proposals, MPC signing, two-phase sale.
 
 pub mod evm;
@@ -37,12 +47,33 @@ use near_sdk::collections::{LazyOption, LookupMap};
 use near_sdk::json_types::U128;
 use near_sdk::serde_json::json;
 use near_sdk::{
-    assert_one_yocto, env, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault,
-    Promise, PromiseOrValue,
+    assert_one_yocto, env, ext_contract, near, require, AccountId, BorshStorageKey, Gas,
+    NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue,
 };
+
+use crate::evm::keccak256;
 
 /// Prefix of the Chain Signatures derivation path of every vault.
 pub const VAULT_PATH_PREFIX: &str = "vault-";
+
+/// Chain Signatures domain of secp256k1 (the curve used by Ethereum).
+pub const SECP256K1_DOMAIN_ID: u64 = 0;
+
+/// Gas for the signer's `derived_public_key` view and for our callback.
+pub const GAS_FOR_DERIVE: Gas = Gas::from_tgas(15);
+pub const GAS_FOR_DERIVE_CALLBACK: Gas = Gas::from_tgas(10);
+
+/// The part of the Chain Signatures contract this contract uses in M4.
+#[ext_contract(ext_signer)]
+#[allow(dead_code)]
+trait ChainSignatures {
+    fn derived_public_key(
+        &self,
+        path: String,
+        predecessor: Option<AccountId>,
+        domain_id: Option<u64>,
+    ) -> String;
+}
 
 /// Storage reserved at mint for the largest possible transfer record of a token
 /// (two 64-char account ids, an optional third one, a kind label, two u64 and trie overhead).
@@ -57,6 +88,61 @@ enum StorageKey {
     Approval,
     ContractMetadata,
     TransferInfo,
+    Vaults,
+}
+
+/// Fixed-size record (same storage whether resolved or not, so it is paid in full at mint).
+#[near(serializers = [borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultRecord {
+    pub resolved: bool,
+    /// Uncompressed secp256k1 key without the 0x04 prefix: X (32 bytes) || Y (32 bytes).
+    pub public_key: [u8; 64],
+    pub evm_address: [u8; 20],
+}
+
+impl VaultRecord {
+    fn unresolved() -> Self {
+        Self { resolved: false, public_key: [0; 64], evm_address: [0; 20] }
+    }
+}
+
+/// What anyone can read about a vault.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultInfo {
+    pub token_id: TokenId,
+    pub path: String,
+    /// Chain Signatures contract that derives and signs for this vault.
+    pub signer_id: AccountId,
+    /// `None` until the signer's answer has been stored.
+    pub public_key: Option<String>,
+    /// Lowercase `0x…` address, the same on every EVM chain. `None` until resolved.
+    pub evm_address: Option<String>,
+}
+
+/// Parses the signer's answer: "secp256k1:<base58 of 64 bytes>".
+pub fn parse_secp256k1_key(s: &str) -> Option<[u8; 64]> {
+    let b58 = s.strip_prefix("secp256k1:")?;
+    let bytes = bs58::decode(b58).into_vec().ok()?;
+    bytes.try_into().ok()
+}
+
+/// Ethereum address of an uncompressed public key: last 20 bytes of keccak256(X || Y).
+pub fn evm_address_of(public_key: &[u8; 64]) -> [u8; 20] {
+    let h = keccak256(public_key);
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&h[12..]);
+    a
+}
+
+fn hex0x(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("0x");
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// The last ownership change of a vault, kept on-chain. The full history is in the
@@ -90,20 +176,25 @@ pub struct PolicyVault {
     metadata: LazyOption<NFTContractMetadata>,
     next_token_id: u64,
     transfer_info: LookupMap<TokenId, TransferInfo>,
+    signer_id: AccountId,
+    vaults: LookupMap<TokenId, VaultRecord>,
 }
 
-/// State layout of the first deployment (commit 5a4ad3c), used only by `migrate`.
+/// State layout deployed for the M3 review (commit 858e6e5), used only by `migrate`.
 #[near(serializers = [borsh])]
-struct PolicyVaultV1 {
+struct PolicyVaultV2 {
     tokens: NonFungibleToken,
     metadata: LazyOption<NFTContractMetadata>,
     next_token_id: u64,
+    transfer_info: LookupMap<TokenId, TransferInfo>,
 }
 
 #[near]
 impl PolicyVault {
+    /// `signer_id`: the Chain Signatures contract (`v1.signer-prod.testnet` on testnet,
+    /// `v1.signer` on mainnet). It cannot be changed afterwards without a code upgrade.
     #[init]
-    pub fn new() -> Self {
+    pub fn new(signer_id: AccountId) -> Self {
         let metadata = NFTContractMetadata {
             spec: NFT_METADATA_SPEC.to_string(),
             name: "NEAR Policy Vault".to_string(),
@@ -124,20 +215,25 @@ impl PolicyVault {
             metadata: LazyOption::new(StorageKey::ContractMetadata, Some(&metadata)),
             next_token_id: 0,
             transfer_info: LookupMap::new(StorageKey::TransferInfo),
+            signer_id,
+            vaults: LookupMap::new(StorageKey::Vaults),
         }
     }
 
-    /// Upgrades the state written by the first deployment. Only the contract account can call
-    /// it. Calling it on the current layout fails, because the old layout no longer parses.
+    /// Upgrades the state written by the M3-review deployment. Only the contract account can
+    /// call it. Calling it on the current layout fails, because the old layout no longer parses.
+    /// Vaults minted before this migration have no record; `resolve_vault_address` creates it.
     #[private]
     #[init(ignore_state)]
-    pub fn migrate() -> Self {
-        let old: PolicyVaultV1 = env::state_read().expect("no V1 state to migrate");
+    pub fn migrate(signer_id: AccountId) -> Self {
+        let old: PolicyVaultV2 = env::state_read().expect("no V2 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
             next_token_id: old.next_token_id,
-            transfer_info: LookupMap::new(StorageKey::TransferInfo),
+            transfer_info: old.transfer_info,
+            signer_id,
+            vaults: LookupMap::new(StorageKey::Vaults),
         }
     }
 
@@ -172,6 +268,8 @@ impl PolicyVault {
         let token =
             self.tokens.internal_mint_with_refund(token_id, owner_id.clone(), Some(metadata), None);
         self.transfer_info.insert(&token.token_id, &TransferInfo::default());
+        // Fixed-size placeholder, so the storage of the resolved record is charged now.
+        self.vaults.insert(&token.token_id, &VaultRecord::unresolved());
         NftMint { owner_id: &owner_id, token_ids: &[&token.token_id], memo: None }.emit();
 
         let storage_used = env::storage_usage() - initial_storage + TRANSFER_RECORD_RESERVE_BYTES;
@@ -185,7 +283,92 @@ impl PolicyVault {
         if refund > NearToken::from_yoctonear(1) {
             Promise::new(owner_id).transfer(refund).detach();
         }
+        self.request_derived_key(&token.token_id).detach();
         token
+    }
+
+    /// Everything public about a vault, including its EVM address once resolved.
+    pub fn vault_info(&self, token_id: TokenId) -> VaultInfo {
+        require_token_exists(&self.tokens, &token_id);
+        let record = self.vaults.get(&token_id).filter(|r| r.resolved);
+        VaultInfo {
+            path: vault_path_for(&token_id),
+            token_id,
+            signer_id: self.signer_id.clone(),
+            public_key: record
+                .as_ref()
+                .map(|r| format!("secp256k1:{}", bs58::encode(r.public_key).into_string())),
+            evm_address: record.as_ref().map(|r| hex0x(&r.evm_address)),
+        }
+    }
+
+    /// Asks the signer again for a vault's key. Use it when the call made at mint failed, or for
+    /// vaults minted before the M4 migration (they have no record yet: the caller then pays its
+    /// storage and gets the rest back). Fails if the address is already resolved.
+    #[payable]
+    pub fn resolve_vault_address(&mut self, token_id: TokenId) -> Promise {
+        require_token_exists(&self.tokens, &token_id);
+        match self.vaults.get(&token_id) {
+            Some(r) if r.resolved => env::panic_str("Vault address already resolved"),
+            Some(_) => {}
+            None => {
+                let before = env::storage_usage();
+                self.vaults.insert(&token_id, &VaultRecord::unresolved());
+                let cost = env::storage_byte_cost()
+                    .saturating_mul((env::storage_usage() - before).into());
+                let attached = env::attached_deposit();
+                require!(
+                    cost <= attached,
+                    format!("Must attach {} to cover storage", cost.exact_amount_display())
+                );
+                let refund = attached.saturating_sub(cost);
+                if refund > NearToken::from_yoctonear(1) {
+                    Promise::new(env::predecessor_account_id()).transfer(refund).detach();
+                }
+            }
+        }
+        self.request_derived_key(&token_id)
+    }
+
+    /// Callback of the signer's `derived_public_key`. Stores the key only if it parses as a
+    /// 64-byte secp256k1 key and the vault is not resolved yet. Returns whether it stored it.
+    #[private]
+    pub fn on_derived_key(
+        &mut self,
+        token_id: TokenId,
+        #[callback_result] result: Result<String, PromiseError>,
+    ) -> bool {
+        let Some(mut record) = self.vaults.get(&token_id) else {
+            env::log_str(&format!("on_derived_key: no record for token {token_id}"));
+            return false;
+        };
+        if record.resolved {
+            env::log_str(&format!("on_derived_key: token {token_id} already resolved, kept"));
+            return false;
+        }
+        let key = match result.as_deref().map(parse_secp256k1_key) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                env::log_str(&format!("on_derived_key: malformed key for token {token_id}"));
+                return false;
+            }
+            Err(_) => {
+                env::log_str(&format!("on_derived_key: signer call failed for token {token_id}"));
+                return false;
+            }
+        };
+        record.resolved = true;
+        record.public_key = key;
+        record.evm_address = evm_address_of(&key);
+        self.vaults.insert(&token_id, &record);
+        let event = json!({
+            "standard": "policy_vault",
+            "version": "1.0.0",
+            "event": "vault_address",
+            "data": [{ "token_id": token_id, "evm_address": hex0x(&record.evm_address) }]
+        });
+        env::log_str(&format!("EVENT_JSON:{event}"));
+        true
     }
 
     /// Chain Signatures derivation path of a vault. The EVM address is obtained off-chain with
@@ -200,6 +383,21 @@ impl PolicyVault {
     pub fn vault_transfer_info(&self, token_id: TokenId) -> Option<TransferInfo> {
         require_token_exists(&self.tokens, &token_id);
         self.transfer_info.get(&token_id)
+    }
+
+    fn request_derived_key(&self, token_id: &TokenId) -> Promise {
+        ext_signer::ext(self.signer_id.clone())
+            .with_static_gas(GAS_FOR_DERIVE)
+            .derived_public_key(
+                vault_path_for(token_id),
+                Some(env::current_account_id()),
+                Some(SECP256K1_DOMAIN_ID),
+            )
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_DERIVE_CALLBACK)
+                    .on_derived_key(token_id.clone()),
+            )
     }
 
     /// Hook called before any transfer. Only checks existence in M3: M8 adds the sale freeze
@@ -421,6 +619,16 @@ mod tests {
     const STORAGE_DEPOSIT: NearToken = NearToken::from_millinear(100); // 0.1 NEAR, refunded excess
     const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 
+    fn signer() -> AccountId {
+        "v1.signer-prod.testnet".parse().unwrap()
+    }
+
+    /// Real answer of v1.signer-prod.testnet for path vault-0 and predecessor
+    /// m3.alan-vault-2026.testnet (queried on 2026-11-05). Its address was computed
+    /// independently with viem (scripts/derive-address.mjs).
+    const VAULT0_KEY: &str = "secp256k1:4yjHrZfCB7ieEjybG2ydzAeWxn6EyeUd81Uv6TiYzW3WBcjRH27cZRVWxvTu3EujBSnJ9SJspDu5BVJWk2aoqdJp";
+    const VAULT0_ADDRESS: &str = "0xb4bbbae0c0e057f0d85233d9394088e449d5b843";
+
     fn ctx(predecessor: AccountId, deposit: NearToken) {
         let mut b = VMContextBuilder::new();
         b.current_account_id("vault.testnet".parse().unwrap())
@@ -431,7 +639,7 @@ mod tests {
 
     fn setup_with_vault(owner: AccountId) -> PolicyVault {
         ctx(accounts(0), NearToken::from_yoctonear(0));
-        let mut c = PolicyVault::new();
+        let mut c = PolicyVault::new(signer());
         ctx(owner, STORAGE_DEPOSIT);
         c.mint_vault();
         c
@@ -491,7 +699,7 @@ mod tests {
     #[should_panic(expected = "to cover storage")]
     fn mint_without_storage_deposit_fails() {
         ctx(accounts(0), NearToken::from_yoctonear(0));
-        let mut c = PolicyVault::new();
+        let mut c = PolicyVault::new(signer());
         ctx(accounts(1), NearToken::from_yoctonear(0));
         c.mint_vault();
     }
@@ -500,7 +708,7 @@ mod tests {
     #[test]
     fn mint_refunds_the_excess_to_the_minter() {
         ctx(accounts(0), NearToken::from_yoctonear(0));
-        let mut c = PolicyVault::new();
+        let mut c = PolicyVault::new(signer());
         ctx(accounts(1), STORAGE_DEPOSIT);
         let before = env::storage_usage();
         c.mint_vault();
@@ -735,6 +943,125 @@ mod tests {
     fn vault_path_of_missing_token_fails() {
         let c = setup_with_vault(accounts(1));
         c.vault_path("7".to_string());
+    }
+
+    // ---------- M4: vault address from the signer ----------
+
+    fn function_calls() -> Vec<(AccountId, String, String)> {
+        get_created_receipts()
+            .into_iter()
+            .flat_map(|r| {
+                let to = r.receiver_id.clone();
+                r.actions.into_iter().filter_map(move |a| match a {
+                    MockAction::FunctionCallWeight { method_name, args, .. } => Some((
+                        to.clone(),
+                        String::from_utf8(method_name).unwrap(),
+                        String::from_utf8(args).unwrap(),
+                    )),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_and_address_match_viem_for_real_vault0_key() {
+        let key = parse_secp256k1_key(VAULT0_KEY).expect("real key must parse");
+        assert_eq!(hex0x(&evm_address_of(&key)), VAULT0_ADDRESS);
+    }
+
+    #[test]
+    fn parse_rejects_malformed_keys() {
+        assert!(parse_secp256k1_key("ed25519:4yjHrZfCB7ieEjybG2ydzAeWxn6E").is_none());
+        assert!(parse_secp256k1_key("secp256k1:0OIl").is_none(), "not base58");
+        assert!(parse_secp256k1_key("secp256k1:4yjHrZfCB7ieEjy").is_none(), "too short");
+        let long = format!("{}11", VAULT0_KEY);
+        assert!(parse_secp256k1_key(&long).is_none(), "too long");
+    }
+
+    #[test]
+    fn mint_asks_the_signer_for_this_vaults_key() {
+        let _c = setup_with_vault(accounts(1));
+        let calls = function_calls();
+        let to_signer: Vec<_> = calls.iter().filter(|(to, _, _)| *to == signer()).collect();
+        assert_eq!(to_signer.len(), 1, "{calls:?}");
+        let (_, method, args) = to_signer[0];
+        assert_eq!(method, "derived_public_key");
+        let args: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(args).unwrap();
+        assert_eq!(args["path"], "vault-0");
+        assert_eq!(args["predecessor"], "vault.testnet");
+        assert_eq!(args["domain_id"], 0);
+        assert!(calls.iter().any(|(_, m, _)| m == "on_derived_key"), "callback missing");
+    }
+
+    #[test]
+    fn new_vault_is_unresolved_until_the_signer_answers() {
+        let c = setup_with_vault(accounts(1));
+        let info = c.vault_info("0".to_string());
+        assert_eq!(info.path, "vault-0");
+        assert_eq!(info.signer_id, signer());
+        assert_eq!((info.public_key, info.evm_address), (None, None));
+    }
+
+    #[test]
+    fn callback_stores_key_address_and_emits_event() {
+        let mut c = setup_with_vault(accounts(1));
+        assert!(c.on_derived_key("0".to_string(), Ok(VAULT0_KEY.to_string())));
+        let info = c.vault_info("0".to_string());
+        assert_eq!(info.public_key.as_deref(), Some(VAULT0_KEY));
+        assert_eq!(info.evm_address.as_deref(), Some(VAULT0_ADDRESS));
+        assert!(get_logs().iter().any(|l| l.contains("\"vault_address\"") && l.contains(VAULT0_ADDRESS)));
+    }
+
+    #[test]
+    fn failed_or_malformed_answer_leaves_vault_unresolved() {
+        let mut c = setup_with_vault(accounts(1));
+        assert!(!c.on_derived_key("0".to_string(), Err(PromiseError::Failed)));
+        assert!(!c.on_derived_key("0".to_string(), Ok("secp256k1:garbage0".to_string())));
+        assert_eq!(c.vault_info("0".to_string()).evm_address, None);
+    }
+
+    #[test]
+    fn resolved_address_is_never_overwritten() {
+        let mut c = setup_with_vault(accounts(1));
+        assert!(c.on_derived_key("0".to_string(), Ok(VAULT0_KEY.to_string())));
+        // A different valid key arriving later (e.g. a stale retry) must not replace it.
+        let other = format!("secp256k1:{}", bs58::encode([7u8; 64]).into_string());
+        assert!(!c.on_derived_key("0".to_string(), Ok(other)));
+        assert_eq!(c.vault_info("0".to_string()).evm_address.as_deref(), Some(VAULT0_ADDRESS));
+    }
+
+    #[test]
+    #[should_panic(expected = "Vault address already resolved")]
+    fn resolve_on_resolved_vault_fails() {
+        let mut c = setup_with_vault(accounts(1));
+        c.on_derived_key("0".to_string(), Ok(VAULT0_KEY.to_string()));
+        ctx(accounts(2), NearToken::from_yoctonear(0));
+        let _ = c.resolve_vault_address("0".to_string());
+    }
+
+    #[test]
+    fn resolve_retries_an_unresolved_vault() {
+        let mut c = setup_with_vault(accounts(1));
+        ctx(accounts(2), NearToken::from_yoctonear(0)); // anyone may retry, no deposit needed
+        let _ = c.resolve_vault_address("0".to_string());
+        assert!(function_calls().iter().any(|(to, m, _)| *to == signer() && m == "derived_public_key"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Token not found")]
+    fn vault_info_of_missing_token_fails() {
+        let c = setup_with_vault(accounts(1));
+        c.vault_info("9".to_string());
+    }
+
+    #[test]
+    fn resolving_does_not_grow_storage() {
+        // The placeholder written at mint is fixed-size, so its storage was already paid.
+        let mut c = setup_with_vault(accounts(1));
+        let before = env::storage_usage();
+        c.on_derived_key("0".to_string(), Ok(VAULT0_KEY.to_string()));
+        assert_eq!(env::storage_usage(), before, "resolving changed storage size");
     }
 
     #[test]

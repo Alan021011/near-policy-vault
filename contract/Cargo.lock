@@ -1709,6 +1709,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "policy-vault"
 version = "0.1.0"
 dependencies = [
+ "bs58 0.5.1",
  "near-contract-standards",
  "near-sdk",
  "sha3 0.12.0",

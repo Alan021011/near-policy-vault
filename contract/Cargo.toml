@@ -8,6 +8,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bs58 = "0.5.1"
 near-contract-standards = "5.30.0"
 near-sdk = "5.30.0"
 sha3 = "0.12.0"
