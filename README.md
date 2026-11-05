@@ -1,6 +1,6 @@
 # near-policy-vault
 
-> **Status: work in progress.** The NFT vault contract, the per-vault EVM address, the spending policy, the proposal queue and **signing from the contract** run on testnet: NFT vaults have spent ETH on Sepolia under their policy, and a pending signature has been cancelled on Sepolia. **Not built yet: the two-phase sale (M8).** Until it exists, someone holding the owner's NEAR key can move the NFT and skip the guardian (threat 16, see Known limits).
+> **Status: work in progress.** The NFT vault contract, the per-vault EVM address, the spending policy, the proposal queue and **signing from the contract** run on testnet: NFT vaults have spent ETH on Sepolia under their policy, and a pending signature has been cancelled on Sepolia. The **two-phase sale** (M8) closes the two worst threats: a transfer needs a sale window that waits the policy delay and that the guardian can veto (stolen owner key), and a buyer's audit plus `cancel_nonce` make sure no signature the seller kept can still be mined.
 > Built for the NEAR HACKATHON 2026, track `nfts` (also aiming at `security` and `open` only if they work end to end).
 
 An NFT that **owns an account on another chain** and can only move its funds under a spending policy enforced by a NEAR contract.
@@ -26,7 +26,8 @@ An NFT that **owns an account on another chain** and can only move its funds und
 | Signing from the contract (M7) | `execute_proposal` (owner, after the delay) charges the caps, takes the next nonce and asks `v1.signer-prod.testnet` to sign the hash it computed; the vault is locked meanwhile (no second signature, no transfer). The private callback reads the signer's answer by hand (it never panics), **recovers the signer with `ecrecover` and requires the vault's own key**, then stores the raw signed transaction (`get_signed`, `get_signed_versions`, `list_signed`). An answer that recovers to another key is undone (caps, nonce, queue). If the signer fails or answers something unreadable, a valid signature might still exist, so the outcome is *uncertain*: the nonce stays used, the charge stays, and the proposal returns pinned to that nonce, so a retry yields the identical transaction and is not charged twice. `cancel_nonce` signs a 0-value self-transfer with an already used nonce, which makes anything else signed with it unminable; `execute_proposal(.., replace_nonce)` re-signs a stuck nonce. The owner can `abandon_signature` after 1 hour without an answer. Unit tests use the real A1 MPC signature: the contract rebuilds byte for byte the transaction mined on Sepolia. `scripts/m7-testnet-check.mjs`: 14/14 end to end, e.g. vault 29 `0x19ce46adba126170700527e23b53d84063e50050` sent 0.001 ETH: [tx 0xd77fb56f…](https://sepolia.etherscan.io/tx/0xd77fb56f370bbecf0247db4a557ab15a04d0befdf0e2c620415ed95d872fd067) |
 | M7 review fixes, live | `scripts/m7-cancel-testnet-check.mjs`: 17/17 on vault 29 (run twice). The signer refused a 0 deposit and the outcome was marked uncertain; the retry was signed at the same nonce without a second charge; that signature was kept unbroadcast (a "pending signature"); `cancel_nonce` was signed and mined ([tx 0xeeea5c42…](https://sepolia.etherscan.io/tx/0xeeea5c420fae65dcae4f8e166e783ae6974c2487a6b0f128de2572bc2030fdcb)); the pending payment was then rejected by Sepolia: "nonce too low" |
 | Chain lock (general review G2) | A vault's nonce counter belongs to one EVM chain, so its first signature fixes the chain (`get_vault_chain`); later policies, also a buyer's, must keep it. Vaults that signed earlier read it from their history. Checked live: vault 29 rejects a mainnet policy |
-| Two-phase sale (M8), web page, attack suite, live ERC-20 signing | Not started |
+| Two-phase sale (M8) | No transfer without a sale window: `start_sale` opens it after the policy's delay (at once without a policy), it stays open 24 h, the guardian can `veto_sale` and the owner can `cancel_sale`. Every path needs it: owner, approved marketplace, `transfer_call`. While on sale the vault signs no new payment, only cancellations. The transfer ends the sale; the buyer gets no policy, no queue, but the same chain and nonce. `scripts/sale-audit.mjs` is the buyer's check the contract cannot do (it cannot read Ethereum): it compares the vault account's mined nonce with the contract's next nonce and lists every signature that could still be mined. `scripts/m8-testnet-check.mjs`: 17/17 live on vault 41: a kept payment made the audit say NOT SAFE, the seller cancelled that nonce during the sale ([tx 0x3eb5425d…](https://sepolia.etherscan.io/tx/0x3eb5425d2dbd79df3e4d5bcb0cb2f7cca8ba90892a1752f3539079ba624a7890)), the audit said SAFE, the NFT went to the buyer and the kept payment was rejected by Sepolia |
+| Web page, attack suite, live ERC-20 signing | Not started |
 
 ## How to verify (will be filled in as pieces land)
 
@@ -37,21 +38,21 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
    Expect: `wrote 19 vectors to .../vectors/eip1559_signing_hash.tsv` and `git status` shows no change (the committed vectors are reproduced exactly). `npm ci` installs the exact versions in `package-lock.json`.
 2. Run the Rust tests:
    `cd contract && cargo test`
-   Expect: 140 unit tests (13 EVM helpers, 14 policy, 113 contract) and `rust_signing_hash_matches_viem` pass. If you change one character in a vector, that test fails with the case name.
+   Expect: 157 unit tests (13 EVM helpers, 14 policy, 130 contract) and `rust_signing_hash_matches_viem` pass. If you change one character in a vector, that test fails with the case name.
    On Windows, `contract/.cargo/config.toml` sets `AWS_LC_SYS_PREBUILT_NASM=1` so NASM is not needed.
 3. Build the contract:
    `cd contract && cargo near build non-reproducible-wasm --no-abi`
    Expect: `policy_vault.wasm` is produced (ABI generation is skipped because it fails on Windows hosts).
 4. Check the deployed NFT contract on testnet (needs the NEAR CLI and keys for an owner account and the contract account; `test-receiver/` is a helper contract deployed at the third account):
    `cd scripts && node m3-testnet-check.mjs <owner>.testnet <vault-contract>.testnet <receiver>.testnet`
-   Expect: 16 `PASS` lines and `ALL CHECKS PASSED`.
+   Expect: 16 `PASS` lines and `ALL CHECKS PASSED` (each new vault gets a sale window first: no transfer happens without one).
 5. Check that the contract publishes the right EVM address for every vault:
    `cd scripts && node m4-testnet-check.mjs <owner>.testnet <vault-contract>.testnet`
    Expect: one `PASS` per vault comparing `vault_info` with an independent derivation (signer query + viem), the private-callback attack rejected, and `ALL CHECKS PASSED`.
-6. Check the spending policy on testnet (about 2 minutes; the third account acts as guardian):
+6. Check the spending policy on testnet (about 3 minutes; the third account acts as guardian):
    `cd scripts && node m5-testnet-check.mjs <owner>.testnet <vault-contract>.testnet <guardian>.testnet`
    Expect: 27 `PASS` lines and `ALL CHECKS PASSED`.
-7. Check the proposal queue on testnet (about 2 minutes):
+7. Check the proposal queue on testnet (about 3 minutes):
    `cd scripts && node m6-testnet-check.mjs <owner>.testnet <vault-contract>.testnet <guardian>.testnet`
    Expect: 15 `PASS` lines and `ALL CHECKS PASSED`.
 8. Sign and spend end to end (about 3 minutes; the owner's `ethereum-1` Chain Signatures address needs some Sepolia ETH, it funds the new vault):
@@ -60,15 +61,23 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
 9. Cancel a pending signature (about 3 minutes, on a funded vault with a policy, e.g. the one created by step 8):
    `cd scripts && node m7-cancel-testnet-check.mjs <owner>.testnet <vault-contract>.testnet <token_id>`
    Expect: 17 `PASS` lines (if the signer ever accepts a 0 deposit, a NOTE replaces the uncertain-path checks), a Sepolia link to the mined cancellation, `nonce too low` (or `replacement transaction underpriced` while the node still holds the cancellation) for the pending payment, and `ALL CHECKS PASSED`.
-10. Check that the deployed code is this repository's code: compare the SHA-256 printed by step 3 with the `code_hash` of the contract account (`near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now`, or the RPC `view_account`, which gives it in base58).
-   The contract currently deployed (after the general review) has SHA-256 `ce06324da3c22ed8818c8846e515e5047a462db108ebaf269d1ea55f79698ff3`, equal to the local build of that commit. On 2026-11-05 a fresh clone of the previous commit built the wasm deployed then byte for byte (`3b567463…`). Both were on the author's machine and toolchain (Rust 1.99.1, cargo-near 0.22.0); a byte-identical build on any machine needs `cargo near build reproducible-wasm` (Docker), planned before submission.
+10. Sell a vault (about 4 minutes; use the vault created by step 8, which has funds, a policy whose guardian is the third account, and the seller's `ethereum-1` address as destination):
+   `cd scripts && node m8-testnet-check.mjs <seller>.testnet <vault-contract>.testnet <buyer-and-guardian>.testnet <token_id>`
+   Expect: 17 `PASS` lines, including "NOT SAFE" before the cancellation, a Sepolia link to it, "SAFE" after it, and `ALL CHECKS PASSED`.
+11. Audit any vault before buying it:
+   `cd scripts && node sale-audit.mjs <vault-contract>.testnet <token_id>`
+   Expect: `SAFE` (exit code 0) only if a sale is open and every nonce the contract signed is already mined on the vault's chain; otherwise `NOT SAFE` with the nonces to cancel (exit code 2).
+12. Check that the deployed code is this repository's code: compare the SHA-256 printed by step 3 with the `code_hash` of the contract account (`near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now`, or the RPC `view_account`, which gives it in base58).
+   The contract currently deployed (M8) has SHA-256 `ef7679f12c3ab7e34c87eeda0ebaa98235a0a36a252dfdda23e9b7089f7dce35`, equal to the local build of that commit. On 2026-11-05 a fresh clone of the previous commit built the wasm deployed then byte for byte (`3b567463…`). Both were on the author's machine and toolchain (Rust 1.99.1, cargo-near 0.22.0); a byte-identical build on any machine needs `cargo near build reproducible-wasm` (Docker), planned before submission.
 
 ## Known limits
 
 See `docs/THREAT_MODEL.md`. Residual risks that this design does not remove: trust in the MPC network, and whoever controls the contract's upgrade keys.
 
 - **Upgrade key (threat 9).** Today the contract account keeps a full-access key, so its owner can replace the code (this is how `migrate` was deployed). Before the final submission the plan is to delete that key so the code can no longer change, and to show it here with `near account view-account-summary` ("0 full access keys"). Until then, treat the contract as upgradable by its deployer.
-- **Stolen owner key (threat 16, open, live).** Today someone holding the owner's NEAR key can transfer the NFT to an account of theirs; the transfer deletes the policy, their first policy applies at once without a guardian, and after its delay they can spend. Since M7 the contract really signs, so this is a live risk (the testnet vaults hold only test ETH). The two-phase sale (M8) must make transfers wait the delay and let the guardian veto them.
+- **Stolen owner key (threat 16).** A transfer needs a sale window that waits the policy's delay and that the guardian can veto, so a thief holding the owner's key has to get past the guardian. What remains: with a delay of 0 the window opens at once (the guardian cannot react), and a thief can replace the guardian after max(2 x delay, 3 days) (threat 18), during which the guardian can keep vetoing.
+- **The buyer must run the audit.** The contract cannot read Ethereum, so it cannot tell whether every nonce it signed is already mined. `scripts/sale-audit.mjs` does that check; a buyer who skips it can receive a vault for which the seller still holds a payment that can be mined. During the sale the vault only signs cancellations, so the state the audit sees does not change under it.
+- **Sale windows close.** A window stays open 24 hours after it opens; after that a new sale must be started (an old sale never leaves the vault transferable).
 - **A delay of 0 disables the guardian's veto on spending.** With `delay_ms` = 0 a proposal can be signed in the same block, so the guardian never gets a chance to veto it (it still protects its own replacement, which waits at least 3 days).
 - **Uncertain nonces survive a sale.** The list of nonces with an unknown outcome (`get_uncertain`) stays with the vault, so a buyer sees it and can cancel them; the queue and the policy do not survive.
 - **One chain per vault.** The nonce counter belongs to the chain of the first signature, so a vault cannot move to another EVM chain afterwards (its address exists on every chain, but this contract only signs for that one).

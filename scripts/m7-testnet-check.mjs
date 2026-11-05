@@ -60,7 +60,7 @@ function call(contract, signer, method, args, deposit, gas = '300 Tgas') {
     'json-args', JSON.stringify(args), 'prepaid-gas', gas, 'attached-deposit', deposit,
     'sign-as', signer, 'network-config', 'testnet', 'sign-with-keychain', 'send'], { encoding: 'utf8' });
   const out = (p.stdout || '') + (p.stderr || '');
-  return { out, stdout: (p.stdout || '').trim(), panic: (out.match(/Smart contract panicked: ([^"\n)]*)/) || [])[1] };
+  return { out, stdout: (p.stdout || '').trim(), panic: (out.match(/Smart contract panicked: (.*?)(?:"\)|\n|$)/) || [])[1] };
 }
 const addressOfKey = (key) => {
   let n = 0n;

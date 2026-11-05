@@ -52,7 +52,7 @@ function call(signer, method, args, deposit) {
     'json-args', JSON.stringify(args), 'prepaid-gas', '100 Tgas', 'attached-deposit', deposit,
     'sign-as', signer, 'network-config', 'testnet', 'sign-with-keychain', 'send'], { encoding: 'utf8' });
   const out = (p.stdout || '') + (p.stderr || '');
-  return { out, panic: (out.match(/Smart contract panicked: ([^"\n)]*)/) || [])[1] };
+  return { out, panic: (out.match(/Smart contract panicked: (.*?)(?:"\)|\n|$)/) || [])[1] };
 }
 const policy = (capCenti) => ({
   chain_id: 11155111, delay_ms: DELAY_MS, guardian: GUARDIAN,
@@ -106,7 +106,10 @@ call(OWNER, 'set_policy', { token_id: t, policy: policy(1) }, '0.05 NEAR');
 e = await view('check_execution', { token_id: t, proposal_id: Number(b) });
 check('after lowering the cap, B is no longer executable', !e.ready && e.reason === 'Policy now refuses it: ETH daily cap exceeded', e.reason);
 
-// sale empties the queue
+// sale empties the queue (M8: through a sale window, which waits the delay)
+call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR');
+console.log(`      waiting ${DELAY_MS / 1000 + 5} s for the sale window to open...`);
+await sleep(DELAY_MS + 5000);
 call(OWNER, 'nft_transfer', { receiver_id: GUARDIAN, token_id: t }, '1 yoctoNEAR');
 check('after the sale the queue is empty', (await view('list_proposals', { token_id: t })).length === 0);
 check('the next nonce is still 0 (not reset, nothing signed)', (await view('get_next_nonce', { token_id: t })) === 0);

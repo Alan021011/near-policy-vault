@@ -69,7 +69,7 @@ async function call(signer, method, args, deposit, gas = '100 Tgas') {
       .flatMap((r) => r.receipt.Action.actions.filter((a) => a.Transfer)
         .map((a) => ({ to: r.receiver_id, amount: BigInt(a.Transfer.deposit) })));
   }
-  return { out, refunds, panic: (out.match(/Smart contract panicked: ([^"\n)]*)/) || [])[1] };
+  return { out, refunds, panic: (out.match(/Smart contract panicked: (.*?)(?:"\)|\n|$)/) || [])[1] };
 }
 
 const policy = (capEth, guardian = GUARDIAN) => ({
@@ -165,7 +165,10 @@ r = await call(OWNER, 'cancel_pending_policy', { token_id: t }, '1 yoctoNEAR');
 v = await view('get_policy', { token_id: t });
 check('the owner can cancel the replacement', !r.panic && v.pending === null && v.policy.guardian === GUARDIAN, r.panic);
 
-// ---------- transfer clears the policy ----------
+// ---------- transfer clears the policy (M8: through a sale window, which waits the delay) ----------
+await call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR');
+console.log(`      waiting ${DELAY_MS / 1000 + 5} s for the sale window to open...`);
+await sleep(DELAY_MS + 5000);
 r = await call(OWNER, 'nft_transfer', { receiver_id: GUARDIAN, token_id: t }, '1 yoctoNEAR');
 v = await view('get_policy', { token_id: t });
 check('after a transfer the buyer gets a locked vault', v.has_policy === false);

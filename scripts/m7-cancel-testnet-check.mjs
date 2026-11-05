@@ -55,7 +55,7 @@ function call(method, args, deposit, gas = '300 Tgas') {
     'json-args', JSON.stringify(args), 'prepaid-gas', gas, 'attached-deposit', deposit,
     'sign-as', OWNER, 'network-config', 'testnet', 'sign-with-keychain', 'send'], { encoding: 'utf8' });
   const out = (p.stdout || '') + (p.stderr || '');
-  return { out, stdout: (p.stdout || '').trim(), panic: (out.match(/Smart contract panicked: ([^"\n)]*)/) || [])[1] };
+  return { out, stdout: (p.stdout || '').trim(), panic: (out.match(/Smart contract panicked: (.*?)(?:"\)|\n|$)/) || [])[1] };
 }
 async function broadcast(raw) {
   const j = await fetch('https://ethereum-sepolia-rpc.publicnode.com', { method: 'POST', headers: { 'content-type': 'application/json' },

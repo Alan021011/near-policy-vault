@@ -76,14 +76,20 @@ const events = (logs, name) => logs
 const approvalBytes = (id) => BigInt(id.length + 4 + 8);
 const owner = async (t) => (await view('nft_token', { token_id: t })).owner_id;
 
+/** Mints a vault and opens its sale window (M8: no transfer without one). A vault without a
+ *  policy has no delay, so the window opens at once. Returns the token id and what the sale
+ *  record cost in storage: the transfer that ends the sale refunds exactly that to the seller. */
 async function mint() {
   const r = await call(OWNER, 'mint_vault', {}, '0.1 NEAR');
-  return events(r.logs, 'nft_mint')[0].data[0].token_ids[0];
+  const t = events(r.logs, 'nft_mint')[0].data[0].token_ids[0];
+  const s = await call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR');
+  const back = s.refunds.filter((x) => x.to === OWNER).reduce((sum, x) => sum + x.amount, 0n);
+  return { t, saleCost: 10n ** 22n - back };
 }
 
 // ---------- A. Approved account transfers (R1) and approvals are refunded (R4) ----------
 {
-  const t = await mint();
+  const { t, saleCost } = await mint();
   await call(OWNER, 'nft_approve', { token_id: t, account_id: VAULT }, '0.01 NEAR');
   await call(OWNER, 'nft_approve', { token_id: t, account_id: RECV }, '0.01 NEAR');
   const r = await call(VAULT, 'nft_transfer', { receiver_id: RECV, token_id: t }, '1 yoctoNEAR');
@@ -92,16 +98,16 @@ async function mint() {
   check('A library nft_transfer event omits authorized_id (upstream bug, documented)', !('authorized_id' in lib), JSON.stringify(lib));
   const ours = events(r.logs, 'vault_transfer')[0]?.data[0] ?? {};
   check('A our vault_transfer event names the approved account', ours.authorized_id === VAULT, JSON.stringify(ours));
-  const expected = (approvalBytes(VAULT) + approvalBytes(RECV)) * BYTE_COST;
+  const expected = (approvalBytes(VAULT) + approvalBytes(RECV)) * BYTE_COST + saleCost;
   const got = r.refunds.filter((x) => x.to === OWNER).reduce((s, x) => s + x.amount, 0n);
-  check('A approval storage refunded to the previous owner (R4)', got === expected, `expected ${expected}, got ${got}`);
+  check('A approval storage (R4) and sale record (M8) refunded to the previous owner', got === expected, `expected ${expected}, got ${got}`);
   const info = await view('vault_transfer_info', { token_id: t });
   check('A on-chain record: count 1, authorized_id set', info.count === 1 && info.last.authorized_id === VAULT, JSON.stringify(info));
 }
 
 // ---------- B. transfer_call kept by the receiver (R2) refunds approvals in resolve (R4) ----------
 {
-  const t = await mint();
+  const { t, saleCost } = await mint();
   await call(OWNER, 'nft_approve', { token_id: t, account_id: VAULT }, '0.01 NEAR');
   const r = await call(OWNER, 'nft_transfer_call', { receiver_id: RECV, token_id: t, msg: 'keep' }, '1 yoctoNEAR', '150 Tgas');
   check(`B token ${t}: receiver kept it`, (await owner(t)) === RECV);
@@ -109,26 +115,27 @@ async function mint() {
   const kinds = events(r.logs, 'vault_transfer').map((e) => e.data[0].kind);
   check('B events: one transfer_call, no return', JSON.stringify(kinds) === '["transfer_call"]', JSON.stringify(kinds));
   const got = r.refunds.filter((x) => x.to === OWNER).reduce((s, x) => s + x.amount, 0n);
-  check('B approval storage refunded after resolve (R4)', got === approvalBytes(VAULT) * BYTE_COST, `got ${got}`);
+  check('B approval storage refunded after resolve (R4), plus the sale record (M8)', got === approvalBytes(VAULT) * BYTE_COST + saleCost, `got ${got}`);
 }
 
 // ---------- C. transfer_call returned by the receiver (R2): owner and approvals restored ----------
 {
-  const t = await mint();
+  const { t, saleCost } = await mint();
   await call(OWNER, 'nft_approve', { token_id: t, account_id: VAULT }, '0.01 NEAR');
   const r = await call(OWNER, 'nft_transfer_call', { receiver_id: RECV, token_id: t, msg: 'return' }, '1 yoctoNEAR', '150 Tgas');
   check(`C token ${t}: back with the original owner`, (await owner(t)) === OWNER);
   check('C previous approval restored', await view('nft_is_approved', { token_id: t, approved_account_id: VAULT }));
   const kinds = events(r.logs, 'vault_transfer').map((e) => e.data[0].kind);
   check('C events: transfer_call then transfer_call_returned', JSON.stringify(kinds) === '["transfer_call","transfer_call_returned"]', JSON.stringify(kinds));
-  check('C no approval refund when the token comes back', r.refunds.filter((x) => x.to === OWNER).length === 0);
+  const back = r.refunds.filter((x) => x.to === OWNER).reduce((s, x) => s + x.amount, 0n);
+  check('C no approval refund when the token comes back (only the sale record, M8)', back === saleCost, `got ${back}, sale record ${saleCost}`);
   const info = await view('vault_transfer_info', { token_id: t });
   check('C on-chain record: count 2, last is the return', info.count === 2 && info.last.kind === 'transfer_call_returned', JSON.stringify(info));
 }
 
 // ---------- D. receiver fails (R2): the token must come back ----------
 {
-  const t = await mint();
+  const { t } = await mint();
   const r = await call(OWNER, 'nft_transfer_call', { receiver_id: RECV, token_id: t, msg: 'panic' }, '1 yoctoNEAR', '150 Tgas');
   check(`D token ${t}: back with the original owner after receiver panic`, (await owner(t)) === OWNER);
   const kinds = events(r.logs, 'vault_transfer').map((e) => e.data[0].kind);
