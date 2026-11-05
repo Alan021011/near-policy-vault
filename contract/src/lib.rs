@@ -635,13 +635,23 @@ impl PolicyVault {
         let before = env::storage_usage();
         let mut st = self.policy_state(&token_id);
         let now = env::block_timestamp_ms();
-        let applied = policy::is_not_looser(&new, &st.policy) || st.policy.delay_ms == 0;
+        st.spend.prune_expired(now);
+        // Review P3: replacing or removing an existing guardian always waits the long lock and
+        // cannot be vetoed by that guardian, so a lost or hostile guardian cannot freeze the vault.
+        let replaces = policy::replaces_guardian(&new, &st.policy);
+        let applied =
+            !replaces && (policy::is_not_looser(&new, &st.policy) || st.policy.delay_ms == 0);
         let apply_after_ms = if applied {
             st.policy = new;
             st.pending = None;
             now
         } else {
-            let at = now.saturating_add(st.policy.delay_ms);
+            let wait = if replaces {
+                policy::guardian_change_wait_ms(&st.policy)
+            } else {
+                st.policy.delay_ms
+            };
+            let at = now.saturating_add(wait);
             st.pending = Some(PendingPolicy { policy: new, apply_after_ms: at });
             at
         };
@@ -659,6 +669,7 @@ impl PolicyVault {
         let pending = st.pending.take().unwrap_or_else(|| env::panic_str("No pending policy"));
         require!(env::block_timestamp_ms() >= pending.apply_after_ms, "Pending policy not ready yet");
         st.policy = pending.policy;
+        st.spend.prune_expired(env::block_timestamp_ms());
         self.policies.insert(&token_id, &st);
         settle_storage(before, &owner);
         emit_policy_event("policy_applied", &token_id, json!({}));
@@ -683,6 +694,12 @@ impl PolicyVault {
             st.policy.guardian.as_ref() == Some(&env::predecessor_account_id()),
             "Only the guardian can veto"
         );
+        if let Some(p) = &st.pending {
+            require!(
+                !policy::replaces_guardian(&p.policy, &st.policy),
+                "The guardian cannot veto its own replacement"
+            );
+        }
         self.drop_pending(&token_id, &owner);
         emit_policy_event("policy_vetoed", &token_id, json!({ "guardian": env::predecessor_account_id() }));
     }
@@ -757,9 +774,10 @@ fn locked_state() -> VaultPolicyState {
 #[near]
 impl PolicyVault {
     /// Queues a transaction. Only the owner, with a deposit of at least 1 yoctoNEAR that also
-    /// covers the storage of the proposal. The transaction must pass the policy now; its spend
-    /// is reserved from the daily caps; it can be signed after the policy's delay (M7).
-    /// Returns the proposal id.
+    /// covers the storage of the proposal. The transaction must pass the policy now, but its
+    /// spend is charged to the daily caps only when it is signed (review P1: charging at
+    /// proposal time let proposals held across days be signed together above the cap).
+    /// It can be signed after the policy's delay (M7). Returns the proposal id.
     #[payable]
     pub fn propose(&mut self, token_id: TokenId, tx: ProposalTx) -> u64 {
         require!(
@@ -776,9 +794,9 @@ impl PolicyVault {
         // The nonce does not take part in the policy; 0 is a placeholder.
         let candidate = tx.to_tx(0).unwrap_or_else(|e| env::panic_str(&e));
         let now = env::block_timestamp_ms();
+        st.spend.prune_expired(now);
         let reservation = policy::check(&st.policy, &st.spend, &candidate, now)
             .unwrap_or_else(|e| env::panic_str(&e.to_string()));
-        st.spend.reserve(&reservation, now);
         let id = self.next_proposal_id;
         self.next_proposal_id += 1;
         let executable_after_ms = now.saturating_add(st.policy.delay_ms);
@@ -800,7 +818,7 @@ impl PolicyVault {
         id
     }
 
-    /// The owner withdraws a queued proposal; its reservation is released.
+    /// The owner withdraws a queued proposal.
     #[payable]
     pub fn cancel_proposal(&mut self, token_id: TokenId, proposal_id: u64) {
         assert_one_yocto();
@@ -809,7 +827,7 @@ impl PolicyVault {
         emit_policy_event("proposal_cancelled", &token_id, json!({ "proposal_id": proposal_id }));
     }
 
-    /// The guardian of the policy in force vetoes a queued proposal; its reservation is released.
+    /// The guardian of the policy in force vetoes a queued proposal.
     #[payable]
     pub fn veto_proposal(&mut self, token_id: TokenId, proposal_id: u64) {
         assert_one_yocto();
@@ -843,7 +861,7 @@ impl PolicyVault {
         require_token_exists(&self.tokens, &token_id);
         let nonce = self.nonces.get(&token_id).unwrap_or(0);
         match self.prepare_execution(&token_id, proposal_id, env::block_timestamp_ms()) {
-            Ok(tx) => ExecutionCheck {
+            Ok((tx, _)) => ExecutionCheck {
                 ready: true,
                 reason: None,
                 nonce,
@@ -870,31 +888,57 @@ impl PolicyVault {
             .position(|p| p.id == proposal_id)
             .unwrap_or_else(|| env::panic_str("Proposal not found"));
         let p = st.proposals.remove(i);
-        st.spend.release(&p.reservation);
         self.policies.insert(token_id, &st);
         settle_storage(before, owner);
         p
     }
 
     /// The transaction that would be signed for a proposal at `now_ms`, with the vault's next
-    /// nonce, or why not. Checks: the proposal exists, it belongs to the current owner epoch,
-    /// its delay has passed, and it still passes the policy in force (tightened since?) with
-    /// its own reservation given back first.
-    fn prepare_execution(&self, token_id: &TokenId, proposal_id: u64, now_ms: u64) -> Result<Eip1559Tx, String> {
+    /// nonce, and what it would charge to the caps, or why not. Checks: the proposal exists, it
+    /// belongs to the current owner epoch, both its own delay and the current policy's delay
+    /// have passed since it was made (review P4: raising the delay also holds queued
+    /// proposals), and it passes the policy in force against what has already been signed in
+    /// the current windows.
+    fn prepare_execution(
+        &self,
+        token_id: &TokenId,
+        proposal_id: u64,
+        now_ms: u64,
+    ) -> Result<(Eip1559Tx, Reservation), String> {
         let st = self.policies.get(token_id).ok_or("Proposal not found")?;
         let p = st.proposals.iter().find(|p| p.id == proposal_id).ok_or("Proposal not found")?;
         if p.owner_epoch != self.owner_epoch(token_id) {
             return Err("Proposal belongs to a previous owner".into());
         }
-        if now_ms < p.executable_after_ms {
+        let ready_at = p.executable_after_ms.max(p.created_ms.saturating_add(st.policy.delay_ms));
+        if now_ms < ready_at {
             return Err("Proposal delay has not passed yet".into());
         }
         let nonce = self.nonces.get(token_id).unwrap_or(0);
         let tx = p.tx.to_tx(nonce)?;
-        let mut spend = st.spend.clone();
-        spend.release(&p.reservation);
-        policy::check(&st.policy, &spend, &tx, now_ms).map_err(|e| format!("Policy now refuses it: {e}"))?;
-        Ok(tx)
+        let charge = policy::check(&st.policy, &st.spend, &tx, now_ms)
+            .map_err(|e| format!("Policy now refuses it: {e}"))?;
+        Ok((tx, charge))
+    }
+
+    /// Takes a ready proposal out of the queue for signing: charges its spend to the current
+    /// windows, gives the vault's next nonce to it and advances that nonce. All in one
+    /// synchronous step, so two executions can never both fit under the cap (threat 6).
+    /// M7 calls this before asking the MPC network to sign, and must undo it (release the
+    /// charge, restore the nonce) if the signature fails, while no other signature is in flight.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn commit_execution(&mut self, token_id: &TokenId, proposal_id: u64) -> (Proposal, Eip1559Tx, Reservation) {
+        let now = env::block_timestamp_ms();
+        let (tx, charge) =
+            self.prepare_execution(token_id, proposal_id, now).unwrap_or_else(|e| env::panic_str(&e));
+        let mut st = self.policies.get(token_id).expect("checked by prepare_execution");
+        st.spend.prune_expired(now);
+        st.spend.reserve(&charge, now);
+        let i = st.proposals.iter().position(|p| p.id == proposal_id).expect("checked");
+        let p = st.proposals.remove(i);
+        self.policies.insert(token_id, &st);
+        self.nonces.insert(token_id, &(tx.nonce + 1));
+        (p, tx, charge)
     }
 }
 
@@ -1851,15 +1895,143 @@ mod tests {
     }
 
     #[test]
-    fn propose_queues_and_reserves_the_spend() {
+    fn propose_queues_without_charging_the_cap() {
         let (mut c, alice) = vault_with_policy();
         let id = propose_as(&mut c, &alice, 4 * ONE_HUNDREDTH_ETH, T0_MS + 10);
         let q = c.list_proposals("0".into());
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].id, id);
         assert_eq!(q[0].executable_after_ms, T0_MS + 10 + HOUR_MS);
-        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 4 * ONE_HUNDREDTH_ETH + GAS_RESERVE);
+        assert_eq!(q[0].reservation.eth.0, 4 * ONE_HUNDREDTH_ETH + GAS_RESERVE, "what it will charge");
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 0, "charged only when signed (P1)");
         assert!(get_logs().iter().any(|l| l.contains("\"proposal_created\"")));
+    }
+
+    /// Review P1, the exact scenario that broke the cap: proposals made on different days.
+    #[test]
+    fn proposals_held_across_days_cannot_be_signed_together_above_the_cap() {
+        let (mut c, alice) = vault_with_policy(); // cap 0.1 ETH, delay 1 h
+        let a = propose_as(&mut c, &alice, 9 * ONE_HUNDREDTH_ETH, T0_MS + 10);
+        let b = propose_as(&mut c, &alice, 9 * ONE_HUNDREDTH_ETH, T0_MS + 10 + policy::DAY_MS);
+        ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 10 + policy::DAY_MS + HOUR_MS);
+        assert!(c.check_execution("0".into(), a).ready);
+        c.commit_execution(&"0".to_string(), a);
+        let rb = c.check_execution("0".into(), b);
+        assert!(!rb.ready, "0.18 ETH signed in one window with a 0.1 cap");
+        assert_eq!(rb.reason.as_deref(), Some("Policy now refuses it: ETH daily cap exceeded"));
+    }
+
+    #[test]
+    fn signing_charges_the_cap_and_advances_the_nonce() {
+        let (mut c, alice) = vault_with_policy();
+        let a = propose_as(&mut c, &alice, ONE_HUNDREDTH_ETH, T0_MS + 10);
+        let b = propose_as(&mut c, &alice, ONE_HUNDREDTH_ETH, T0_MS + 11);
+        ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 11 + HOUR_MS);
+        let (p, tx, charge) = c.commit_execution(&"0".to_string(), a);
+        assert_eq!((p.id, tx.nonce), (a, 0));
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, charge.eth.0);
+        assert_eq!(c.get_next_nonce("0".into()), 1);
+        assert_eq!(c.list_proposals("0".into()).len(), 1, "signed proposal leaves the queue");
+        let rb = c.check_execution("0".into(), b);
+        assert!(rb.ready);
+        assert_eq!(rb.nonce, 1, "the next one gets the next nonce");
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal delay has not passed yet")]
+    fn commit_respects_the_delay() {
+        let (mut c, alice) = vault_with_policy();
+        let a = propose_as(&mut c, &alice, 1, T0_MS + 10);
+        ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS - 1);
+        c.commit_execution(&"0".to_string(), a);
+    }
+
+    /// Review P4.
+    #[test]
+    fn raising_the_delay_also_holds_queued_proposals() {
+        let (mut c, alice) = vault_with_policy(); // delay 1 h
+        let a = propose_as(&mut c, &alice, 1, T0_MS + 10);
+        let mut slower = test_policy(100_000_000_000_000_000);
+        slower.delay_ms = 2 * HOUR_MS;
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 20);
+        assert!(c.set_policy("0".into(), slower), "a longer delay is a tightening");
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS);
+        assert!(!c.check_execution("0".into(), a).ready, "old delay no longer enough");
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + 2 * HOUR_MS);
+        assert!(c.check_execution("0".into(), a).ready);
+    }
+
+    /// Review P2 at contract level.
+    #[test]
+    fn unminable_transactions_are_refused() {
+        let (c, _) = vault_with_policy();
+        let mut t = tx_input(1);
+        t.gas_limit = 0;
+        assert_eq!(c.check_transaction("0".into(), t).reason.as_deref(), Some("gas_limit below 21000"));
+        let mut t = tx_input(1);
+        t.max_fee_per_gas = U128(0);
+        t.max_priority_fee_per_gas = U128(0);
+        assert_eq!(c.check_transaction("0".into(), t).reason.as_deref(), Some("max_fee_per_gas must be above 0"));
+    }
+
+    // ---------- review P3: the guardian cannot freeze the vault ----------
+
+    fn without_guardian() -> Policy {
+        let mut p = test_policy(100_000_000_000_000_000);
+        p.guardian = None;
+        p
+    }
+
+    #[test]
+    #[should_panic(expected = "The guardian cannot veto its own replacement")]
+    fn guardian_cannot_veto_its_own_replacement() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        assert!(!c.set_policy("0".into(), without_guardian()));
+        ctx_at(guardian(), ONE_YOCTO, T0_MS + 20);
+        c.veto_pending_policy("0".into());
+    }
+
+    #[test]
+    fn guardian_replacement_waits_the_long_lock() {
+        let (mut c, alice) = vault_with_policy(); // delay 1 h -> lock is 3 days
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), without_guardian());
+        let at = c.get_policy("0".into()).pending.unwrap().apply_after_ms;
+        assert_eq!(at, T0_MS + 10 + policy::GUARDIAN_CHANGE_MIN_MS);
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + 2 * HOUR_MS);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.apply_policy("0".into()))).is_err(), "applied after the normal delay");
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), at);
+        c.apply_policy("0".into());
+        assert_eq!(c.get_policy("0".into()).policy.guardian, None);
+    }
+
+    #[test]
+    fn guardian_replacement_waits_even_with_zero_delay() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        let mut fast = test_policy(1);
+        fast.delay_ms = 0;
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS);
+        assert!(c.set_policy("0".into(), fast));
+        let mut no_g = test_policy(1);
+        no_g.delay_ms = 0;
+        no_g.guardian = None;
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        assert!(!c.set_policy("0".into(), no_g), "delay 0 must not let the guardian go at once");
+        assert_eq!(c.get_policy("0".into()).pending.unwrap().apply_after_ms, T0_MS + 10 + policy::GUARDIAN_CHANGE_MIN_MS);
+    }
+
+    #[test]
+    fn owner_can_cancel_a_guardian_replacement() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), without_guardian());
+        ctx_at(alice, ONE_YOCTO, T0_MS + 20);
+        c.cancel_pending_policy("0".into());
+        let v = c.get_policy("0".into());
+        assert!(v.pending.is_none());
+        assert_eq!(v.policy.guardian, Some(guardian()));
     }
 
     #[test]
@@ -1895,34 +2067,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ETH daily cap exceeded")]
-    fn queued_proposals_hold_their_share_of_the_cap() {
+    fn several_proposals_may_queue_beyond_the_cap() {
+        // The cap is enforced when signing (P1), so the queue may hold more than one day's cap.
         let (mut c, alice) = vault_with_policy();
         propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 10);
-        propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 11); // 0.12 > 0.1
+        propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 11); // 0.12 > 0.1 queued
+        assert_eq!(c.list_proposals("0".into()).len(), 2);
     }
 
+    /// Review P5: precise assertion on who gets the freed storage.
     #[test]
-    fn cancel_releases_the_reservation() {
+    fn cancel_removes_the_proposal_and_refunds_its_storage_to_the_owner() {
         let (mut c, alice) = vault_with_policy();
         let id = propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 10);
         ctx_at(alice.clone(), ONE_YOCTO, T0_MS + 11);
         c.cancel_proposal("0".into(), id);
+        let t = transfers();
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(t[0].0, alice);
+        assert!(t[0].1 > NearToken::from_yoctonear(1), "{t:?}");
         assert!(c.list_proposals("0".into()).is_empty());
-        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 0);
-        propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 12); // fits again
-        assert!(transfers().is_empty() || transfers().iter().all(|(to, _)| *to == alice));
     }
 
     #[test]
-    fn guardian_veto_releases_the_reservation() {
+    fn guardian_veto_removes_the_proposal_and_refunds_the_owner() {
         let (mut c, alice) = vault_with_policy();
         let id = propose_as(&mut c, &alice, 6 * ONE_HUNDREDTH_ETH, T0_MS + 10);
         ctx_at(guardian(), ONE_YOCTO, T0_MS + 11);
         c.veto_proposal("0".into(), id);
         assert!(c.list_proposals("0".into()).is_empty());
-        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 0);
-        assert!(transfers().iter().any(|(to, _)| *to == alice), "freed storage goes to the owner");
+        let t = transfers();
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(t[0].0, alice, "freed storage goes to the owner, not the guardian");
     }
 
     #[test]

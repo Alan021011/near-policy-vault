@@ -1,6 +1,6 @@
 // M6 checks on testnet: queued proposals with real accounts.
-// - a proposal must pass the policy and holds its share of the daily cap;
-// - the guardian vetoes (and the reservation comes back), the owner cancels, nobody else can;
+// - a proposal must pass the policy; the daily cap is charged only when it is signed (M7);
+// - the guardian vetoes, the owner cancels, nobody else can;
 // - a proposal is not ready before the delay; after it, check_execution gives nonce 0 and the
 //   same signing hash as viem; tightening the policy also stops queued proposals;
 // - selling the NFT empties the queue, and the vault's next nonce does not reset.
@@ -20,6 +20,10 @@ const DELAY_MS = 60_000;
 const DEST = '0x1111111111111111111111111111111111111111';
 const CENTI = 10n ** 16n; // 0.01 ETH
 let failures = 0;
+// Events printed by the CLI ("EVENT_JSON:{...}"), parsed instead of matched as text.
+const events = (out, name) => [...out.matchAll(/EVENT_JSON:(\{.*\})/g)]
+  .map((m) => { try { return JSON.parse(m[1]); } catch { return null; } })
+  .filter((e) => e && (!name || e.event === name));
 
 const check = (name, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
@@ -48,20 +52,23 @@ const policy = (capCenti) => ({
 });
 const ptx = (centi) => ({ chain_id: 11155111, max_priority_fee_per_gas: '1000000000',
   max_fee_per_gas: '20000000000', gas_limit: 21000, to: DEST, value: String(BigInt(centi) * CENTI), data: '0x' });
-const proposalId = (out) => out.match(/"event":"proposal_created","data":\[\{"token_id":"\d+","proposal_id":(\d+)/)?.[1];
+const proposalId = (out) => events(out, 'proposal_created')[0]?.data[0].proposal_id;
 
 // setup: new vault with a 0.1 ETH/day policy, 60 s delay
-const t = call(OWNER, 'mint_vault', {}, '0.1 NEAR').out.match(/"token_ids":\["(\d+)"\]/)?.[1];
+const t = events(call(OWNER, 'mint_vault', {}, '0.1 NEAR').out, 'nft_mint')[0]?.data[0].token_ids[0];
 check('vault minted', t !== undefined);
 call(OWNER, 'set_policy', { token_id: t, policy: policy(10) }, '0.05 NEAR');
 check('policy in force', (await view('get_policy', { token_id: t })).has_policy);
 
-// proposals hold their share of the cap
+// proposals queue; the cap is charged when signing (review P1), not when proposing
 let r = call(OWNER, 'propose', { token_id: t, tx: ptx(6) }, '0.05 NEAR');
 const a = proposalId(r.out);
 check('proposal A (0.06 ETH) queued', a !== undefined && (await view('list_proposals', { token_id: t })).length === 1, r.panic);
 r = call(OWNER, 'propose', { token_id: t, tx: ptx(6) }, '0.05 NEAR');
-check('proposal B (0.06 ETH) refused: A holds part of the cap', r.panic === 'ETH daily cap exceeded', r.panic);
+const b = proposalId(r.out);
+check('proposal B (0.06 ETH) also queues; nothing charged yet', b !== undefined && (await view('get_policy', { token_id: t })).spend.eth.spent === '0', r.panic);
+r = call(OWNER, 'propose', { token_id: t, tx: ptx(11) }, '0.05 NEAR');
+check('a single proposal above the cap is refused', r.panic === 'ETH daily cap exceeded', r.panic);
 let e = await view('check_execution', { token_id: t, proposal_id: Number(a) });
 check('A not ready before the delay', !e.ready && e.reason === 'Proposal delay has not passed yet', e.reason);
 
@@ -69,11 +76,7 @@ check('A not ready before the delay', !e.ready && e.reason === 'Proposal delay h
 r = call(OWNER, 'veto_proposal', { token_id: t, proposal_id: Number(a) }, '1 yoctoNEAR');
 check('the owner cannot veto as guardian', r.panic === 'Only the guardian can veto', r.panic);
 r = call(GUARDIAN, 'veto_proposal', { token_id: t, proposal_id: Number(a) }, '1 yoctoNEAR');
-const pol = await view('get_policy', { token_id: t });
-check('the guardian vetoes A and its reservation comes back', !r.panic && pol.spend.eth.spent === '0', r.panic ?? pol.spend.eth.spent);
-r = call(OWNER, 'propose', { token_id: t, tx: ptx(6) }, '0.05 NEAR');
-const b = proposalId(r.out);
-check('B fits now', b !== undefined, r.panic);
+check('the guardian vetoes A', !r.panic && (await view('list_proposals', { token_id: t })).length === 1, r.panic);
 const c = proposalId(call(OWNER, 'propose', { token_id: t, tx: ptx(1) }, '0.05 NEAR').out);
 r = call(GUARDIAN, 'cancel_proposal', { token_id: t, proposal_id: Number(c) }, '1 yoctoNEAR');
 check('the guardian cannot cancel as owner', r.panic === 'Only the vault owner can do this', r.panic);

@@ -24,6 +24,11 @@ const STRANGER = '0x2222222222222222222222222222222222222222';
 const TOKEN = '0x' + 'aa'.repeat(20);
 const SPENDER = '0x' + 'bb'.repeat(20);
 let failures = 0;
+// Events printed by the CLI ("EVENT_JSON:{...}"), parsed instead of matched as text.
+const events = (out, name) => [...out.matchAll(/EVENT_JSON:(\{.*\})/g)]
+  .map((m) => { try { return JSON.parse(m[1]); } catch { return null; } })
+  .filter((e) => e && (!name || e.event === name));
+const applied = (out) => events(out, 'policy_set')[0]?.data[0].applied;
 
 const check = (name, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
@@ -77,7 +82,7 @@ const txInput = (o = {}) => ({
 
 // ---------- new vault: locked, first policy applies at once ----------
 const mint = await call(OWNER, 'mint_vault', {}, '0.1 NEAR');
-const t = mint.out.match(/"token_ids":\["(\d+)"\]/)?.[1];
+const t = events(mint.out, 'nft_mint')[0]?.data[0].token_ids[0];
 check('vault minted', t !== undefined);
 let v = await view('get_policy', { token_id: t });
 check(`vault ${t} starts locked`, v.has_policy === false);
@@ -86,7 +91,7 @@ check('locked vault refuses everything', !c.allowed && c.reason === 'vault has n
 
 let r = await call(OWNER, 'set_policy', { token_id: t, policy: policy(0.1) }, '0.05 NEAR');
 v = await view('get_policy', { token_id: t });
-check('first policy applies at once', r.out.includes('"applied":true') && v.has_policy && v.policy.guardian === GUARDIAN);
+check('first policy applies at once', applied(r.out) === true && v.has_policy && v.policy.guardian === GUARDIAN);
 
 // ---------- check_transaction ----------
 const input = txInput();
@@ -100,6 +105,8 @@ const refusals = [
   ['above the ETH daily cap', txInput({ value: '100000000000000000' }), 'ETH daily cap exceeded'],
   ['ETH to a stranger', txInput({ to: STRANGER }), 'destination not allowed'],
   ['other chain (mainnet)', txInput({ chain_id: 1 }), "chain_id is not the vault's chain"],
+  ['gas limit 0 (unminable, review P2)', txInput({ gas_limit: 0 }), 'gas_limit below 21000'],
+  ['max fee 0 (unminable, review P2)', txInput({ max_fee_per_gas: '0', max_priority_fee_per_gas: '0' }), 'max_fee_per_gas must be above 0'],
   ['approve above max_approval', txInput({ to: TOKEN, value: '0', data: approve(word(500001)) }), "approval above the token's max_approval"],
   ['unlimited approve (2^256-1)', txInput({ to: TOKEN, value: '0', data: approve('f'.repeat(64)) }), 'amount does not fit in 128 bits'],
   ['almost unlimited approve (2^255)', txInput({ to: TOKEN, value: '0', data: approve('8' + '0'.repeat(63)) }), 'amount does not fit in 128 bits'],
@@ -115,7 +122,7 @@ check('approve exactly at max_approval is allowed', c.allowed === true, c.reason
 // ---------- loosening waits; guardian veto ----------
 r = await call(OWNER, 'set_policy', { token_id: t, policy: policy(1) }, '0.05 NEAR');
 v = await view('get_policy', { token_id: t });
-check('raising the cap is queued, not applied', r.out.includes('"applied":false') && v.pending && v.policy.eth_daily_cap === policy(0.1).eth_daily_cap);
+check('raising the cap is queued, not applied', applied(r.out) === false && v.pending && v.policy.eth_daily_cap === policy(0.1).eth_daily_cap);
 r = await call(OWNER, 'veto_pending_policy', { token_id: t }, '1 yoctoNEAR');
 check('the owner cannot veto as guardian', r.panic === 'Only the guardian can veto', r.panic);
 r = await call(GUARDIAN, 'veto_pending_policy', { token_id: t }, '1 yoctoNEAR');
@@ -135,7 +142,19 @@ check('after the delay anyone can apply it', !r.panic && v.policy.eth_daily_cap 
 // ---------- tightening applies at once ----------
 r = await call(OWNER, 'set_policy', { token_id: t, policy: policy(0.01) }, '0.05 NEAR');
 v = await view('get_policy', { token_id: t });
-check('lowering the cap applies at once', r.out.includes('"applied":true') && v.policy.eth_daily_cap === policy(0.01).eth_daily_cap);
+check('lowering the cap applies at once', applied(r.out) === true && v.policy.eth_daily_cap === policy(0.01).eth_daily_cap);
+
+// ---------- review P3: the guardian cannot freeze the vault ----------
+const t0 = Date.now();
+r = await call(OWNER, 'set_policy', { token_id: t, policy: { ...policy(0.01), guardian: null } }, '0.05 NEAR');
+v = await view('get_policy', { token_id: t });
+const lockH = v.pending ? (v.pending.apply_after_ms - t0) / 3_600_000 : 0;
+check('removing the guardian waits the long lock (3 days)', applied(r.out) === false && lockH > 71.9, `${lockH.toFixed(2)} h`);
+r = await call(GUARDIAN, 'veto_pending_policy', { token_id: t }, '1 yoctoNEAR');
+check('the guardian cannot veto its own replacement', r.panic === 'The guardian cannot veto its own replacement', r.panic);
+r = await call(OWNER, 'cancel_pending_policy', { token_id: t }, '1 yoctoNEAR');
+v = await view('get_policy', { token_id: t });
+check('the owner can cancel the replacement', !r.panic && v.pending === null && v.policy.guardian === GUARDIAN, r.panic);
 
 // ---------- transfer clears the policy ----------
 r = await call(OWNER, 'nft_transfer', { receiver_id: GUARDIAN, token_id: t }, '1 yoctoNEAR');

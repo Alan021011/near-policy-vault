@@ -35,6 +35,11 @@ use near_sdk::{near, AccountId};
 use crate::evm::{classify, Address, CallKind, Eip1559Tx};
 
 pub const DAY_MS: u64 = 86_400_000;
+/// Smallest gas limit of any EVM transaction (a plain transfer). Below it a transaction can
+/// never be mined, and signing it would burn a nonce and jam the account (review P2).
+pub const MIN_GAS_LIMIT: u64 = 21_000;
+/// Shortest wait for replacing or removing a guardian, whatever the delay (review P3).
+pub const GUARDIAN_CHANGE_MIN_MS: u64 = 3 * DAY_MS;
 /// Longest delay a policy may ask for (30 days), so a typo cannot lock a vault for years.
 pub const MAX_DELAY_MS: u64 = 30 * DAY_MS;
 /// Bound on every list in a policy, to keep storage and gas predictable.
@@ -129,6 +134,8 @@ impl Policy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyError {
     WrongChain,
+    GasLimitTooLow,
+    ZeroFee,
     FeeOrder,
     GasCostTooHigh,
     DestinationNotAllowed,
@@ -148,6 +155,8 @@ impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::WrongChain => "chain_id is not the vault's chain",
+            Self::GasLimitTooLow => "gas_limit below 21000",
+            Self::ZeroFee => "max_fee_per_gas must be above 0",
             Self::FeeOrder => "max_priority_fee_per_gas above max_fee_per_gas",
             Self::GasCostTooHigh => "max_fee_per_gas * gas_limit above max_gas_cost",
             Self::DestinationNotAllowed => "destination not allowed",
@@ -240,6 +249,13 @@ impl SpendState {
             self.token_window_mut(c).release(r.token_amount.0);
         }
     }
+
+    /// Drops token windows whose 24 hours are over (review P6). Active windows are kept even
+    /// for tokens no longer in the policy, so removing and re-adding a token the same day does
+    /// not give a fresh cap.
+    pub fn prune_expired(&mut self, now_ms: u64) {
+        self.tokens.retain(|t| now_ms < t.window.start_ms.saturating_add(DAY_MS));
+    }
 }
 
 /// What a transaction consumes from the caps if it is queued.
@@ -262,6 +278,12 @@ pub fn check(
     use PolicyError::*;
     if tx.chain_id != policy.chain_id {
         return Err(WrongChain);
+    }
+    if tx.gas_limit < MIN_GAS_LIMIT {
+        return Err(GasLimitTooLow);
+    }
+    if tx.max_fee_per_gas == 0 {
+        return Err(ZeroFee);
     }
     if tx.max_priority_fee_per_gas > tx.max_fee_per_gas {
         return Err(FeeOrder);
@@ -341,6 +363,17 @@ pub fn is_not_looser(new: &Policy, old: &Policy) -> bool {
                 .map(|o| t.daily_cap.0 <= o.daily_cap.0 && t.max_approval.0 <= o.max_approval.0)
                 .unwrap_or(false)
         })
+}
+
+/// `true` when a change would replace or remove a guardian that exists today. Such a change
+/// cannot be vetoed by that guardian and waits `guardian_change_wait_ms` (review P3).
+pub fn replaces_guardian(new: &Policy, old: &Policy) -> bool {
+    old.guardian.is_some() && new.guardian != old.guardian
+}
+
+/// Wait before a guardian replacement applies: twice the delay, and never under 3 days.
+pub fn guardian_change_wait_ms(old: &Policy) -> u64 {
+    old.delay_ms.saturating_mul(2).max(GUARDIAN_CHANGE_MIN_MS)
 }
 
 // ---------- helpers ----------
@@ -504,8 +537,8 @@ mod tests {
         gas_high.gas_limit = 22_000; // 22_000 * 20 gwei > 21_000 * 50 gwei? no: 440k vs 1050k gwei
         gas_high.max_fee_per_gas = 51 * GWEI; // 22_000 * 51 gwei = 1_122_000 gwei > cap
         let mut gas_overflow = eth_tx(DEST, 1);
-        gas_overflow.max_fee_per_gas = u128::MAX;
-        gas_overflow.gas_limit = 2;
+        gas_overflow.max_fee_per_gas = u128::MAX; // u128::MAX * 21_000 overflows
+        gas_overflow.gas_limit = MIN_GAS_LIMIT;
         let mut value_with_data = token_tx(SEL_ERC20_TRANSFER, DEST, word(1));
         value_with_data.value = 1;
         let mut token_not_allowed = token_tx(SEL_ERC20_TRANSFER, DEST, word(1));
@@ -519,8 +552,16 @@ mod tests {
         two_pow_255[0] = 0x80;
         max_uint[31] = 0xff;
 
+        let mut gas_low = eth_tx(DEST, 1);
+        gas_low.gas_limit = MIN_GAS_LIMIT - 1;
+        let mut zero_fee = eth_tx(DEST, 1);
+        zero_fee.max_fee_per_gas = 0;
+        zero_fee.max_priority_fee_per_gas = 0;
+
         let cases: Vec<(&str, Eip1559Tx, PolicyError)> = vec![
             ("wrong chain", wrong_chain, WrongChain),
+            ("gas limit below 21000 (unminable)", gas_low, GasLimitTooLow),
+            ("zero max fee (unminable)", zero_fee, ZeroFee),
             ("priority fee above max fee", fee_order, FeeOrder),
             ("gas cost above max", gas_high, GasCostTooHigh),
             ("gas cost overflows", gas_overflow, GasCostTooHigh),
@@ -585,6 +626,37 @@ mod tests {
         assert!(check(&p, &s, &eth_tx(DEST, ETH / 20), NOW).is_ok());
         assert_eq!(s.tokens.len(), 1);
         assert_eq!(s.tokens[0].window.spent.0, 600_000);
+    }
+
+    #[test]
+    fn prune_drops_only_expired_token_windows() {
+        let p = policy();
+        let mut s = SpendState::default();
+        let tx = token_tx(SEL_ERC20_TRANSFER, DEST, word(10));
+        s.reserve(&check(&p, &s, &tx, NOW).unwrap(), NOW);
+        s.prune_expired(NOW + DAY_MS - 1);
+        assert_eq!(s.tokens.len(), 1, "an active window must stay");
+        s.prune_expired(NOW + DAY_MS);
+        assert!(s.tokens.is_empty(), "an expired window must go");
+    }
+
+    #[test]
+    fn guardian_replacement_rules() {
+        let old = policy(); // delay 1 h, guardian set
+        let mut removed = policy();
+        removed.guardian = None;
+        let mut changed = policy();
+        changed.guardian = Some("other.testnet".parse().unwrap());
+        assert!(replaces_guardian(&removed, &old));
+        assert!(replaces_guardian(&changed, &old));
+        assert!(!replaces_guardian(&old.clone(), &old));
+        let mut no_guardian = policy();
+        no_guardian.guardian = None;
+        assert!(!replaces_guardian(&old, &no_guardian), "adding a guardian is not a replacement");
+        assert_eq!(guardian_change_wait_ms(&old), GUARDIAN_CHANGE_MIN_MS, "short delays still wait 3 days");
+        let mut slow = policy();
+        slow.delay_ms = 2 * DAY_MS;
+        assert_eq!(guardian_change_wait_ms(&slow), 4 * DAY_MS, "long delays wait twice the delay");
     }
 
     #[test]

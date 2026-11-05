@@ -16,17 +16,30 @@ const NEAR = process.env.NEAR_CLI || join(homedir(), '.cargo', 'bin', process.pl
 const RPC = process.env.NEAR_RPC || 'https://rpc.testnet.near.org';
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 let failures = 0;
+// Events printed by the CLI ("EVENT_JSON:{...}"), parsed instead of matched as text.
+const events = (out, name) => [...out.matchAll(/EVENT_JSON:(\{.*\})/g)]
+  .map((m) => { try { return JSON.parse(m[1]); } catch { return null; } })
+  .filter((e) => e && (!name || e.event === name));
 
 const check = (name, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
   if (!ok) failures++;
 };
 
-async function rpc(method, params) {
-  const j = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }).then((r) => r.json());
-  if (j.error) throw new Error(`${method}: ${JSON.stringify(j.error)}`);
-  return j.result;
+// The public RPC rate-limits bursts (this script reads every vault), so retry with backoff.
+async function rpc(method, params, attempt = 1) {
+  try {
+    const res = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+    if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status}`);
+    const j = await res.json();
+    if (j.error) throw new Error(`${method}: ${JSON.stringify(j.error)}`);
+    return j.result;
+  } catch (e) {
+    if (attempt >= 5) throw e;
+    await new Promise((r) => setTimeout(r, 2000 * attempt));
+    return rpc(method, params, attempt + 1);
+  }
 }
 
 async function view(account, method, args) {
@@ -65,10 +78,10 @@ for (let i = 0; i < supply; i++) {
 
 // 2. A new vault is resolved within the mint transaction.
 const out = call(OWNER, 'mint_vault', {}, '0.1 NEAR');
-const tid = out.match(/"token_ids":\["(\d+)"\]/)?.[1];
+const tid = events(out, 'nft_mint')[0]?.data[0].token_ids[0];
 check('new vault minted', tid !== undefined);
 if (tid !== undefined) {
-  check('mint emitted vault_address in the same transaction', out.includes('"event":"vault_address"'));
+  check('mint emitted vault_address in the same transaction', events(out, 'vault_address').length === 1);
   const info = await view(VAULT, 'vault_info', { token_id: tid });
   const indep = await independentAddress(info.signer_id, info.path);
   check(`vault ${tid}: contract address equals independent derivation`, info.evm_address === indep, `${info.evm_address} vs ${indep}`);
