@@ -4,9 +4,15 @@
 //! The contract never signs a hash handed to it by a caller. It stores the
 //! transaction fields, checks the policy on those fields and computes the hash here.
 //!
-//! STATUS: written but not compiled or tested yet. The RLP unit tests use the
-//! examples from the Ethereum RLP specification; golden vectors for the signing
-//! hash (generated with viem) are still to be added.
+//! Tested: the RLP unit tests use the examples from the Ethereum RLP specification, and
+//! `tests/golden_vectors.rs` checks the serialization and the signing hash against 19
+//! vectors generated with viem (`scripts/gen-vectors.mjs`).
+//!
+//! Limits the policy (M5) must cover, because this module only classifies:
+//! - `is_max_uint256` detects only the exact maximum. An approval of 2^255 is practically
+//!   unlimited too, so approvals must be capped by amount, not just checked for the maximum.
+//! - `classify` does not look at the token contract (`to`) and accepts the zero address as
+//!   recipient or spender.
 
 use sha3::{Digest, Keccak256};
 
@@ -237,9 +243,6 @@ mod tests {
         d.to = [0x22; 20];
         assert_ne!(a.signing_hash(), d.signing_hash());
     }
-
-    // TODO: add golden vectors generated with viem (serializeTransaction + keccak256)
-    // and assert that `signing_hash` matches them byte for byte.
 
     fn calldata(selector: [u8; 4], addr_byte: u8, amount: [u8; 32]) -> Vec<u8> {
         let mut d = Vec::new();

@@ -16,9 +16,9 @@ An NFT that **owns an account on another chain** and can only move its funds und
 
 | Piece | State |
 |---|---|
-| Threat model | Written and approved by the author (design stage) |
+| Threat model (`docs/THREAT_MODEL.md`) | 15 threats; approved by the author, updated after the M3 review. Most mitigations are still planned |
 | EIP-1559 signing hash and RLP encoder (`contract/src/evm.rs`) | Compiles; 9 unit tests pass; matches viem on 19 golden vectors (negative control checked) |
-| Chain Signatures on testnet (`scripts/a1-prepare.mjs`, `a1-verify.mjs`) | `sign` called from a NEAR account with a 1 yoctoNEAR deposit; returned signature recovers the derived address (checked with viem). **Broadcast to Sepolia and confirmed** (tx 0xfe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1, block 12064522, status success; `scripts/a1-broadcast.mjs`). Called from a NEAR account, not yet from a contract |
+| Chain Signatures on testnet (`scripts/a1-prepare.mjs`, `a1-verify.mjs`) | `sign` called from a NEAR account with a 1 yoctoNEAR deposit; returned signature recovers the derived address (checked with viem). **Broadcast to Sepolia and confirmed** (tx 0xfe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1, block 12064522, status success; `scripts/a1-broadcast.mjs`). Called from a NEAR account, not yet from a contract. These A1 scripts record a one-off run: the signature is hard-coded and nonce 0 is spent, so they cannot be re-run as they are |
 | NFT base contract, NEP-171/177/178/181 (`contract/src/lib.rs`) | Anyone mints a vault for themselves; path `vault-<id>`. 25 unit tests pass (negative controls checked). Deployed on testnet at `m3.alan-vault-2026.testnet` and upgraded in place with `migrate`. `scripts/m3-testnet-check.mjs` passes 16/16 live checks (approved transfers, `nft_transfer_call` kept / returned / receiver panic, approval refunds). Vault 0 has EVM address `0xb4bbbae0c0e057f0d85233d9394088e449d5b843` (derived, unfunded) |
 | Policy, proposals, MPC integration from the contract, two-phase sale | Not started |
 | Web page, attack suite | Not started |
