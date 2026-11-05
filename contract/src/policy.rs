@@ -365,6 +365,40 @@ pub fn is_not_looser(new: &Policy, old: &Policy) -> bool {
         })
 }
 
+/// A cancellation: a 0-value transfer from the vault to itself that re-uses a nonce, so whatever
+/// else was signed with that nonce can no longer be mined (threat 1, review S3). It moves no
+/// funds, so only the gas rules and the ETH cap (for the gas) apply. A locked vault cannot cancel.
+pub fn check_cancel(
+    policy: &Policy,
+    spend: &SpendState,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    now_ms: u64,
+) -> Result<Reservation, PolicyError> {
+    use PolicyError::*;
+    if policy.chain_id == 0 {
+        return Err(WrongChain);
+    }
+    if gas_limit < MIN_GAS_LIMIT {
+        return Err(GasLimitTooLow);
+    }
+    if max_fee_per_gas == 0 {
+        return Err(ZeroFee);
+    }
+    if max_priority_fee_per_gas > max_fee_per_gas {
+        return Err(FeeOrder);
+    }
+    let gas_cost = max_fee_per_gas.checked_mul(gas_limit as u128).ok_or(GasCostTooHigh)?;
+    if gas_cost > policy.max_gas_cost.0 {
+        return Err(GasCostTooHigh);
+    }
+    if gas_cost > spend.eth.remaining(policy.eth_daily_cap.0, now_ms) {
+        return Err(EthCapExceeded);
+    }
+    Ok(Reservation { eth: U128(gas_cost), token_contract: None, token_amount: U128(0) })
+}
+
 /// `true` when a change would replace or remove a guardian that exists today. Such a change
 /// cannot be vetoed by that guardian and waits `guardian_change_wait_ms` (review P3).
 pub fn replaces_guardian(new: &Policy, old: &Policy) -> bool {
@@ -638,6 +672,23 @@ mod tests {
         assert_eq!(s.tokens.len(), 1, "an active window must stay");
         s.prune_expired(NOW + DAY_MS);
         assert!(s.tokens.is_empty(), "an expired window must go");
+    }
+
+    #[test]
+    fn cancellation_rules() {
+        let p = policy();
+        let s = SpendState::default();
+        let r = check_cancel(&p, &s, 21_000, 20 * GWEI, GWEI, NOW).unwrap();
+        assert_eq!(r.eth.0, 21_000 * 20 * GWEI, "a cancellation only reserves its gas");
+        assert_eq!(r.token_contract, None);
+        assert_eq!(check_cancel(&Policy::locked(), &s, 21_000, GWEI, GWEI, NOW), Err(PolicyError::WrongChain));
+        assert_eq!(check_cancel(&p, &s, 20_999, GWEI, GWEI, NOW), Err(PolicyError::GasLimitTooLow));
+        assert_eq!(check_cancel(&p, &s, 21_000, 0, 0, NOW), Err(PolicyError::ZeroFee));
+        assert_eq!(check_cancel(&p, &s, 21_000, GWEI, 2 * GWEI, NOW), Err(PolicyError::FeeOrder));
+        assert_eq!(check_cancel(&p, &s, 21_000, 51 * GWEI, GWEI, NOW), Err(PolicyError::GasCostTooHigh));
+        let mut full = SpendState::default();
+        full.eth.reserve(p.eth_daily_cap.0, NOW);
+        assert_eq!(check_cancel(&p, &full, 21_000, GWEI, GWEI, NOW), Err(PolicyError::EthCapExceeded));
     }
 
     #[test]

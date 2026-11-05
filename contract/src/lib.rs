@@ -80,12 +80,22 @@ trait ChainSignatures {
 
 // ---------- M7: signing ----------
 
-/// Deposit attached to the signer's `sign` (measured in A1: 1 yoctoNEAR is accepted).
+/// Default deposit attached to the signer's `sign` (measured in A1: 1 yoctoNEAR is accepted).
+/// The caller can attach a different one (review S4).
 pub const SIGN_DEPOSIT: NearToken = NearToken::from_yoctonear(1);
-/// Gas kept for our callback; all the remaining gas goes to `sign`.
+/// Gas kept for our callback (measured: 2.76 Tgas used); all the remaining gas goes to `sign`.
 pub const GAS_FOR_SIGN_CALLBACK: Gas = Gas::from_tgas(20);
+/// Least prepaid gas to start a signature (measured: about 14 Tgas in total; review S7).
+pub const MIN_PREPAID_GAS_FOR_SIGNING: Gas = Gas::from_tgas(60);
 /// Storage paid at execution for the signed record written later by the callback.
 pub const SIGNED_RECORD_RESERVE_BYTES: u64 = 1000;
+/// After this long without an answer the owner may abandon a signature (review S2). Far above
+/// the MPC network's own timeout (about 200 blocks).
+pub const INFLIGHT_TIMEOUT_MS: u64 = 3_600_000;
+/// Longest signer answer read by the callback.
+pub const MAX_SIGN_RESPONSE_LEN: usize = 4096;
+/// `proposal_id` stored in the history for a cancellation (it has no proposal).
+pub const CANCEL_PROPOSAL_ID: u64 = u64::MAX;
 
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq)]
@@ -129,13 +139,32 @@ pub struct SignResponse {
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct InFlight {
-    pub proposal: Proposal,
+    /// The proposal being signed, or `None` for a cancellation.
+    pub proposal: Option<Proposal>,
+    pub tx: ProposalTx,
     pub nonce: u64,
+    /// `true` if `nonce` was the vault's next nonce (it was advanced); `false` when an earlier
+    /// nonce is being signed again (a pinned retry, a replacement or a cancellation).
+    pub from_next: bool,
     pub signing_hash: String,
     pub charge: Reservation,
-    /// Who paid the storage reserve (refunded if the signature fails).
+    /// Whether `charge` was actually added to the caps (an identical retry is not charged twice).
+    pub charged: bool,
+    /// Who paid the storage reserve (refunded if no record is written).
     pub payer: AccountId,
     pub started_ms: u64,
+}
+
+/// A nonce for which a signature may exist without the contract knowing it (review S1/S3): the
+/// signer failed, answered something unreadable, or the owner abandoned the wait. The nonce is
+/// never given to a different transaction automatically; it is filled by re-signing the same
+/// proposal (pinned to it), a replacement or a cancellation.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UncertainNonce {
+    pub nonce: u64,
+    pub signing_hash: String,
+    pub since_ms: u64,
 }
 
 /// A transaction the MPC network signed for a vault, ready to broadcast by anyone.
@@ -204,6 +233,9 @@ enum StorageKey {
     Nonces,
     InFlight,
     Signed,
+    SignedVersions,
+    Uncertain,
+    Pinned,
 }
 
 /// Fixed-size record (same storage whether resolved or not, so it is paid in full at mint).
@@ -301,13 +333,21 @@ pub struct PolicyVault {
     next_proposal_id: u64,
     /// M7: the signature each vault is waiting for, if any.
     inflight: LookupMap<TokenId, InFlight>,
-    /// M7: every signed transaction, keyed by "<token_id>:<nonce>".
+    /// M7: signed transactions. The first version of a nonce is at "<token_id>:<nonce>", later
+    /// versions (re-signatures of the same nonce) at "<token_id>:<nonce>#<v>".
     signed: LookupMap<String, SignedRecord>,
+    /// M7 review S5: how many versions a nonce has (absent = 1 when a first version exists).
+    signed_versions: LookupMap<String, u32>,
+    /// M7 review S1/S3: nonces whose signature outcome is unknown, per vault.
+    uncertain: LookupMap<TokenId, Vec<UncertainNonce>>,
+    /// M7 review S3: proposal id -> the nonce it must be signed with (a retry after an uncertain
+    /// outcome produces the identical transaction, so it can never be paid twice).
+    pinned: LookupMap<u64, u64>,
 }
 
-/// State layout deployed for M6 (commits 7a95f8a and 9944426), used only by `migrate`.
+/// State layout deployed for M7 (commit f7e4716), used only by `migrate`.
 #[near(serializers = [borsh])]
-struct PolicyVaultV5 {
+struct PolicyVaultV6 {
     tokens: NonFungibleToken,
     metadata: LazyOption<NFTContractMetadata>,
     next_token_id: u64,
@@ -317,10 +357,20 @@ struct PolicyVaultV5 {
     policies: LookupMap<TokenId, VaultPolicyState>,
     nonces: LookupMap<TokenId, u64>,
     next_proposal_id: u64,
+    inflight: LookupMap<TokenId, InFlight>,
+    signed: LookupMap<String, SignedRecord>,
 }
 
 fn signed_key(token_id: &str, nonce: u64) -> String {
     format!("{token_id}:{nonce}")
+}
+
+fn signed_version_key(token_id: &str, nonce: u64, version: u32) -> String {
+    if version == 0 {
+        signed_key(token_id, nonce)
+    } else {
+        format!("{token_id}:{nonce}#{version}")
+    }
 }
 
 // ---------- M5: policy state, inputs and views ----------
@@ -498,15 +548,20 @@ impl PolicyVault {
             next_proposal_id: 0,
             inflight: LookupMap::new(StorageKey::InFlight),
             signed: LookupMap::new(StorageKey::Signed),
+            signed_versions: LookupMap::new(StorageKey::SignedVersions),
+            uncertain: LookupMap::new(StorageKey::Uncertain),
+            pinned: LookupMap::new(StorageKey::Pinned),
         }
     }
 
-    /// Upgrades the state written by the M6 deployment. Only the contract account can call it.
+    /// Upgrades the state written by the M7 deployment. Only the contract account can call it.
     /// Calling it on the current layout fails, because the old layout no longer parses.
+    /// `InFlight` changed shape, so this is only safe when no vault has a signature in flight
+    /// (checked before deploying). Stored `SignedRecord`s keep their shape and stay readable.
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: PolicyVaultV5 = env::state_read().expect("no V5 state to migrate");
+        let old: PolicyVaultV6 = env::state_read().expect("no V6 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
@@ -517,8 +572,11 @@ impl PolicyVault {
             policies: old.policies,
             nonces: old.nonces,
             next_proposal_id: old.next_proposal_id,
-            inflight: LookupMap::new(StorageKey::InFlight),
-            signed: LookupMap::new(StorageKey::Signed),
+            inflight: old.inflight,
+            signed: old.signed,
+            signed_versions: LookupMap::new(StorageKey::SignedVersions),
+            uncertain: LookupMap::new(StorageKey::Uncertain),
+            pinned: LookupMap::new(StorageKey::Pinned),
         }
     }
 
@@ -987,12 +1045,12 @@ impl PolicyVault {
     pub fn check_execution(&self, token_id: TokenId, proposal_id: u64) -> ExecutionCheck {
         require_token_exists(&self.tokens, &token_id);
         let nonce = self.nonces.get(&token_id).unwrap_or(0);
-        match self.prepare_execution(&token_id, proposal_id, env::block_timestamp_ms()) {
-            Ok((tx, _)) => ExecutionCheck {
+        match self.prepare_execution(&token_id, proposal_id, env::block_timestamp_ms(), None) {
+            Ok(prep) => ExecutionCheck {
                 ready: true,
                 reason: None,
-                nonce,
-                signing_hash: Some(hex0x(&tx.signing_hash())),
+                nonce: prep.tx.nonce,
+                signing_hash: Some(hex0x(&prep.tx.signing_hash())),
             },
             Err(reason) => ExecutionCheck { ready: false, reason: Some(reason), nonce, signing_hash: None },
         }
@@ -1001,120 +1059,181 @@ impl PolicyVault {
 
 // ---------- M7: signing entry points ----------
 
+/// What `prepare_execution` decides for a proposal: the exact transaction (with its nonce), what
+/// it charges to the caps, and whether the nonce is the vault's next one.
+pub struct PreparedExecution {
+    pub tx: Eip1559Tx,
+    pub charge: Reservation,
+    pub from_next: bool,
+}
+
 #[near]
 impl PolicyVault {
-    /// Signs a ready proposal. Only the owner. In one synchronous step it charges the daily
-    /// caps, takes the vault's next nonce and locks the vault (no second signature, no
-    /// transfer) until the MPC answer arrives in `on_signed`. The deposit must cover
-    /// `SIGNED_RECORD_RESERVE_BYTES` of storage plus 1 yoctoNEAR for the signer; the rest is
-    /// refunded. Returns the promise, so the caller sees whether the signature was stored.
+    /// Signs a ready proposal. Only the owner, with at least 60 Tgas. In one synchronous step it
+    /// charges the daily caps, takes the nonce and locks the vault (no second signature, no
+    /// transfer) until the MPC answer arrives in `on_signed`.
+    /// - Nonce: the vault's next one; a proposal pinned after an uncertain outcome always uses
+    ///   its pinned nonce; `replace_nonce` signs it with an earlier, already signed nonce instead
+    ///   (to replace a transaction that is stuck, e.g. with too low a fee). Two transactions
+    ///   with the same nonce can never both be mined.
+    /// - Deposit: storage for the signed record plus `sign_deposit` for the signer (default
+    ///   1 yoctoNEAR, review S4); the rest is refunded.
+    /// Returns the promise, so the caller sees whether the signature was stored.
     #[payable]
-    pub fn execute_proposal(&mut self, token_id: TokenId, proposal_id: u64) -> Promise {
-        let owner = self.assert_owner(&token_id);
-        require!(self.inflight.get(&token_id).is_none(), "A signature is already in flight for this vault");
-        require!(
-            self.vaults.get(&token_id).map(|v| v.resolved).unwrap_or(false),
-            "Vault address not resolved yet; call resolve_vault_address first"
-        );
-        let before = env::storage_usage();
-        let (proposal, tx, charge) = self.commit_execution(&token_id, proposal_id);
-        let hash = tx.signing_hash();
-        let hash_hex = hex0x(&hash);
-        self.inflight.insert(
-            &token_id,
-            &InFlight {
-                proposal: proposal.clone(),
-                nonce: tx.nonce,
-                signing_hash: hash_hex.clone(),
-                charge,
-                payer: owner.clone(),
-                started_ms: env::block_timestamp_ms(),
-            },
-        );
-        // Storage: whatever this call added, plus the record the callback will write.
-        let added = env::storage_usage().saturating_sub(before) + SIGNED_RECORD_RESERVE_BYTES;
-        let cost = env::storage_byte_cost().saturating_mul(added.into());
-        let attached = env::attached_deposit();
-        require!(
-            cost.saturating_add(SIGN_DEPOSIT) <= attached,
-            format!(
-                "Must attach {} to cover storage and the signer deposit",
-                cost.saturating_add(SIGN_DEPOSIT).exact_amount_display()
-            )
-        );
-        refund_if_any(&owner, attached.saturating_sub(cost).saturating_sub(SIGN_DEPOSIT));
-        emit_policy_event(
-            "signature_requested",
-            &token_id,
-            json!({ "proposal_id": proposal.id, "nonce": tx.nonce, "signing_hash": hash_hex }),
-        );
-        let hex_no_prefix = hash_hex.trim_start_matches("0x").to_string();
-        ext_signer::ext(self.signer_id.clone())
-            .with_attached_deposit(SIGN_DEPOSIT)
-            .with_unused_gas_weight(1)
-            .sign(SignRequest {
-                domain_id: SECP256K1_DOMAIN_ID,
-                path: vault_path_for(&token_id),
-                payload_v2: SignPayload::Ecdsa(hex_no_prefix),
-            })
-            .then(
-                Self::ext(env::current_account_id())
-                    .with_static_gas(GAS_FOR_SIGN_CALLBACK)
-                    .with_unused_gas_weight(0)
-                    .on_signed(token_id),
-            )
-    }
-
-    /// Callback of the signer's `sign`. Never panics: on success it stores the signed
-    /// transaction; on any failure (signer error, malformed answer, wrong key) it undoes the
-    /// execution (releases the caps, restores the nonce, puts the proposal back in the queue)
-    /// and refunds the storage reserve. Returns whether a signature was stored.
-    #[private]
-    pub fn on_signed(
+    pub fn execute_proposal(
         &mut self,
         token_id: TokenId,
-        #[callback_result] result: Result<SignResponse, PromiseError>,
-    ) -> bool {
-        let Some(f) = self.inflight.remove(&token_id) else {
-            env::log_str(&format!("on_signed: nothing in flight for token {token_id}"));
+        proposal_id: u64,
+        replace_nonce: Option<u64>,
+        sign_deposit: Option<U128>,
+    ) -> Promise {
+        let owner = self.assert_owner(&token_id);
+        self.assert_can_sign(&token_id);
+        let before = env::storage_usage();
+        let now = env::block_timestamp_ms();
+        let (proposal, prep, charged) = self.commit_execution(&token_id, proposal_id, replace_nonce);
+        let signing_hash = hex0x(&prep.tx.signing_hash());
+        let f = InFlight {
+            tx: proposal.tx.clone(),
+            proposal: Some(proposal),
+            nonce: prep.tx.nonce,
+            from_next: prep.from_next,
+            signing_hash,
+            charge: prep.charge,
+            charged,
+            payer: owner,
+            started_ms: now,
+        };
+        self.start_signing(&token_id, f, before, sign_deposit)
+    }
+
+    /// Signs a 0-value transfer from the vault to itself with an already signed `nonce`, so
+    /// whatever else was signed with that nonce can no longer be mined (threat 1; review S3).
+    /// Only the owner. It moves no funds, so it does not wait for the delay; it only has to fit
+    /// the gas rules and the ETH cap (the gas is charged). `gas_limit` defaults to 21000.
+    #[payable]
+    pub fn cancel_nonce(
+        &mut self,
+        token_id: TokenId,
+        nonce: u64,
+        max_fee_per_gas: U128,
+        max_priority_fee_per_gas: U128,
+        gas_limit: Option<u64>,
+        sign_deposit: Option<U128>,
+    ) -> Promise {
+        let owner = self.assert_owner(&token_id);
+        self.assert_can_sign(&token_id);
+        require!(
+            nonce < self.nonces.get(&token_id).unwrap_or(0),
+            "Only a nonce that was already signed can be cancelled"
+        );
+        let before = env::storage_usage();
+        let now = env::block_timestamp_ms();
+        let mut st = self
+            .policies
+            .get(&token_id)
+            .unwrap_or_else(|| env::panic_str("vault has no policy (locked)"));
+        st.spend.prune_expired(now);
+        let gas_limit = gas_limit.unwrap_or(policy::MIN_GAS_LIMIT);
+        let charge = policy::check_cancel(
+            &st.policy,
+            &st.spend,
+            gas_limit,
+            max_fee_per_gas.0,
+            max_priority_fee_per_gas.0,
+            now,
+        )
+        .unwrap_or_else(|e| env::panic_str(&e.to_string()));
+        st.spend.reserve(&charge, now);
+        let chain_id = st.policy.chain_id;
+        self.policies.insert(&token_id, &st);
+        let own = self.vaults.get(&token_id).expect("checked by assert_can_sign");
+        let tx = ProposalTx {
+            chain_id,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to: hex0x(&own.evm_address),
+            value: U128(0),
+            data: "0x".into(),
+        };
+        let signing_hash = hex0x(&tx.to_tx(nonce).expect("built from valid fields").signing_hash());
+        let f = InFlight {
+            proposal: None,
+            tx,
+            nonce,
+            from_next: false,
+            signing_hash,
+            charge,
+            charged: true,
+            payer: owner,
+            started_ms: now,
+        };
+        self.start_signing(&token_id, f, before, sign_deposit)
+    }
+
+    /// Callback of the signer's `sign`. Reads the answer by hand and never panics (review S1).
+    /// Only accepts the answer for the signature currently in flight (`signing_hash`).
+    /// - Readable and it recovers to the vault key: stores the signed transaction.
+    /// - Readable but it does not recover to the vault key: it cannot move the vault's funds, so
+    ///   everything is undone (caps, nonce, queue).
+    /// - Signer failed or answer unreadable: a valid signature might exist, so the outcome is
+    ///   "uncertain": the nonce stays used, the charge stays, and the proposal goes back to the
+    ///   queue pinned to that nonce (review S3).
+    /// Returns whether a signature was stored.
+    #[private]
+    pub fn on_signed(&mut self, token_id: TokenId, signing_hash: String) -> bool {
+        match self.inflight.get(&token_id) {
+            Some(f) if f.signing_hash == signing_hash => {}
+            _ => {
+                env::log_str(&format!("on_signed: stale or unknown answer for token {token_id}"));
+                return false;
+            }
+        }
+        let f = self.inflight.remove(&token_id).expect("checked above");
+        let resp = match env::promise_result_checked(0, MAX_SIGN_RESPONSE_LEN) {
+            Err(_) => {
+                self.mark_uncertain(&token_id, &f, "signer call failed");
+                return false;
+            }
+            Ok(bytes) => match near_sdk::serde_json::from_slice::<SignResponse>(&bytes) {
+                Ok(r) => r,
+                Err(_) => {
+                    self.mark_uncertain(&token_id, &f, "unreadable signer answer");
+                    return false;
+                }
+            },
+        };
+        let vault = self.vaults.get(&token_id).filter(|v| v.resolved);
+        let hash: Option<[u8; 32]> = policy::parse_hex(&f.signing_hash).and_then(|v| v.try_into().ok());
+        let (Some(vault), Some(hash), Ok(tx)) = (vault, hash, f.tx.to_tx(f.nonce)) else {
+            self.mark_uncertain(&token_id, &f, "stored data unreadable");
             return false;
         };
-        let outcome = self.check_signer_answer(&token_id, &f, result);
-        match outcome {
+        match verify_signature(&resp, &hash, &vault.public_key) {
             Ok((parity, r, s)) => {
-                let Ok(tx) = f.proposal.tx.to_tx(f.nonce) else {
-                    self.undo_execution(&token_id, &f, "stored proposal no longer parses");
-                    return false;
-                };
-                let raw = tx.rlp_signed(parity, &r, &s);
-                let record = SignedRecord {
-                    token_id: token_id.clone(),
-                    proposal_id: f.proposal.id,
-                    nonce: f.nonce,
-                    signing_hash: f.signing_hash.clone(),
-                    signed_tx: hex0x(&raw),
-                    tx_hash: hex0x(&keccak256(&raw)),
-                    owner: f.payer.clone(),
-                    signed_ms: env::block_timestamp_ms(),
-                };
-                self.signed.insert(&signed_key(&token_id, f.nonce), &record);
-                emit_policy_event(
-                    "transaction_signed",
-                    &token_id,
-                    json!({
-                        "proposal_id": record.proposal_id,
-                        "nonce": record.nonce,
-                        "tx_hash": record.tx_hash,
-                        "signed_tx": record.signed_tx,
-                    }),
-                );
+                self.store_signed(&token_id, &f, &tx, parity, &r, &s);
                 true
             }
             Err(reason) => {
-                self.undo_execution(&token_id, &f, reason);
+                self.reject_signature(&token_id, &f, reason);
                 false
             }
         }
+    }
+
+    /// The owner stops waiting for a signature that never got an answer (review S2). Only after
+    /// `INFLIGHT_TIMEOUT_MS`. The outcome is treated as uncertain: the nonce is not reused for a
+    /// different transaction.
+    pub fn abandon_signature(&mut self, token_id: TokenId) {
+        self.assert_owner(&token_id);
+        let f = self.inflight.get(&token_id).unwrap_or_else(|| env::panic_str("No signature in flight"));
+        require!(
+            env::block_timestamp_ms() >= f.started_ms.saturating_add(INFLIGHT_TIMEOUT_MS),
+            "The signature may still arrive; wait for the timeout"
+        );
+        self.inflight.remove(&token_id);
+        self.mark_uncertain(&token_id, &f, "abandoned after timeout");
     }
 
     /// The signature a vault is waiting for, if any.
@@ -1123,52 +1242,211 @@ impl PolicyVault {
         self.inflight.get(&token_id)
     }
 
-    pub fn get_signed(&self, token_id: TokenId, nonce: u64) -> Option<SignedRecord> {
+    /// Nonces of a vault whose signature outcome is unknown.
+    pub fn get_uncertain(&self, token_id: TokenId) -> Vec<UncertainNonce> {
         require_token_exists(&self.tokens, &token_id);
-        self.signed.get(&signed_key(&token_id, nonce))
+        self.uncertain.get(&token_id).unwrap_or_default()
     }
 
-    /// Signed transactions of a vault by nonce, from `from_nonce` (default 0), at most `limit`
-    /// (default 20). A buyer compares these with the external account's nonce (M8).
+    /// The latest signed version of a nonce.
+    pub fn get_signed(&self, token_id: TokenId, nonce: u64) -> Option<SignedRecord> {
+        require_token_exists(&self.tokens, &token_id);
+        self.signed_versions_of(&token_id, nonce).pop()
+    }
+
+    /// Every signed version of a nonce, oldest first (review S5).
+    pub fn get_signed_versions(&self, token_id: TokenId, nonce: u64) -> Vec<SignedRecord> {
+        require_token_exists(&self.tokens, &token_id);
+        self.signed_versions_of(&token_id, nonce)
+    }
+
+    /// Signed transactions of a vault, every version, by nonce from `from_nonce` (default 0),
+    /// at most `limit` records (default 20, max 100). A buyer compares these with the external
+    /// account's nonce (M8).
     pub fn list_signed(&self, token_id: TokenId, from_nonce: Option<u64>, limit: Option<u64>) -> Vec<SignedRecord> {
         require_token_exists(&self.tokens, &token_id);
         let next = self.nonces.get(&token_id).unwrap_or(0);
-        let from = from_nonce.unwrap_or(0);
-        (from..next)
-            .take(limit.unwrap_or(20).min(100) as usize)
-            .filter_map(|n| self.signed.get(&signed_key(&token_id, n)))
+        let max = limit.unwrap_or(20).min(100) as usize;
+        (from_nonce.unwrap_or(0)..next)
+            .flat_map(|n| self.signed_versions_of(&token_id, n))
+            .take(max)
             .collect()
     }
 }
 
 impl PolicyVault {
-    fn check_signer_answer(
-        &self,
-        token_id: &TokenId,
-        f: &InFlight,
-        result: Result<SignResponse, PromiseError>,
-    ) -> Result<(u8, [u8; 32], [u8; 32]), &'static str> {
-        let resp = result.map_err(|_| "signer call failed")?;
-        let vault = self.vaults.get(token_id).filter(|v| v.resolved).ok_or("vault key unknown")?;
-        let hash: [u8; 32] = policy::parse_hex(&f.signing_hash)
-            .and_then(|v| v.try_into().ok())
-            .ok_or("stored hash malformed")?;
-        verify_signature(&resp, &hash, &vault.public_key)
+    fn assert_can_sign(&self, token_id: &TokenId) {
+        require!(
+            env::prepaid_gas() >= MIN_PREPAID_GAS_FOR_SIGNING,
+            "Attach at least 60 Tgas to sign"
+        );
+        require!(self.inflight.get(token_id).is_none(), "A signature is already in flight for this vault");
+        require!(
+            self.vaults.get(token_id).map(|v| v.resolved).unwrap_or(false),
+            "Vault address not resolved yet; call resolve_vault_address first"
+        );
     }
 
-    /// Reverts `commit_execution` after a failed signature. Safe because only one signature
-    /// per vault can be in flight and the NFT cannot change owner meanwhile.
-    fn undo_execution(&mut self, token_id: &TokenId, f: &InFlight, reason: &str) {
-        let mut requeued = false;
-        if let Some(mut st) = self.policies.get(token_id) {
-            st.spend.release(&f.charge);
-            if f.proposal.owner_epoch == self.owner_epoch(token_id) && st.proposals.len() < MAX_QUEUED_PROPOSALS {
-                st.proposals.insert(0, f.proposal.clone());
-                requeued = true;
-            }
-            self.policies.insert(token_id, &st);
+    /// Records the signature in flight, settles the storage deposit and calls the signer.
+    fn start_signing(&mut self, token_id: &TokenId, f: InFlight, before: u64, sign_deposit: Option<U128>) -> Promise {
+        let deposit = sign_deposit.map(|d| NearToken::from_yoctonear(d.0)).unwrap_or(SIGN_DEPOSIT);
+        self.inflight.insert(token_id, &f);
+        // Storage: whatever this call added, plus the record the callback will write.
+        let added = env::storage_usage().saturating_sub(before) + SIGNED_RECORD_RESERVE_BYTES;
+        let cost = env::storage_byte_cost().saturating_mul(added.into());
+        let attached = env::attached_deposit();
+        require!(
+            cost.saturating_add(deposit) <= attached,
+            format!(
+                "Must attach {} to cover storage and the signer deposit",
+                cost.saturating_add(deposit).exact_amount_display()
+            )
+        );
+        refund_if_any(&f.payer, attached.saturating_sub(cost).saturating_sub(deposit));
+        emit_policy_event(
+            "signature_requested",
+            token_id,
+            json!({
+                "kind": if f.proposal.is_some() { "proposal" } else { "cancel" },
+                "proposal_id": f.proposal.as_ref().map(|p| p.id),
+                "nonce": f.nonce,
+                "signing_hash": f.signing_hash,
+            }),
+        );
+        ext_signer::ext(self.signer_id.clone())
+            .with_attached_deposit(deposit)
+            .with_unused_gas_weight(1)
+            .sign(SignRequest {
+                domain_id: SECP256K1_DOMAIN_ID,
+                path: vault_path_for(token_id),
+                payload_v2: SignPayload::Ecdsa(f.signing_hash.trim_start_matches("0x").to_string()),
+            })
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_SIGN_CALLBACK)
+                    .with_unused_gas_weight(0)
+                    .on_signed(token_id.clone(), f.signing_hash.clone()),
+            )
+    }
+
+    fn signed_versions_of(&self, token_id: &str, nonce: u64) -> Vec<SignedRecord> {
+        let key0 = signed_key(token_id, nonce);
+        if self.signed.get(&key0).is_none() {
+            return Vec::new();
         }
-        self.nonces.insert(token_id, &f.nonce);
+        let count = self.signed_versions.get(&key0).unwrap_or(1);
+        (0..count).filter_map(|v| self.signed.get(&signed_version_key(token_id, nonce, v))).collect()
+    }
+
+    fn is_uncertain(&self, token_id: &TokenId, nonce: u64, signing_hash: &str) -> bool {
+        self.uncertain
+            .get(token_id)
+            .map(|v| v.iter().any(|u| u.nonce == nonce && u.signing_hash == signing_hash))
+            .unwrap_or(false)
+    }
+
+    fn nonce_is_uncertain(&self, token_id: &TokenId, nonce: u64) -> bool {
+        self.uncertain.get(token_id).map(|v| v.iter().any(|u| u.nonce == nonce)).unwrap_or(false)
+    }
+
+    fn store_signed(&mut self, token_id: &TokenId, f: &InFlight, tx: &Eip1559Tx, parity: u8, r: &[u8; 32], s: &[u8; 32]) {
+        let raw = tx.rlp_signed(parity, r, s);
+        let record = SignedRecord {
+            token_id: token_id.clone(),
+            proposal_id: f.proposal.as_ref().map(|p| p.id).unwrap_or(CANCEL_PROPOSAL_ID),
+            nonce: f.nonce,
+            signing_hash: f.signing_hash.clone(),
+            signed_tx: hex0x(&raw),
+            tx_hash: hex0x(&keccak256(&raw)),
+            owner: f.payer.clone(),
+            signed_ms: env::block_timestamp_ms(),
+        };
+        let key0 = signed_key(token_id, f.nonce);
+        let version = if self.signed.get(&key0).is_some() { self.signed_versions.get(&key0).unwrap_or(1) } else { 0 };
+        self.signed.insert(&signed_version_key(token_id, f.nonce, version), &record);
+        if version > 0 {
+            self.signed_versions.insert(&key0, &(version + 1));
+        }
+        // The nonce now has a known signature: it is no longer a gap to fill.
+        if let Some(mut list) = self.uncertain.get(token_id) {
+            list.retain(|u| u.nonce != f.nonce);
+            if list.is_empty() {
+                self.uncertain.remove(token_id);
+            } else {
+                self.uncertain.insert(token_id, &list);
+            }
+        }
+        emit_policy_event(
+            "transaction_signed",
+            token_id,
+            json!({
+                "kind": if f.proposal.is_some() { "proposal" } else { "cancel" },
+                "proposal_id": f.proposal.as_ref().map(|p| p.id),
+                "nonce": record.nonce,
+                "version": version,
+                "tx_hash": record.tx_hash,
+                "signed_tx": record.signed_tx,
+            }),
+        );
+    }
+
+    /// Puts a proposal back at the front of the queue (if it still belongs to this owner and
+    /// there is room), optionally pinned to a nonce.
+    fn requeue(&mut self, token_id: &TokenId, f: &InFlight, pin: Option<u64>) -> bool {
+        let Some(p) = &f.proposal else { return false };
+        let Some(mut st) = self.policies.get(token_id) else { return false };
+        if p.owner_epoch != self.owner_epoch(token_id) || st.proposals.len() >= MAX_QUEUED_PROPOSALS {
+            return false;
+        }
+        st.proposals.insert(0, p.clone());
+        self.policies.insert(token_id, &st);
+        if let Some(n) = pin {
+            self.pinned.insert(&p.id, &n);
+        }
+        true
+    }
+
+    /// The signature may exist: keep the nonce used and the charge, never give the nonce to a
+    /// different transaction automatically, and put the proposal back pinned to that nonce, so
+    /// a retry produces the identical transaction. The storage reserve pays for this bookkeeping.
+    fn mark_uncertain(&mut self, token_id: &TokenId, f: &InFlight, reason: &str) {
+        let mut list = self.uncertain.get(token_id).unwrap_or_default();
+        if !list.iter().any(|u| u.nonce == f.nonce && u.signing_hash == f.signing_hash) {
+            list.push(UncertainNonce {
+                nonce: f.nonce,
+                signing_hash: f.signing_hash.clone(),
+                since_ms: env::block_timestamp_ms(),
+            });
+            self.uncertain.insert(token_id, &list);
+        }
+        let requeued = self.requeue(token_id, f, Some(f.nonce));
+        emit_policy_event(
+            "signature_uncertain",
+            token_id,
+            json!({
+                "kind": if f.proposal.is_some() { "proposal" } else { "cancel" },
+                "proposal_id": f.proposal.as_ref().map(|p| p.id),
+                "nonce": f.nonce,
+                "reason": reason,
+                "requeued": requeued,
+            }),
+        );
+    }
+
+    /// A readable answer that does not recover to the vault key cannot move the vault's funds:
+    /// undo everything (caps, nonce if it was the next one, queue) and refund the reserve.
+    fn reject_signature(&mut self, token_id: &TokenId, f: &InFlight, reason: &str) {
+        if f.charged {
+            if let Some(mut st) = self.policies.get(token_id) {
+                st.spend.release(&f.charge);
+                self.policies.insert(token_id, &st);
+            }
+        }
+        if f.from_next {
+            self.nonces.insert(token_id, &f.nonce);
+        }
+        let pin = (!f.from_next && self.nonce_is_uncertain(token_id, f.nonce)).then_some(f.nonce);
+        let requeued = self.requeue(token_id, f, pin);
         refund_if_any(
             &f.payer,
             env::storage_byte_cost().saturating_mul(SIGNED_RECORD_RESERVE_BYTES.into()),
@@ -1176,7 +1454,13 @@ impl PolicyVault {
         emit_policy_event(
             "signature_failed",
             token_id,
-            json!({ "proposal_id": f.proposal.id, "nonce": f.nonce, "reason": reason, "requeued": requeued }),
+            json!({
+                "kind": if f.proposal.is_some() { "proposal" } else { "cancel" },
+                "proposal_id": f.proposal.as_ref().map(|p| p.id),
+                "nonce": f.nonce,
+                "reason": reason,
+                "requeued": requeued,
+            }),
         );
     }
 }
@@ -1198,22 +1482,24 @@ impl PolicyVault {
             .unwrap_or_else(|| env::panic_str("Proposal not found"));
         let p = st.proposals.remove(i);
         self.policies.insert(token_id, &st);
+        self.pinned.remove(&proposal_id);
         settle_storage(before, owner);
         p
     }
 
-    /// The transaction that would be signed for a proposal at `now_ms`, with the vault's next
-    /// nonce, and what it would charge to the caps, or why not. Checks: the proposal exists, it
-    /// belongs to the current owner epoch, both its own delay and the current policy's delay
-    /// have passed since it was made (review P4: raising the delay also holds queued
-    /// proposals), and it passes the policy in force against what has already been signed in
-    /// the current windows.
+    /// The transaction that would be signed for a proposal at `now_ms`, with its nonce, and what
+    /// it would charge to the caps, or why not. Checks: the proposal exists, it belongs to the
+    /// current owner epoch, both its own delay and the current policy's delay have passed since
+    /// it was made (review P4), its nonce is valid (pinned, a replacement below the next nonce,
+    /// or the next one), and it passes the policy in force against what has already been
+    /// signed in the current windows.
     fn prepare_execution(
         &self,
         token_id: &TokenId,
         proposal_id: u64,
         now_ms: u64,
-    ) -> Result<(Eip1559Tx, Reservation), String> {
+        replace_nonce: Option<u64>,
+    ) -> Result<PreparedExecution, String> {
         let st = self.policies.get(token_id).ok_or("Proposal not found")?;
         let p = st.proposals.iter().find(|p| p.id == proposal_id).ok_or("Proposal not found")?;
         if p.owner_epoch != self.owner_epoch(token_id) {
@@ -1223,30 +1509,51 @@ impl PolicyVault {
         if now_ms < ready_at {
             return Err("Proposal delay has not passed yet".into());
         }
-        let nonce = self.nonces.get(token_id).unwrap_or(0);
+        let next = self.nonces.get(token_id).unwrap_or(0);
+        let (nonce, from_next) = match (self.pinned.get(&proposal_id), replace_nonce) {
+            (Some(pin), Some(r)) if r != pin => return Err(format!("Proposal is pinned to nonce {pin}")),
+            (Some(pin), _) => (pin, false),
+            (None, Some(r)) if r >= next => {
+                return Err("replace_nonce must be a nonce that was already signed".into())
+            }
+            (None, Some(r)) => (r, false),
+            (None, None) => (next, true),
+        };
         let tx = p.tx.to_tx(nonce)?;
         let charge = policy::check(&st.policy, &st.spend, &tx, now_ms)
             .map_err(|e| format!("Policy now refuses it: {e}"))?;
-        Ok((tx, charge))
+        Ok(PreparedExecution { tx, charge, from_next })
     }
 
     /// Takes a ready proposal out of the queue for signing: charges its spend to the current
-    /// windows, gives the vault's next nonce to it and advances that nonce. All in one
+    /// windows (except an identical retry of an uncertain nonce, which cannot be paid twice),
+    /// gives it its nonce and advances the next nonce if that was the one used. One
     /// synchronous step, so two executions can never both fit under the cap (threat 6).
-    /// M7 calls this before asking the MPC network to sign, and must undo it (release the
-    /// charge, restore the nonce) if the signature fails, while no other signature is in flight.
-    fn commit_execution(&mut self, token_id: &TokenId, proposal_id: u64) -> (Proposal, Eip1559Tx, Reservation) {
+    /// Returns the proposal, the prepared execution and whether the charge was applied.
+    fn commit_execution(
+        &mut self,
+        token_id: &TokenId,
+        proposal_id: u64,
+        replace_nonce: Option<u64>,
+    ) -> (Proposal, PreparedExecution, bool) {
         let now = env::block_timestamp_ms();
-        let (tx, charge) =
-            self.prepare_execution(token_id, proposal_id, now).unwrap_or_else(|e| env::panic_str(&e));
+        let prep = self
+            .prepare_execution(token_id, proposal_id, now, replace_nonce)
+            .unwrap_or_else(|e| env::panic_str(&e));
+        let charged = !self.is_uncertain(token_id, prep.tx.nonce, &hex0x(&prep.tx.signing_hash()));
         let mut st = self.policies.get(token_id).expect("checked by prepare_execution");
         st.spend.prune_expired(now);
-        st.spend.reserve(&charge, now);
+        if charged {
+            st.spend.reserve(&prep.charge, now);
+        }
         let i = st.proposals.iter().position(|p| p.id == proposal_id).expect("checked");
         let p = st.proposals.remove(i);
         self.policies.insert(token_id, &st);
-        self.nonces.insert(token_id, &(tx.nonce + 1));
-        (p, tx, charge)
+        self.pinned.remove(&proposal_id);
+        if prep.from_next {
+            self.nonces.insert(token_id, &(prep.tx.nonce + 1));
+        }
+        (p, prep, charged)
     }
 }
 
@@ -2223,7 +2530,7 @@ mod tests {
         let b = propose_as(&mut c, &alice, 9 * ONE_HUNDREDTH_ETH, T0_MS + 10 + policy::DAY_MS);
         ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 10 + policy::DAY_MS + HOUR_MS);
         assert!(c.check_execution("0".into(), a).ready);
-        c.commit_execution(&"0".to_string(), a);
+        c.commit_execution(&"0".to_string(), a, None);
         let rb = c.check_execution("0".into(), b);
         assert!(!rb.ready, "0.18 ETH signed in one window with a 0.1 cap");
         assert_eq!(rb.reason.as_deref(), Some("Policy now refuses it: ETH daily cap exceeded"));
@@ -2235,7 +2542,8 @@ mod tests {
         let a = propose_as(&mut c, &alice, ONE_HUNDREDTH_ETH, T0_MS + 10);
         let b = propose_as(&mut c, &alice, ONE_HUNDREDTH_ETH, T0_MS + 11);
         ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 11 + HOUR_MS);
-        let (p, tx, charge) = c.commit_execution(&"0".to_string(), a);
+        let (p, prep, _) = c.commit_execution(&"0".to_string(), a, None);
+        let (tx, charge) = (prep.tx, prep.charge);
         assert_eq!((p.id, tx.nonce), (a, 0));
         assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, charge.eth.0);
         assert_eq!(c.get_next_nonce("0".into()), 1);
@@ -2251,7 +2559,7 @@ mod tests {
         let (mut c, alice) = vault_with_policy();
         let a = propose_as(&mut c, &alice, 1, T0_MS + 10);
         ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS - 1);
-        c.commit_execution(&"0".to_string(), a);
+        c.commit_execution(&"0".to_string(), a, None);
     }
 
     /// Review P4.
@@ -2507,6 +2815,27 @@ mod tests {
     const A1_TX_HASH: &str = "0xfe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1";
     const EXEC_DEPOSIT: NearToken = NearToken::from_millinear(20);
 
+    /// Delivers a signer answer to `on_signed` the way the runtime does: as the promise result.
+    fn answer(c: &mut PolicyVault, result: near_sdk::PromiseResult) -> bool {
+        let hash = c.get_inflight("0".into()).map(|f| f.signing_hash).unwrap_or_default();
+        let mut b = VMContextBuilder::new();
+        b.current_account_id("vault.testnet".parse().unwrap())
+            .predecessor_account_id("vault.testnet".parse().unwrap())
+            .block_timestamp((T0_MS + 10 + HOUR_MS + 5) * 1_000_000);
+        testing_env!(
+            b.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![result]
+        );
+        c.on_signed("0".into(), hash)
+    }
+
+    fn ok(resp: &SignResponse) -> near_sdk::PromiseResult {
+        near_sdk::PromiseResult::Successful(near_sdk::serde_json::to_vec(resp).unwrap())
+    }
+
     fn a1_response() -> SignResponse {
         SignResponse {
             big_r: AffinePoint { affine_point: "024057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98".into() },
@@ -2547,7 +2876,7 @@ mod tests {
     #[test]
     fn execute_asks_the_signer_for_exactly_the_validated_hash() {
         let (mut c, _, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
         let f = c.get_inflight("0".into()).expect("in flight");
         assert_eq!((f.nonce, f.signing_hash.as_str()), (0, A1_HASH));
         let calls = function_calls();
@@ -2565,8 +2894,8 @@ mod tests {
     #[test]
     fn real_mpc_signature_is_verified_and_the_mined_transaction_is_stored() {
         let (mut c, alice, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
-        assert!(c.on_signed("0".into(), Ok(a1_response())));
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert!(answer(&mut c, ok(&a1_response())));
         let rec = c.get_signed("0".into(), 0).expect("signed record");
         assert_eq!(rec.signed_tx, A1_RAW, "byte-identical to the transaction mined on Sepolia");
         assert_eq!(rec.tx_hash, A1_TX_HASH);
@@ -2590,10 +2919,10 @@ mod tests {
     #[test]
     fn tampered_signature_is_rejected_and_everything_is_undone() {
         let (mut c, _, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
         let mut bad = a1_response();
         bad.s.scalar = "3a85fc21be896c6b5c90c09b479f75806a2b0933b1994876b1a7bb6c25733808".into();
-        assert!(!c.on_signed("0".into(), Ok(bad)));
+        assert!(!answer(&mut c, ok(&bad)));
         assert_rolled_back(&c, id, "does not match the vault key");
     }
 
@@ -2601,29 +2930,244 @@ mod tests {
     fn signature_for_another_key_is_rejected() {
         // A valid signature, but the vault's key is different (vault-0 of the M4 tests).
         let (mut c, _, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
         let mut v = c.vaults.get(&"0".to_string()).unwrap();
         v.public_key = parse_secp256k1_key(VAULT0_KEY).unwrap();
         c.vaults.insert(&"0".to_string(), &v);
-        assert!(!c.on_signed("0".into(), Ok(a1_response())));
+        assert!(!answer(&mut c, ok(&a1_response())));
         assert_rolled_back(&c, id, "does not match the vault key");
     }
 
     #[test]
-    fn signer_failure_is_undone() {
+    fn signer_failure_is_uncertain_not_undone() {
+        // Review S3: a failed promise does not prove that no signature exists.
         let (mut c, _, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
-        assert!(!c.on_signed("0".into(), Err(PromiseError::Failed)));
-        assert_rolled_back(&c, id, "signer call failed");
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
+        assert!(!answer(&mut c, near_sdk::PromiseResult::Failed));
+        assert_uncertain(&c, id, 0, spent, "signer call failed");
+    }
+
+    /// After an uncertain outcome: lock released, nonce stays used, charge kept, proposal back
+    /// in the queue pinned to that nonce, nothing stored, and an event.
+    fn assert_uncertain(c: &PolicyVault, id: u64, nonce: u64, spent: u128, reason: &str) {
+        assert!(c.get_inflight("0".into()).is_none(), "lock released");
+        assert!(c.get_signed("0".into(), nonce).is_none(), "nothing stored");
+        assert_eq!(c.get_next_nonce("0".into()), nonce + 1, "nonce NOT reused");
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, spent, "charge kept");
+        assert_eq!(c.list_proposals("0".into()).iter().map(|p| p.id).collect::<Vec<_>>(), vec![id], "requeued");
+        assert_eq!(c.pinned.get(&id), Some(nonce), "pinned to its nonce");
+        assert_eq!(c.get_uncertain("0".into()).iter().map(|u| u.nonce).collect::<Vec<_>>(), vec![nonce]);
+        let ev = get_logs().into_iter().find(|l| l.contains("\"signature_uncertain\"")).expect("event");
+        assert!(ev.contains(reason), "{ev}");
+    }
+
+    /// Review S1: an answer in another format used to make the callback panic before our code,
+    /// leaving the vault locked forever.
+    fn assert_unreadable_answer_is_uncertain(weird: &[u8]) {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
+        assert!(!answer(&mut c, near_sdk::PromiseResult::Successful(weird.to_vec())));
+        assert_uncertain(&c, id, 0, spent, "unreadable signer answer");
+    }
+
+    #[test]
+    fn answer_in_another_scheme_does_not_lock_the_vault() {
+        assert_unreadable_answer_is_uncertain(br#"{"scheme":"Ed25519","signature":[1,2,3]}"#);
+    }
+
+    #[test]
+    fn answer_that_is_not_json_does_not_lock_the_vault() {
+        assert_unreadable_answer_is_uncertain(b"not json at all");
+    }
+
+    #[test]
+    fn answer_with_wrong_types_does_not_lock_the_vault() {
+        assert_unreadable_answer_is_uncertain(br#"{"big_r":{"affine_point":7},"s":{"scalar":"00"},"recovery_id":1}"#);
+    }
+
+    /// Review S3: retrying a pinned proposal produces the identical transaction at the same
+    /// nonce, is not charged twice, and fills the gap.
+    #[test]
+    fn retry_after_uncertain_uses_the_same_nonce_and_is_not_charged_twice() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, near_sdk::PromiseResult::Failed);
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
+        let check = c.check_execution("0".into(), id);
+        assert_eq!((check.ready, check.nonce), (true, 0), "{check:?}");
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        let f = c.get_inflight("0".into()).unwrap();
+        assert_eq!((f.nonce, f.from_next, f.charged, f.signing_hash.as_str()), (0, false, false, A1_HASH));
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, spent, "not charged twice");
+        assert!(answer(&mut c, ok(&a1_response())));
+        assert_eq!(c.get_signed("0".into(), 0).unwrap().signed_tx, A1_RAW);
+        assert!(c.get_uncertain("0".into()).is_empty(), "gap filled");
+        assert_eq!(c.get_next_nonce("0".into()), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal is pinned to nonce 0")]
+    fn a_pinned_proposal_cannot_be_moved_to_another_nonce() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, near_sdk::PromiseResult::Failed);
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, Some(1), None);
+    }
+
+    /// Review S5: signing the same nonce again keeps every version.
+    #[test]
+    fn replacing_a_nonce_keeps_every_version() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert!(answer(&mut c, ok(&a1_response())));
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 30);
+        let id2 = c.propose("0".into(), a1_ptx()); // same fields, so the A1 signature fits nonce 0 again
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 30 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id2, Some(0), None);
+        let f = c.get_inflight("0".into()).unwrap();
+        assert_eq!((f.nonce, f.from_next), (0, false));
+        assert!(answer(&mut c, ok(&a1_response())));
+        let versions = c.get_signed_versions("0".into(), 0);
+        assert_eq!(versions.iter().map(|r| r.proposal_id).collect::<Vec<_>>(), vec![id, id2]);
+        assert_eq!(c.get_signed("0".into(), 0).unwrap().proposal_id, id2, "latest version");
+        assert_eq!(c.list_signed("0".into(), None, None).len(), 2);
+        assert_eq!(c.get_next_nonce("0".into()), 1, "a replacement does not advance the nonce");
+    }
+
+    #[test]
+    #[should_panic(expected = "replace_nonce must be a nonce that was already signed")]
+    fn replace_nonce_must_be_already_signed() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, Some(0), None); // nothing signed yet
+    }
+
+    /// Threat 1 building block: a cancellation is a 0-value self-transfer with the same nonce.
+    #[test]
+    fn cancel_nonce_signs_a_self_transfer_with_that_nonce() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert!(answer(&mut c, ok(&a1_response())));
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS); // no delay needed
+        let _ = c.cancel_nonce("0".into(), 0, U128(40_000_000_000), U128(2_000_000_000), None, None);
+        let f = c.get_inflight("0".into()).expect("in flight");
+        assert!(f.proposal.is_none());
+        assert_eq!((f.nonce, f.from_next), (0, false));
+        assert_eq!((f.tx.to.as_str(), f.tx.value.0, f.tx.data.as_str(), f.tx.gas_limit), (A1_ADDR, 0, "0x", 21_000));
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, spent + 40_000_000_000 * 21_000, "only gas charged");
+        assert_eq!(c.get_next_nonce("0".into()), 1);
+        // The A1 signature is for another hash, so it is rejected and the charge is released.
+        assert!(!answer(&mut c, ok(&a1_response())));
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, spent);
+        assert_eq!(c.get_next_nonce("0".into()), 1, "a cancellation never touches the next nonce");
+    }
+
+    #[test]
+    #[should_panic(expected = "Only a nonce that was already signed can be cancelled")]
+    fn cannot_cancel_a_nonce_never_signed() {
+        let (mut c, alice, _) = ready_a1_proposal();
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let _ = c.cancel_nonce("0".into(), 0, U128(1_000_000_000), U128(1_000_000_000), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn stranger_cannot_cancel_a_nonce() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        ctx_at(accounts(3), EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let _ = c.cancel_nonce("0".into(), 0, U128(1_000_000_000), U128(1_000_000_000), None, None);
+    }
+
+    /// Review S2: a signature that never gets an answer can be abandoned after the timeout.
+    #[test]
+    fn abandon_only_after_the_timeout_and_as_uncertain() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
+        ctx_at(alice.clone(), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS + INFLIGHT_TIMEOUT_MS - 1);
+        let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.abandon_signature("0".into())));
+        assert!(early.is_err(), "abandoned before the timeout");
+        ctx_at(alice, NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS + INFLIGHT_TIMEOUT_MS);
+        c.abandon_signature("0".into());
+        assert_uncertain(&c, id, 0, spent, "abandoned after timeout");
+    }
+
+    #[test]
+    fn a_stale_answer_cannot_land_on_another_signature() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        // An answer that names a different hash is ignored and the lock stays.
+        let mut b = VMContextBuilder::new();
+        b.current_account_id("vault.testnet".parse().unwrap()).predecessor_account_id("vault.testnet".parse().unwrap());
+        testing_env!(b.build(), near_sdk::test_vm_config(), near_sdk::RuntimeFeesConfig::test(), Default::default(), vec![ok(&a1_response())]);
+        assert!(!c.on_signed("0".into(), "0xdeadbeef".into()));
+        assert!(c.get_inflight("0".into()).is_some(), "the real signature is still awaited");
+    }
+
+    /// Review S7.
+    #[test]
+    #[should_panic(expected = "Attach at least 60 Tgas to sign")]
+    fn signing_needs_enough_gas() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let mut b = VMContextBuilder::new();
+        b.current_account_id("vault.testnet".parse().unwrap())
+            .predecessor_account_id(alice)
+            .attached_deposit(EXEC_DEPOSIT)
+            .prepaid_gas(Gas::from_tgas(30))
+            .block_timestamp((T0_MS + 10 + HOUR_MS) * 1_000_000);
+        testing_env!(b.build());
+        let _ = c.execute_proposal("0".into(), id, None, None);
+    }
+
+    /// Review S4: the signer deposit can be raised by the caller.
+    #[test]
+    fn sign_deposit_is_forwarded() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, Some(U128(5)));
+        let deposit = get_created_receipts()
+            .into_iter()
+            .filter(|r| r.receiver_id == signer())
+            .flat_map(|r| r.actions)
+            .find_map(|a| match a {
+                MockAction::FunctionCallWeight { method_name, attached_deposit, .. } if method_name == b"sign" => Some(attached_deposit),
+                _ => None,
+            });
+        assert_eq!(deposit, Some(NearToken::from_yoctonear(5)));
+    }
+
+    /// Review S6: the largest signed record fits the storage reserved for it.
+    #[test]
+    fn largest_signed_record_fits_the_reserve() {
+        let long_account: AccountId = format!("{}.testnet", "a".repeat(56)).parse().unwrap();
+        let record = SignedRecord {
+            token_id: u64::MAX.to_string(),
+            proposal_id: u64::MAX,
+            nonce: u64::MAX,
+            signing_hash: format!("0x{}", "ab".repeat(32)),
+            // an ERC-20 call with the largest fields: about 190 bytes raw
+            signed_tx: format!("0x{}", "cd".repeat(200)),
+            tx_hash: format!("0x{}", "ef".repeat(32)),
+            owner: long_account,
+            signed_ms: u64::MAX,
+        };
+        let key = signed_version_key(&record.token_id, record.nonce, u32::MAX);
+        let bytes = near_sdk::borsh::to_vec(&record).unwrap().len() + near_sdk::borsh::to_vec(&key).unwrap().len() + 40 + 1;
+        assert!((bytes as u64) <= SIGNED_RECORD_RESERVE_BYTES, "record needs {bytes} bytes");
     }
 
     #[test]
     fn malformed_answer_is_undone() {
         let (mut c, _, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
         let mut bad = a1_response();
         bad.big_r.affine_point = "054057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98".into();
-        assert!(!c.on_signed("0".into(), Ok(bad)));
+        assert!(!answer(&mut c, ok(&bad)));
         assert_rolled_back(&c, id, "not a compressed point");
     }
 
@@ -2635,15 +3179,15 @@ mod tests {
         let id2 = c.propose("0".into(), a1_ptx());
         let _ = id;
         ctx_at(alice.clone(), EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
-        let _ = c.execute_proposal("0".into(), id);
-        let _ = c.execute_proposal("0".into(), id2);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        let _ = c.execute_proposal("0".into(), id2, None, None);
     }
 
     #[test]
     #[should_panic(expected = "A signature is in flight for this vault; transfer after it completes")]
     fn no_transfer_while_a_signature_is_in_flight() {
         let (mut c, alice, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
         ctx_at(alice, ONE_YOCTO, T0_MS + 20 + HOUR_MS);
         c.nft_transfer(accounts(2), "0".into(), None, None);
     }
@@ -2651,8 +3195,8 @@ mod tests {
     #[test]
     fn after_signing_the_vault_can_be_sold_and_keeps_its_nonce_and_history() {
         let (mut c, alice, id) = ready_a1_proposal();
-        let _ = c.execute_proposal("0".into(), id);
-        c.on_signed("0".into(), Ok(a1_response()));
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
         ctx_at(alice, ONE_YOCTO, T0_MS + 30 + HOUR_MS);
         c.nft_transfer(accounts(2), "0".into(), None, None);
         assert_eq!(c.get_next_nonce("0".into()), 1, "the external account's nonce survives the sale");
@@ -2664,7 +3208,7 @@ mod tests {
     fn stranger_cannot_execute() {
         let (mut c, _, id) = ready_a1_proposal();
         ctx_at(accounts(3), EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
     }
 
     #[test]
@@ -2672,7 +3216,7 @@ mod tests {
     fn execute_respects_the_delay() {
         let (mut c, alice, id) = ready_a1_proposal();
         ctx_at(alice, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS - 1);
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
     }
 
     #[test]
@@ -2680,7 +3224,7 @@ mod tests {
     fn execute_needs_a_deposit() {
         let (mut c, alice, id) = ready_a1_proposal();
         ctx_at(alice, ONE_YOCTO, T0_MS + 10 + HOUR_MS);
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
     }
 
     #[test]
@@ -2689,7 +3233,7 @@ mod tests {
         let (mut c, alice) = vault_with_policy(); // vault key never resolved
         let id = propose_as(&mut c, &alice, 1, T0_MS + 10);
         ctx_at(alice, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
-        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id, None, None);
     }
 
     #[test]
