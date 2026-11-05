@@ -65,7 +65,7 @@ pub const SECP256K1_DOMAIN_ID: u64 = 0;
 pub const GAS_FOR_DERIVE: Gas = Gas::from_tgas(15);
 pub const GAS_FOR_DERIVE_CALLBACK: Gas = Gas::from_tgas(10);
 
-/// The part of the Chain Signatures contract this contract uses in M4.
+/// The part of the Chain Signatures contract this contract uses (M4: keys, M7: signatures).
 #[ext_contract(ext_signer)]
 #[allow(dead_code)]
 trait ChainSignatures {
@@ -75,6 +75,115 @@ trait ChainSignatures {
         predecessor: Option<AccountId>,
         domain_id: Option<u64>,
     ) -> String;
+    fn sign(&mut self, request: SignRequest) -> SignResponse;
+}
+
+// ---------- M7: signing ----------
+
+/// Deposit attached to the signer's `sign` (measured in A1: 1 yoctoNEAR is accepted).
+pub const SIGN_DEPOSIT: NearToken = NearToken::from_yoctonear(1);
+/// Gas kept for our callback; all the remaining gas goes to `sign`.
+pub const GAS_FOR_SIGN_CALLBACK: Gas = Gas::from_tgas(20);
+/// Storage paid at execution for the signed record written later by the callback.
+pub const SIGNED_RECORD_RESERVE_BYTES: u64 = 1000;
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub enum SignPayload {
+    /// 32-byte hash as 64 hex characters, no `0x`.
+    Ecdsa(String),
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignRequest {
+    pub domain_id: u64,
+    pub path: String,
+    pub payload_v2: SignPayload,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AffinePoint {
+    /// Compressed point: 02/03 || x, as hex.
+    pub affine_point: String,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scalar {
+    pub scalar: String,
+}
+
+/// What the signer returns, e.g. `{"big_r":{"affine_point":"02…"},"s":{"scalar":"…"},"recovery_id":1}`.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignResponse {
+    pub big_r: AffinePoint,
+    pub s: Scalar,
+    pub recovery_id: u8,
+}
+
+/// A signature the contract has asked for and not received yet. While it exists the vault
+/// cannot sign again and the NFT cannot be transferred (threat 5).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InFlight {
+    pub proposal: Proposal,
+    pub nonce: u64,
+    pub signing_hash: String,
+    pub charge: Reservation,
+    /// Who paid the storage reserve (refunded if the signature fails).
+    pub payer: AccountId,
+    pub started_ms: u64,
+}
+
+/// A transaction the MPC network signed for a vault, ready to broadcast by anyone.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignedRecord {
+    pub token_id: TokenId,
+    pub proposal_id: u64,
+    pub nonce: u64,
+    /// The EIP-1559 hash that was signed.
+    pub signing_hash: String,
+    /// `0x02…`, the raw transaction for `eth_sendRawTransaction`.
+    pub signed_tx: String,
+    /// keccak256 of the raw transaction: the hash explorers show.
+    pub tx_hash: String,
+    /// Owner of the vault when it was requested.
+    pub owner: AccountId,
+    pub signed_ms: u64,
+}
+
+/// Checks the signer's answer against the vault's own key and returns `(y_parity, r, s)` with
+/// `s` normalized to the lower half (EIP-2). The contract never trusts the MPC answer blindly.
+pub fn verify_signature(
+    resp: &SignResponse,
+    hash: &[u8; 32],
+    vault_key: &[u8; 64],
+) -> Result<(u8, [u8; 32], [u8; 32]), &'static str> {
+    let big_r = policy::parse_hex(&format!("0x{}", resp.big_r.affine_point)).ok_or("big_r is not hex")?;
+    if big_r.len() != 33 || (big_r[0] != 2 && big_r[0] != 3) {
+        return Err("big_r is not a compressed point");
+    }
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&big_r[1..]);
+    let s: [u8; 32] = policy::parse_hex(&format!("0x{}", resp.s.scalar))
+        .and_then(|v| v.try_into().ok())
+        .ok_or("s is not 32 bytes of hex")?;
+    if resp.recovery_id > 1 {
+        return Err("recovery_id must be 0 or 1");
+    }
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(&r);
+    sig[32..].copy_from_slice(&s);
+    let recovered = env::ecrecover(hash, &sig, resp.recovery_id, false).ok_or("ecrecover failed")?;
+    if &recovered != vault_key {
+        return Err("signature does not match the vault key");
+    }
+    let (s_low, parity) = evm::normalize_s(&s, resp.recovery_id);
+    Ok((parity, r, s_low))
 }
 
 /// Storage reserved at mint for the largest possible transfer record of a token
@@ -93,6 +202,8 @@ enum StorageKey {
     Vaults,
     Policies,
     Nonces,
+    InFlight,
+    Signed,
 }
 
 /// Fixed-size record (same storage whether resolved or not, so it is paid in full at mint).
@@ -188,11 +299,15 @@ pub struct PolicyVault {
     nonces: LookupMap<TokenId, u64>,
     /// M6: proposal ids are unique across all vaults and owners.
     next_proposal_id: u64,
+    /// M7: the signature each vault is waiting for, if any.
+    inflight: LookupMap<TokenId, InFlight>,
+    /// M7: every signed transaction, keyed by "<token_id>:<nonce>".
+    signed: LookupMap<String, SignedRecord>,
 }
 
-/// State layout deployed for M5 (commit fc15205), used only by `migrate`.
+/// State layout deployed for M6 (commits 7a95f8a and 9944426), used only by `migrate`.
 #[near(serializers = [borsh])]
-struct PolicyVaultV4 {
+struct PolicyVaultV5 {
     tokens: NonFungibleToken,
     metadata: LazyOption<NFTContractMetadata>,
     next_token_id: u64,
@@ -200,6 +315,12 @@ struct PolicyVaultV4 {
     signer_id: AccountId,
     vaults: LookupMap<TokenId, VaultRecord>,
     policies: LookupMap<TokenId, VaultPolicyState>,
+    nonces: LookupMap<TokenId, u64>,
+    next_proposal_id: u64,
+}
+
+fn signed_key(token_id: &str, nonce: u64) -> String {
+    format!("{token_id}:{nonce}")
 }
 
 // ---------- M5: policy state, inputs and views ----------
@@ -375,17 +496,17 @@ impl PolicyVault {
             policies: LookupMap::new(StorageKey::Policies),
             nonces: LookupMap::new(StorageKey::Nonces),
             next_proposal_id: 0,
+            inflight: LookupMap::new(StorageKey::InFlight),
+            signed: LookupMap::new(StorageKey::Signed),
         }
     }
 
-    /// Upgrades the state written by the M5 deployment. Only the contract account can call it.
+    /// Upgrades the state written by the M6 deployment. Only the contract account can call it.
     /// Calling it on the current layout fails, because the old layout no longer parses.
-    /// The stored policy entries gain a `proposals` field, so this is only safe if no vault has
-    /// a stored policy at migration time (checked before deploying; see the M6 notes).
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: PolicyVaultV4 = env::state_read().expect("no V4 state to migrate");
+        let old: PolicyVaultV5 = env::state_read().expect("no V5 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
@@ -394,8 +515,10 @@ impl PolicyVault {
             signer_id: old.signer_id,
             vaults: old.vaults,
             policies: old.policies,
-            nonces: LookupMap::new(StorageKey::Nonces),
-            next_proposal_id: 0,
+            nonces: old.nonces,
+            next_proposal_id: old.next_proposal_id,
+            inflight: LookupMap::new(StorageKey::InFlight),
+            signed: LookupMap::new(StorageKey::Signed),
         }
     }
 
@@ -562,10 +685,14 @@ impl PolicyVault {
             )
     }
 
-    /// Hook called before any transfer. Only checks existence in M3: M8 adds the sale freeze
-    /// and the lock while a signature is in flight.
+    /// Hook called before any transfer. M7: no transfer while a signature is in flight, so the
+    /// callback always sees the owner who asked for it (threat 5). M8 adds the sale freeze.
     fn assert_transferable(&self, token_id: &TokenId) {
         require_token_exists(&self.tokens, token_id);
+        require!(
+            self.inflight.get(token_id).is_none(),
+            "A signature is in flight for this vault; transfer after it completes"
+        );
     }
 
     fn record_transfer(
@@ -872,6 +999,188 @@ impl PolicyVault {
     }
 }
 
+// ---------- M7: signing entry points ----------
+
+#[near]
+impl PolicyVault {
+    /// Signs a ready proposal. Only the owner. In one synchronous step it charges the daily
+    /// caps, takes the vault's next nonce and locks the vault (no second signature, no
+    /// transfer) until the MPC answer arrives in `on_signed`. The deposit must cover
+    /// `SIGNED_RECORD_RESERVE_BYTES` of storage plus 1 yoctoNEAR for the signer; the rest is
+    /// refunded. Returns the promise, so the caller sees whether the signature was stored.
+    #[payable]
+    pub fn execute_proposal(&mut self, token_id: TokenId, proposal_id: u64) -> Promise {
+        let owner = self.assert_owner(&token_id);
+        require!(self.inflight.get(&token_id).is_none(), "A signature is already in flight for this vault");
+        require!(
+            self.vaults.get(&token_id).map(|v| v.resolved).unwrap_or(false),
+            "Vault address not resolved yet; call resolve_vault_address first"
+        );
+        let before = env::storage_usage();
+        let (proposal, tx, charge) = self.commit_execution(&token_id, proposal_id);
+        let hash = tx.signing_hash();
+        let hash_hex = hex0x(&hash);
+        self.inflight.insert(
+            &token_id,
+            &InFlight {
+                proposal: proposal.clone(),
+                nonce: tx.nonce,
+                signing_hash: hash_hex.clone(),
+                charge,
+                payer: owner.clone(),
+                started_ms: env::block_timestamp_ms(),
+            },
+        );
+        // Storage: whatever this call added, plus the record the callback will write.
+        let added = env::storage_usage().saturating_sub(before) + SIGNED_RECORD_RESERVE_BYTES;
+        let cost = env::storage_byte_cost().saturating_mul(added.into());
+        let attached = env::attached_deposit();
+        require!(
+            cost.saturating_add(SIGN_DEPOSIT) <= attached,
+            format!(
+                "Must attach {} to cover storage and the signer deposit",
+                cost.saturating_add(SIGN_DEPOSIT).exact_amount_display()
+            )
+        );
+        refund_if_any(&owner, attached.saturating_sub(cost).saturating_sub(SIGN_DEPOSIT));
+        emit_policy_event(
+            "signature_requested",
+            &token_id,
+            json!({ "proposal_id": proposal.id, "nonce": tx.nonce, "signing_hash": hash_hex }),
+        );
+        let hex_no_prefix = hash_hex.trim_start_matches("0x").to_string();
+        ext_signer::ext(self.signer_id.clone())
+            .with_attached_deposit(SIGN_DEPOSIT)
+            .with_unused_gas_weight(1)
+            .sign(SignRequest {
+                domain_id: SECP256K1_DOMAIN_ID,
+                path: vault_path_for(&token_id),
+                payload_v2: SignPayload::Ecdsa(hex_no_prefix),
+            })
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_SIGN_CALLBACK)
+                    .with_unused_gas_weight(0)
+                    .on_signed(token_id),
+            )
+    }
+
+    /// Callback of the signer's `sign`. Never panics: on success it stores the signed
+    /// transaction; on any failure (signer error, malformed answer, wrong key) it undoes the
+    /// execution (releases the caps, restores the nonce, puts the proposal back in the queue)
+    /// and refunds the storage reserve. Returns whether a signature was stored.
+    #[private]
+    pub fn on_signed(
+        &mut self,
+        token_id: TokenId,
+        #[callback_result] result: Result<SignResponse, PromiseError>,
+    ) -> bool {
+        let Some(f) = self.inflight.remove(&token_id) else {
+            env::log_str(&format!("on_signed: nothing in flight for token {token_id}"));
+            return false;
+        };
+        let outcome = self.check_signer_answer(&token_id, &f, result);
+        match outcome {
+            Ok((parity, r, s)) => {
+                let Ok(tx) = f.proposal.tx.to_tx(f.nonce) else {
+                    self.undo_execution(&token_id, &f, "stored proposal no longer parses");
+                    return false;
+                };
+                let raw = tx.rlp_signed(parity, &r, &s);
+                let record = SignedRecord {
+                    token_id: token_id.clone(),
+                    proposal_id: f.proposal.id,
+                    nonce: f.nonce,
+                    signing_hash: f.signing_hash.clone(),
+                    signed_tx: hex0x(&raw),
+                    tx_hash: hex0x(&keccak256(&raw)),
+                    owner: f.payer.clone(),
+                    signed_ms: env::block_timestamp_ms(),
+                };
+                self.signed.insert(&signed_key(&token_id, f.nonce), &record);
+                emit_policy_event(
+                    "transaction_signed",
+                    &token_id,
+                    json!({
+                        "proposal_id": record.proposal_id,
+                        "nonce": record.nonce,
+                        "tx_hash": record.tx_hash,
+                        "signed_tx": record.signed_tx,
+                    }),
+                );
+                true
+            }
+            Err(reason) => {
+                self.undo_execution(&token_id, &f, reason);
+                false
+            }
+        }
+    }
+
+    /// The signature a vault is waiting for, if any.
+    pub fn get_inflight(&self, token_id: TokenId) -> Option<InFlight> {
+        require_token_exists(&self.tokens, &token_id);
+        self.inflight.get(&token_id)
+    }
+
+    pub fn get_signed(&self, token_id: TokenId, nonce: u64) -> Option<SignedRecord> {
+        require_token_exists(&self.tokens, &token_id);
+        self.signed.get(&signed_key(&token_id, nonce))
+    }
+
+    /// Signed transactions of a vault by nonce, from `from_nonce` (default 0), at most `limit`
+    /// (default 20). A buyer compares these with the external account's nonce (M8).
+    pub fn list_signed(&self, token_id: TokenId, from_nonce: Option<u64>, limit: Option<u64>) -> Vec<SignedRecord> {
+        require_token_exists(&self.tokens, &token_id);
+        let next = self.nonces.get(&token_id).unwrap_or(0);
+        let from = from_nonce.unwrap_or(0);
+        (from..next)
+            .take(limit.unwrap_or(20).min(100) as usize)
+            .filter_map(|n| self.signed.get(&signed_key(&token_id, n)))
+            .collect()
+    }
+}
+
+impl PolicyVault {
+    fn check_signer_answer(
+        &self,
+        token_id: &TokenId,
+        f: &InFlight,
+        result: Result<SignResponse, PromiseError>,
+    ) -> Result<(u8, [u8; 32], [u8; 32]), &'static str> {
+        let resp = result.map_err(|_| "signer call failed")?;
+        let vault = self.vaults.get(token_id).filter(|v| v.resolved).ok_or("vault key unknown")?;
+        let hash: [u8; 32] = policy::parse_hex(&f.signing_hash)
+            .and_then(|v| v.try_into().ok())
+            .ok_or("stored hash malformed")?;
+        verify_signature(&resp, &hash, &vault.public_key)
+    }
+
+    /// Reverts `commit_execution` after a failed signature. Safe because only one signature
+    /// per vault can be in flight and the NFT cannot change owner meanwhile.
+    fn undo_execution(&mut self, token_id: &TokenId, f: &InFlight, reason: &str) {
+        let mut requeued = false;
+        if let Some(mut st) = self.policies.get(token_id) {
+            st.spend.release(&f.charge);
+            if f.proposal.owner_epoch == self.owner_epoch(token_id) && st.proposals.len() < MAX_QUEUED_PROPOSALS {
+                st.proposals.insert(0, f.proposal.clone());
+                requeued = true;
+            }
+            self.policies.insert(token_id, &st);
+        }
+        self.nonces.insert(token_id, &f.nonce);
+        refund_if_any(
+            &f.payer,
+            env::storage_byte_cost().saturating_mul(SIGNED_RECORD_RESERVE_BYTES.into()),
+        );
+        emit_policy_event(
+            "signature_failed",
+            token_id,
+            json!({ "proposal_id": f.proposal.id, "nonce": f.nonce, "reason": reason, "requeued": requeued }),
+        );
+    }
+}
+
 impl PolicyVault {
     /// Owner epoch: how many times the vault has changed owner. A proposal is only valid for
     /// the epoch it was made in (defense in depth: the queue is also cleared on every change).
@@ -926,7 +1235,6 @@ impl PolicyVault {
     /// synchronous step, so two executions can never both fit under the cap (threat 6).
     /// M7 calls this before asking the MPC network to sign, and must undo it (release the
     /// charge, restore the nonce) if the signature fails, while no other signature is in flight.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn commit_execution(&mut self, token_id: &TokenId, proposal_id: u64) -> (Proposal, Eip1559Tx, Reservation) {
         let now = env::block_timestamp_ms();
         let (tx, charge) =
@@ -2186,6 +2494,202 @@ mod tests {
         c.nft_transfer(accounts(2), "0".into(), None, None);
         assert!(c.list_proposals("0".into()).is_empty());
         assert_eq!(c.get_next_nonce("0".into()), 0);
+    }
+
+    // ---------- M7: signing, with the real A1 signature from the MPC network ----------
+
+    /// Key the testnet signer derived for (alan-vault-2026.testnet, "ethereum-1"); its address
+    /// 0x8812…8d11 sent the A1 transaction, signed by the MPC network and mined on Sepolia.
+    const A1_KEY: &str = "secp256k1:3YaBgZYkJKteg4ACKrmjkmwCWhzDJiEgstzpEJNNvkb5Kf6YJhe7dHxDqFx3gsaMnKhemeB6YPj42s2ejdqxPhiU";
+    const A1_ADDR: &str = "0x881294c1b52d631ab43fa2bd23d691209b548d11";
+    const A1_HASH: &str = "0x2ffcfe7987e5ff1810ccdf565de03ee53ceeac8427d84a361d2c058a991c97b2";
+    const A1_RAW: &str = "0x02f87583aa36a780843b9aca008506fc23ac0082520894881294c1b52d631ab43fa2bd23d691209b548d1187038d7ea4c6800080c001a04057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98a03a85fc21be896c6b5c90c09b479f75806a2b0933b1994876b1a7bb6c25733809";
+    const A1_TX_HASH: &str = "0xfe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1";
+    const EXEC_DEPOSIT: NearToken = NearToken::from_millinear(20);
+
+    fn a1_response() -> SignResponse {
+        SignResponse {
+            big_r: AffinePoint { affine_point: "024057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98".into() },
+            s: Scalar { scalar: "3a85fc21be896c6b5c90c09b479f75806a2b0933b1994876b1a7bb6c25733809".into() },
+            recovery_id: 1,
+        }
+    }
+
+    fn a1_ptx() -> ProposalTx {
+        ProposalTx {
+            chain_id: 11155111,
+            max_priority_fee_per_gas: U128(1_000_000_000),
+            max_fee_per_gas: U128(30_000_000_000),
+            gas_limit: 21_000,
+            to: A1_ADDR.into(),
+            value: U128(1_000_000_000_000_000),
+            data: "0x".into(),
+        }
+    }
+
+    /// Vault 0 whose key is the A1 key, a policy that allows the A1 transaction, the A1
+    /// transaction proposed, and the clock past the delay. Returns (contract, owner, proposal id).
+    fn ready_a1_proposal() -> (PolicyVault, AccountId, u64) {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        assert!(c.on_derived_key("0".into(), Ok(A1_KEY.into())));
+        assert_eq!(c.vault_info("0".into()).evm_address.as_deref(), Some(A1_ADDR));
+        let mut p = test_policy(100_000_000_000_000_000);
+        p.allowed_destinations = vec![A1_ADDR.into()];
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS);
+        c.set_policy("0".into(), p);
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), a1_ptx());
+        ctx_at(alice.clone(), EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        (c, alice, id)
+    }
+
+    #[test]
+    fn execute_asks_the_signer_for_exactly_the_validated_hash() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        let f = c.get_inflight("0".into()).expect("in flight");
+        assert_eq!((f.nonce, f.signing_hash.as_str()), (0, A1_HASH));
+        let calls = function_calls();
+        let (_, _, args) = calls.iter().find(|(to, m, _)| *to == signer() && m == "sign").expect("sign call");
+        let v: near_sdk::serde_json::Value = near_sdk::serde_json::from_str(args).unwrap();
+        assert_eq!(v["request"]["domain_id"], 0);
+        assert_eq!(v["request"]["path"], "vault-0");
+        assert_eq!(v["request"]["payload_v2"]["Ecdsa"], A1_HASH.trim_start_matches("0x"));
+        assert!(calls.iter().any(|(_, m, _)| m == "on_signed"), "callback missing");
+        assert_eq!(c.get_next_nonce("0".into()), 1);
+        assert!(c.list_proposals("0".into()).is_empty());
+        assert!(c.get_policy("0".into()).spend.eth.spent.0 > 0, "cap charged at signing");
+    }
+
+    #[test]
+    fn real_mpc_signature_is_verified_and_the_mined_transaction_is_stored() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        assert!(c.on_signed("0".into(), Ok(a1_response())));
+        let rec = c.get_signed("0".into(), 0).expect("signed record");
+        assert_eq!(rec.signed_tx, A1_RAW, "byte-identical to the transaction mined on Sepolia");
+        assert_eq!(rec.tx_hash, A1_TX_HASH);
+        assert_eq!((rec.owner, rec.proposal_id), (alice, id));
+        assert!(c.get_inflight("0".into()).is_none(), "lock released");
+        assert_eq!(c.list_signed("0".into(), None, None).len(), 1);
+        assert!(get_logs().iter().any(|l| l.contains("\"transaction_signed\"") && l.contains(A1_TX_HASH)));
+    }
+
+    fn assert_rolled_back(c: &PolicyVault, id: u64, reason: &str) {
+        assert!(c.get_inflight("0".into()).is_none(), "lock released");
+        assert!(c.get_signed("0".into(), 0).is_none(), "nothing stored");
+        assert_eq!(c.get_next_nonce("0".into()), 0, "nonce restored");
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, 0, "cap released");
+        assert_eq!(c.list_proposals("0".into()).iter().map(|p| p.id).collect::<Vec<_>>(), vec![id], "requeued");
+        let ev = get_logs().into_iter().find(|l| l.contains("\"signature_failed\"")).expect("event");
+        assert!(ev.contains(reason), "{ev}");
+        assert!(transfers().iter().any(|(to, _)| *to == accounts(1)), "storage reserve refunded");
+    }
+
+    #[test]
+    fn tampered_signature_is_rejected_and_everything_is_undone() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        let mut bad = a1_response();
+        bad.s.scalar = "3a85fc21be896c6b5c90c09b479f75806a2b0933b1994876b1a7bb6c25733808".into();
+        assert!(!c.on_signed("0".into(), Ok(bad)));
+        assert_rolled_back(&c, id, "does not match the vault key");
+    }
+
+    #[test]
+    fn signature_for_another_key_is_rejected() {
+        // A valid signature, but the vault's key is different (vault-0 of the M4 tests).
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        let mut v = c.vaults.get(&"0".to_string()).unwrap();
+        v.public_key = parse_secp256k1_key(VAULT0_KEY).unwrap();
+        c.vaults.insert(&"0".to_string(), &v);
+        assert!(!c.on_signed("0".into(), Ok(a1_response())));
+        assert_rolled_back(&c, id, "does not match the vault key");
+    }
+
+    #[test]
+    fn signer_failure_is_undone() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        assert!(!c.on_signed("0".into(), Err(PromiseError::Failed)));
+        assert_rolled_back(&c, id, "signer call failed");
+    }
+
+    #[test]
+    fn malformed_answer_is_undone() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        let mut bad = a1_response();
+        bad.big_r.affine_point = "054057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98".into();
+        assert!(!c.on_signed("0".into(), Ok(bad)));
+        assert_rolled_back(&c, id, "not a compressed point");
+    }
+
+    #[test]
+    #[should_panic(expected = "A signature is already in flight for this vault")]
+    fn only_one_signature_in_flight() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 20);
+        let id2 = c.propose("0".into(), a1_ptx());
+        let _ = id;
+        ctx_at(alice.clone(), EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id);
+        let _ = c.execute_proposal("0".into(), id2);
+    }
+
+    #[test]
+    #[should_panic(expected = "A signature is in flight for this vault; transfer after it completes")]
+    fn no_transfer_while_a_signature_is_in_flight() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        ctx_at(alice, ONE_YOCTO, T0_MS + 20 + HOUR_MS);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+    }
+
+    #[test]
+    fn after_signing_the_vault_can_be_sold_and_keeps_its_nonce_and_history() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id);
+        c.on_signed("0".into(), Ok(a1_response()));
+        ctx_at(alice, ONE_YOCTO, T0_MS + 30 + HOUR_MS);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+        assert_eq!(c.get_next_nonce("0".into()), 1, "the external account's nonce survives the sale");
+        assert_eq!(c.list_signed("0".into(), None, None).len(), 1, "the buyer can audit past signatures");
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn stranger_cannot_execute() {
+        let (mut c, _, id) = ready_a1_proposal();
+        ctx_at(accounts(3), EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal delay has not passed yet")]
+    fn execute_respects_the_delay() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS - 1);
+        let _ = c.execute_proposal("0".into(), id);
+    }
+
+    #[test]
+    #[should_panic(expected = "to cover storage and the signer deposit")]
+    fn execute_needs_a_deposit() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        ctx_at(alice, ONE_YOCTO, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Vault address not resolved yet")]
+    fn execute_needs_a_resolved_vault() {
+        let (mut c, alice) = vault_with_policy(); // vault key never resolved
+        let id = propose_as(&mut c, &alice, 1, T0_MS + 10);
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id);
     }
 
     #[test]

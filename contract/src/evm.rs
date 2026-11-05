@@ -109,6 +109,60 @@ impl Eip1559Tx {
         preimage.extend_from_slice(&self.rlp_unsigned());
         keccak256(&preimage)
     }
+
+    /// The raw signed transaction, ready for `eth_sendRawTransaction`:
+    /// `0x02 || rlp([chain_id, nonce, max_priority_fee, max_fee, gas_limit, to, value, data,
+    /// access_list, y_parity, r, s])`. `r` and `s` are encoded as integers (no leading zeros).
+    pub fn rlp_signed(&self, y_parity: u8, r: &[u8; 32], s: &[u8; 32]) -> Vec<u8> {
+        let mut p = Vec::new();
+        rlp_uint(&mut p, self.chain_id as u128);
+        rlp_uint(&mut p, self.nonce as u128);
+        rlp_uint(&mut p, self.max_priority_fee_per_gas);
+        rlp_uint(&mut p, self.max_fee_per_gas);
+        rlp_uint(&mut p, self.gas_limit as u128);
+        rlp_bytes(&mut p, &self.to);
+        rlp_uint(&mut p, self.value);
+        rlp_bytes(&mut p, &self.data);
+        p.push(0xc0); // empty access list
+        rlp_uint(&mut p, y_parity as u128);
+        rlp_bytes(&mut p, strip_leading_zeros(r));
+        rlp_bytes(&mut p, strip_leading_zeros(s));
+        let mut out = vec![0x02];
+        out.extend_from_slice(&rlp_list(&p));
+        out
+    }
+}
+
+fn strip_leading_zeros(b: &[u8]) -> &[u8] {
+    let first = b.iter().position(|x| *x != 0).unwrap_or(b.len());
+    &b[first..]
+}
+
+/// Order of the secp256k1 group.
+pub const SECP256K1_N: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+];
+/// n / 2: Ethereum only accepts signatures with `s <= n/2` (EIP-2).
+pub const SECP256K1_HALF_N: [u8; 32] = [
+    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+];
+
+/// Returns `(s, y_parity)` with `s` in the lower half. If `s > n/2`, the equivalent signature
+/// `(n - s, 1 - y_parity)` is returned, which recovers the same key and Ethereum accepts.
+pub fn normalize_s(s: &[u8; 32], y_parity: u8) -> ([u8; 32], u8) {
+    if s[..] <= SECP256K1_HALF_N[..] {
+        return (*s, y_parity);
+    }
+    let mut out = [0u8; 32];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let mut d = SECP256K1_N[i] as i16 - s[i] as i16 - borrow;
+        borrow = if d < 0 { d += 256; 1 } else { 0 };
+        out[i] = d as u8;
+    }
+    (out, y_parity ^ 1)
 }
 
 /// What the calldata of a candidate transaction looks like. Anything not listed is `Unknown`
@@ -227,6 +281,79 @@ mod tests {
             value: 1_000_000_000_000_000,
             data: vec![],
         }
+    }
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let v: Vec<u8> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+        v.try_into().unwrap()
+    }
+
+    fn to_hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// The real A1 transaction: signed by the NEAR MPC network and mined on Sepolia
+    /// (tx 0xfe6d501e…45b1, block 12064522). Raw bytes as printed by viem in scripts/a1-verify.mjs.
+    #[test]
+    fn signed_rlp_matches_the_a1_transaction_mined_on_sepolia() {
+        let mut to = [0u8; 20];
+        to.copy_from_slice(&hex32("881294c1b52d631ab43fa2bd23d691209b548d11000000000000000000000000")[..20]);
+        let tx = Eip1559Tx {
+            chain_id: 11155111,
+            nonce: 0,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 30_000_000_000,
+            gas_limit: 21_000,
+            to,
+            value: 1_000_000_000_000_000,
+            data: vec![],
+        };
+        let r = hex32("4057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98");
+        let s = hex32("3a85fc21be896c6b5c90c09b479f75806a2b0933b1994876b1a7bb6c25733809");
+        let raw = tx.rlp_signed(1, &r, &s);
+        assert_eq!(
+            to_hex(&raw),
+            "02f87583aa36a780843b9aca008506fc23ac0082520894881294c1b52d631ab43fa2bd23d691209b548d11\
+             87038d7ea4c6800080c001a04057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98\
+             a03a85fc21be896c6b5c90c09b479f75806a2b0933b1994876b1a7bb6c25733809"
+        );
+        assert_eq!(
+            to_hex(&keccak256(&raw)),
+            "fe6d501e202d703ed56ef3978b6c6f666379fbe87d9d0c456683cd22741a45b1",
+            "the Ethereum transaction hash seen on Sepolia"
+        );
+    }
+
+    #[test]
+    fn signed_rlp_strips_leading_zeros_of_r_and_s() {
+        let tx = sample_tx();
+        let mut r = [0u8; 32];
+        r[31] = 5;
+        let s = [0x11u8; 32];
+        let raw = tx.rlp_signed(0, &r, &s);
+        // ... 0x80 (y_parity 0), 0x05 (r = 5, single byte), 0xa0 + 32 bytes (s)
+        let tail = &raw[raw.len() - 35..];
+        assert_eq!(&tail[..3], &[0x80, 0x05, 0xa0]);
+    }
+
+    #[test]
+    fn normalize_s_keeps_low_s_and_flips_high_s() {
+        let low = hex32("3a85fc21be896c6b5c90c09b479f75806a2b0933b1994876b1a7bb6c25733809");
+        assert_eq!(normalize_s(&low, 1), (low, 1));
+        assert_eq!(normalize_s(&SECP256K1_HALF_N, 0), (SECP256K1_HALF_N, 0), "n/2 itself is low");
+        // high s = n - low  ->  back to low, parity flipped
+        let (high, _) = {
+            let mut out = [0u8; 32];
+            let mut borrow = 0i16;
+            for i in (0..32).rev() {
+                let mut d = SECP256K1_N[i] as i16 - low[i] as i16 - borrow;
+                borrow = if d < 0 { d += 256; 1 } else { 0 };
+                out[i] = d as u8;
+            }
+            (out, ())
+        };
+        assert!(high[..] > SECP256K1_HALF_N[..]);
+        assert_eq!(normalize_s(&high, 0), (low, 1));
     }
 
     #[test]
