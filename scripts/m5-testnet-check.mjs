@@ -7,7 +7,7 @@
 // - transferring the NFT clears the policy and refunds its storage to the seller.
 //
 // Usage: node m5-testnet-check.mjs <owner> <vault-contract> <guardian>
-// The three accounts need keys in the keychain. Takes about 2 minutes (it waits a 60 s delay).
+// The three accounts need keys in the keychain. Takes about 11 minutes (the sale window waits at least 10).
 // Mints one vault (0.1 NEAR, mostly refunded) and transfers it to the guardian at the end.
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -101,6 +101,9 @@ check('locked vault refuses everything', !c.allowed && c.reason === 'vault has n
 let r = await call(OWNER, 'set_policy', { token_id: t, policy: policy(0.1) }, '0.05 NEAR');
 v = await view('get_policy', { token_id: t });
 check('first policy applies at once', applied(r.out) === true && v.has_policy && v.policy.guardian === GUARDIAN);
+// The final check sells the vault. Every sale waits at least 10 minutes (M8), so open it now and
+// let the wait run alongside the policy checks (this script signs nothing, so the freeze is harmless).
+const saleOpensAt = events((await call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR')).out, 'sale_started')[0]?.data[0].opens_at_ms;
 
 // ---------- check_transaction ----------
 const input = txInput();
@@ -166,9 +169,11 @@ v = await view('get_policy', { token_id: t });
 check('the owner can cancel the replacement', !r.panic && v.pending === null && v.policy.guardian === GUARDIAN, r.panic);
 
 // ---------- transfer clears the policy (M8: through a sale window, which waits the delay) ----------
-await call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR');
-console.log(`      waiting ${DELAY_MS / 1000 + 5} s for the sale window to open...`);
-await sleep(DELAY_MS + 5000);
+const saleWait = saleOpensAt - Date.now() + 5000;
+if (saleWait > 0) {
+  console.log(`      waiting ${Math.ceil(saleWait / 1000)} s for the sale window to open (minimum 10 minutes)...`);
+  await sleep(saleWait);
+}
 r = await call(OWNER, 'nft_transfer', { receiver_id: GUARDIAN, token_id: t }, '1 yoctoNEAR');
 v = await view('get_policy', { token_id: t });
 check('after a transfer the buyer gets a locked vault', v.has_policy === false);

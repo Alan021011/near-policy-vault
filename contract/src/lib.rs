@@ -351,9 +351,34 @@ pub struct PolicyVault {
     vault_chain: LookupMap<TokenId, u64>,
     /// M8: the sale window of each vault, if one was started. No transfer happens without one.
     sales: LookupMap<TokenId, Sale>,
+    /// M8 review V1: sale numbers are unique, so a buyer can bind a transfer to the audited sale.
+    next_sale_id: u64,
 }
 
-/// State layout deployed for the general-review fixes (commit 22a48bb), used only by `migrate`.
+/// State layout deployed for M8 (commit b539799), used only by `migrate`. Its sale records had no
+/// `sale_id`; migrating is only safe when no vault has a sale record (checked before deploying).
+#[near(serializers = [borsh])]
+struct PolicyVaultV9 {
+    tokens: NonFungibleToken,
+    metadata: LazyOption<NFTContractMetadata>,
+    next_token_id: u64,
+    transfer_info: LookupMap<TokenId, TransferInfo>,
+    signer_id: AccountId,
+    vaults: LookupMap<TokenId, VaultRecord>,
+    policies: LookupMap<TokenId, VaultPolicyState>,
+    nonces: LookupMap<TokenId, u64>,
+    next_proposal_id: u64,
+    inflight: LookupMap<TokenId, InFlight>,
+    signed: LookupMap<String, SignedRecord>,
+    signed_versions: LookupMap<String, u32>,
+    uncertain: LookupMap<TokenId, Vec<UncertainNonce>>,
+    pinned: LookupMap<u64, u64>,
+    vault_chain: LookupMap<TokenId, u64>,
+    sales: LookupMap<TokenId, Sale>,
+}
+
+/// State layout deployed for the general-review fixes (commit 22a48bb), kept for reference.
+#[allow(dead_code)]
 #[near(serializers = [borsh])]
 struct PolicyVaultV8 {
     tokens: NonFungibleToken,
@@ -379,14 +404,21 @@ struct PolicyVaultV8 {
 /// an old sale never leaves the vault transferable for good.
 pub const SALE_WINDOW_MS: u64 = 86_400_000;
 
-/// A sale window. While it exists the vault cannot sign new transactions (only cancellations),
-/// so its state is stable for the buyer's audit. Transfers are only possible between
-/// `opens_at_ms` and `closes_at_ms`, and the guardian can veto it at any time (threat 16).
+/// Shortest wait before any sale opens, also for a vault without policy (M8 review V3): if the
+/// owner's key leaks, the owner, who still holds it, has this long to cancel the thief's sale.
+pub const MIN_SALE_DELAY_MS: u64 = 600_000;
+
+/// A sale window. While it is active (not closed) the vault cannot sign new transactions (only
+/// cancellations), so its state is stable for the buyer's audit. Transfers are only possible
+/// between `opens_at_ms` and `closes_at_ms`, and the guardian can veto it at any time (threat 16).
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sale {
+    /// Unique sale number. A transfer whose `memo` is `sale:<sale_id>` only succeeds during this
+    /// very sale (M8 review V1): a buyer or escrow binds the payment to the sale it audited.
+    pub sale_id: u64,
     pub started_ms: u64,
-    /// Start + the policy's delay (0 for a vault without policy).
+    /// Start + max(policy delay, `MIN_SALE_DELAY_MS`).
     pub opens_at_ms: u64,
     pub closes_at_ms: u64,
     /// Owner epoch when it was started; a sale never carries over to a later owner.
@@ -605,17 +637,16 @@ impl PolicyVault {
             pinned: LookupMap::new(StorageKey::Pinned),
             vault_chain: LookupMap::new(StorageKey::VaultChain),
             sales: LookupMap::new(StorageKey::Sales),
+            next_sale_id: 0,
         }
     }
 
-    /// Upgrades the state written by the general-review deployment. Only the contract account
-    /// can call it. Calling it on the current layout fails, because the old layout no longer
-    /// parses. Existing vaults start without a sale, so they cannot be transferred until one is
-    /// started.
+    /// Upgrades the state written by the M8 deployment. Only the contract account can call it.
+    /// Calling it on the current layout fails, because the old layout no longer parses.
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: PolicyVaultV8 = env::state_read().expect("no V8 state to migrate");
+        let old: PolicyVaultV9 = env::state_read().expect("no V9 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
@@ -632,15 +663,17 @@ impl PolicyVault {
             uncertain: old.uncertain,
             pinned: old.pinned,
             vault_chain: old.vault_chain,
-            sales: LookupMap::new(StorageKey::Sales),
+            sales: old.sales,
+            next_sale_id: 0,
         }
     }
 
     /// Opens a sale window (M8). Only the owner, with a deposit that covers its storage. The
-    /// window opens after the policy's delay (at once for a vault without policy), stays open
-    /// `SALE_WINDOW_MS`, and the guardian can veto it at any time. While the sale exists the vault
-    /// cannot sign new transactions, only cancellations (`cancel_nonce`), so the buyer can audit
-    /// a stable state. Not allowed while a signature is in flight.
+    /// window opens after max(policy delay, `MIN_SALE_DELAY_MS`), stays open `SALE_WINDOW_MS`,
+    /// and the guardian can veto it at any time. While the sale is active the vault cannot sign
+    /// new transactions, only cancellations (`cancel_nonce`), so the buyer can audit a stable
+    /// state. Not allowed while a signature is in flight. A sale whose window has closed is
+    /// replaced (M8 review V2).
     #[payable]
     pub fn start_sale(&mut self, token_id: TokenId) -> Sale {
         require!(
@@ -648,27 +681,29 @@ impl PolicyVault {
             "Requires attached deposit of at least 1 yoctoNEAR"
         );
         let owner = self.assert_owner(&token_id);
-        require!(self.sales.get(&token_id).is_none(), "A sale is already active; cancel it first");
+        require!(self.active_sale(&token_id).is_none(), "A sale is already active; cancel it first");
         require!(
             self.inflight.get(&token_id).is_none(),
             "A signature is in flight for this vault; start the sale after it completes"
         );
         let now = env::block_timestamp_ms();
         let delay = self.policies.get(&token_id).map(|s| s.policy.delay_ms).unwrap_or(0);
-        let opens_at_ms = now.saturating_add(delay);
+        let opens_at_ms = now.saturating_add(delay.max(MIN_SALE_DELAY_MS));
         let sale = Sale {
+            sale_id: self.next_sale_id,
             started_ms: now,
             opens_at_ms,
             closes_at_ms: opens_at_ms.saturating_add(SALE_WINDOW_MS),
             owner_epoch: self.owner_epoch(&token_id),
         };
+        self.next_sale_id += 1;
         let before = env::storage_usage();
-        self.sales.insert(&token_id, &sale);
+        self.sales.insert(&token_id, &sale); // replaces a closed one, if any
         settle_storage(before, &owner);
         emit_policy_event(
             "sale_started",
             &token_id,
-            json!({ "opens_at_ms": sale.opens_at_ms, "closes_at_ms": sale.closes_at_ms }),
+            json!({ "sale_id": sale.sale_id, "opens_at_ms": sale.opens_at_ms, "closes_at_ms": sale.closes_at_ms }),
         );
         sale
     }
@@ -864,8 +899,9 @@ impl PolicyVault {
     }
 
     /// Hook called before any transfer. M7: no transfer while a signature is in flight, so the
-    /// callback always sees the owner who asked for it (threat 5). M8 adds the sale freeze.
-    fn assert_transferable(&self, token_id: &TokenId) {
+    /// callback always sees the owner who asked for it (threat 5). M8: an open sale window of
+    /// the current owner, and, if the memo names a sale (`sale:<id>`), that very sale.
+    fn assert_transferable(&self, token_id: &TokenId, memo: Option<&str>) {
         require_token_exists(&self.tokens, token_id);
         require!(
             self.inflight.get(token_id).is_none(),
@@ -883,6 +919,24 @@ impl PolicyVault {
         let now = env::block_timestamp_ms();
         require!(now >= sale.opens_at_ms, format!("The sale opens at {} ms", sale.opens_at_ms));
         require!(now < sale.closes_at_ms, "The sale window has closed; start a new sale");
+        // M8 review V1: a buyer or escrow that audited sale N transfers with memo "sale:N"; if the
+        // seller cancelled and restarted the sale (and could have signed in between), it fails.
+        if let Some(bound) = memo.and_then(|m| m.trim().strip_prefix("sale:")) {
+            let id: u64 = bound
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| env::panic_str("Malformed sale binding in memo; use sale:<sale_id>"));
+            require!(
+                id == sale.sale_id,
+                format!("The sale changed since it was audited (audited {id}, current {})", sale.sale_id)
+            );
+        }
+    }
+
+    /// The sale of a vault if its window has not closed yet (a closed one no longer freezes the
+    /// vault; M8 review V2).
+    fn active_sale(&self, token_id: &TokenId) -> Option<Sale> {
+        self.sales.get(token_id).filter(|s| env::block_timestamp_ms() < s.closes_at_ms)
     }
 
     fn drop_sale(&mut self, token_id: &TokenId, owner: &AccountId) {
@@ -1235,7 +1289,7 @@ impl PolicyVault {
         self.assert_can_sign(&token_id);
         // M8: a vault on sale only signs cancellations, so the buyer audits a stable state.
         require!(
-            self.sales.get(&token_id).is_none(),
+            self.active_sale(&token_id).is_none(),
             "The vault is frozen for a sale; only cancel_nonce can sign until the sale ends"
         );
         let before = env::storage_usage();
@@ -1809,7 +1863,7 @@ impl NonFungibleTokenCore for PolicyVault {
         memo: Option<String>,
     ) {
         assert_one_yocto();
-        self.assert_transferable(&token_id);
+        self.assert_transferable(&token_id, memo.as_deref());
         let sender_id = env::predecessor_account_id();
         let (old_owner, cleared) =
             self.tokens.internal_transfer(&sender_id, &receiver_id, &token_id, approval_id, memo);
@@ -1827,7 +1881,7 @@ impl NonFungibleTokenCore for PolicyVault {
         memo: Option<String>,
         msg: String,
     ) -> PromiseOrValue<bool> {
-        self.assert_transferable(&token_id);
+        self.assert_transferable(&token_id, memo.as_deref());
         let old_owner = self.tokens.owner_by_id.get(&token_id).expect("checked above");
         let sender_id = env::predecessor_account_id();
         let result =
@@ -1969,7 +2023,7 @@ mod tests {
         let epoch = c.owner_epoch(&"0".to_string());
         c.sales.insert(
             &"0".to_string(),
-            &Sale { started_ms: 0, opens_at_ms: 0, closes_at_ms: u64::MAX, owner_epoch: epoch },
+            &Sale { sale_id: 9_999, started_ms: 0, opens_at_ms: 0, closes_at_ms: u64::MAX, owner_epoch: epoch },
         );
     }
 
@@ -3554,14 +3608,119 @@ mod tests {
     }
 
     #[test]
-    fn a_vault_without_policy_opens_its_sale_at_once_and_the_transfer_ends_it() {
+    fn a_vault_without_policy_waits_the_minimum_and_the_transfer_ends_it() {
         let (alice, bob) = (accounts(1), accounts(2));
         let mut c = setup_with_vault(alice.clone());
         let sale = start_sale_as(&mut c, &alice, T0_MS);
-        assert_eq!((sale.opens_at_ms, sale.closes_at_ms), (T0_MS, T0_MS + SALE_WINDOW_MS));
-        transfer_as(&mut c, &alice, bob.clone(), T0_MS);
+        let opens = T0_MS + MIN_SALE_DELAY_MS;
+        assert_eq!((sale.opens_at_ms, sale.closes_at_ms), (opens, opens + SALE_WINDOW_MS));
+        transfer_as(&mut c, &alice, bob.clone(), opens);
         assert_eq!(c.nft_token("0".into()).unwrap().owner_id, bob);
         assert!(c.get_sale("0".into()).is_none(), "the sale never carries over to the buyer");
+    }
+
+    /// M8 review V3: even without a policy, a sale waits 10 minutes.
+    #[test]
+    #[should_panic(expected = "The sale opens at")]
+    fn a_vault_without_policy_cannot_be_sold_at_once() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        start_sale_as(&mut c, &alice, T0_MS);
+        transfer_as(&mut c, &alice, accounts(2), T0_MS + MIN_SALE_DELAY_MS - 1);
+    }
+
+    /// M8 review V3: a thief who copied the owner's key starts a sale; the owner, who still holds
+    /// the key, cancels it during the minimum wait.
+    #[test]
+    #[should_panic(expected = "Start a sale (start_sale) and wait for it to open")]
+    fn the_owner_cancels_a_thiefs_sale_during_the_minimum_wait() {
+        let alice = accounts(1); // both the thief and the owner sign as alice
+        let mut c = setup_with_vault(alice.clone());
+        start_sale_as(&mut c, &alice, T0_MS); // the thief
+        ctx_at(alice.clone(), ONE_YOCTO, T0_MS + 60_000);
+        c.cancel_sale("0".into()); // the owner, a minute later
+        transfer_as(&mut c, &alice, accounts(5), T0_MS + MIN_SALE_DELAY_MS);
+    }
+
+    /// M8 review V1: a buyer binds the transfer to the sale it audited.
+    #[test]
+    fn a_transfer_bound_to_the_audited_sale_succeeds() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        let sale = start_sale_as(&mut c, &alice, T0_MS);
+        ctx_at(alice, ONE_YOCTO, sale.opens_at_ms);
+        c.nft_transfer(accounts(2), "0".into(), None, Some(format!("sale:{}", sale.sale_id)));
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, accounts(2));
+    }
+
+    /// M8 review V1: the seller cancelled the audited sale, could have signed something, and
+    /// started a new one: the bound transfer fails.
+    #[test]
+    #[should_panic(expected = "The sale changed since it was audited (audited 0, current 1)")]
+    fn a_transfer_bound_to_an_old_sale_fails() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        let audited = start_sale_as(&mut c, &alice, T0_MS);
+        ctx_at(alice.clone(), ONE_YOCTO, T0_MS + 1);
+        c.cancel_sale("0".into());
+        let current = start_sale_as(&mut c, &alice, T0_MS + 2);
+        assert_eq!((audited.sale_id, current.sale_id), (0, 1), "sale ids are unique");
+        ctx_at(alice, ONE_YOCTO, current.opens_at_ms);
+        c.nft_transfer(accounts(2), "0".into(), None, Some(format!("sale:{}", audited.sale_id)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Malformed sale binding in memo")]
+    fn a_malformed_sale_binding_fails() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        let sale = start_sale_as(&mut c, &alice, T0_MS);
+        ctx_at(alice, ONE_YOCTO, sale.opens_at_ms);
+        c.nft_transfer(accounts(2), "0".into(), None, Some("sale:abc".into()));
+    }
+
+    #[test]
+    fn a_memo_that_names_no_sale_is_just_a_memo() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        let sale = start_sale_as(&mut c, &alice, T0_MS);
+        ctx_at(alice, ONE_YOCTO, sale.opens_at_ms);
+        c.nft_transfer(accounts(2), "0".into(), None, Some("thanks for the deal".into()));
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, accounts(2));
+    }
+
+    /// M8 review V2: once its window has closed, a sale no longer freezes the vault...
+    #[test]
+    fn a_closed_sale_no_longer_freezes_the_vault() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let sale = start_sale_as(&mut c, &alice, T0_MS + 10 + HOUR_MS);
+        ctx_at(alice, EXEC_DEPOSIT, sale.closes_at_ms);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert!(c.get_inflight("0".into()).is_some(), "signing works again");
+    }
+
+    /// ...and a new sale can replace it without cancelling it first.
+    #[test]
+    fn a_new_sale_replaces_a_closed_one() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        let old = start_sale_as(&mut c, &alice, T0_MS);
+        let new = start_sale_as(&mut c, &alice, old.closes_at_ms);
+        assert_eq!(new.sale_id, old.sale_id + 1);
+        assert_eq!(c.get_sale("0".into()).unwrap(), new);
+    }
+
+    /// M8 review V6.
+    #[test]
+    #[should_panic(expected = "A signature is in flight for this vault; transfer after it completes")]
+    fn no_transfer_while_a_cancellation_is_in_flight_during_a_sale() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        let sale = start_sale_as(&mut c, &alice, T0_MS + 20 + HOUR_MS);
+        ctx_at(alice.clone(), EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let _ = c.cancel_nonce("0".into(), 0, U128(40_000_000_000), U128(2_000_000_000), None, None);
+        transfer_as(&mut c, &alice, accounts(2), sale.opens_at_ms);
     }
 
     #[test]
@@ -3617,8 +3776,8 @@ mod tests {
     fn the_sale_window_closes() {
         let alice = accounts(1);
         let mut c = setup_with_vault(alice.clone());
-        start_sale_as(&mut c, &alice, T0_MS);
-        transfer_as(&mut c, &alice, accounts(2), T0_MS + SALE_WINDOW_MS);
+        let sale = start_sale_as(&mut c, &alice, T0_MS);
+        transfer_as(&mut c, &alice, accounts(2), sale.closes_at_ms);
     }
 
     #[test]
@@ -3652,8 +3811,8 @@ mod tests {
         let (alice, market) = (accounts(1), accounts(2));
         let mut c = setup_with_vault(alice.clone());
         approve(&mut c, &alice, &market);
-        start_sale_as(&mut c, &alice, T0_MS);
-        transfer_as(&mut c, &market, accounts(3), T0_MS);
+        let sale = start_sale_as(&mut c, &alice, T0_MS);
+        transfer_as(&mut c, &market, accounts(3), sale.opens_at_ms);
         assert_eq!(c.nft_token("0".into()).unwrap().owner_id, accounts(3));
     }
 

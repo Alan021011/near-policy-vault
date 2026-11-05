@@ -10,7 +10,7 @@
 // Usage: node m8-testnet-check.mjs <seller> <vault-contract> <buyer-and-guardian> <token_id>
 // The vault must be funded, owned by <seller>, with a policy whose guardian is <buyer-and-guardian>
 // and whose allowed destinations include the seller's "ethereum-1" address (as left by
-// m7-testnet-check.mjs). Keys for both accounts in the keychain. About 4 minutes.
+// m7-testnet-check.mjs). Keys for both accounts in the keychain. About 13 minutes (every sale waits at least 10).
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -78,7 +78,8 @@ const delay = pol.policy.delay_ms;
 let r = call(SELLER, 'nft_transfer', { receiver_id: BUYER, token_id: T }, '1 yoctoNEAR', '50 Tgas');
 check('no transfer without a sale', r.panic === 'Start a sale (start_sale) and wait for it to open before transferring', r.panic);
 r = call(SELLER, 'start_sale', { token_id: T }, '0.01 NEAR', '50 Tgas');
-check('sale started; it opens after the policy delay', events(r.out, 'sale_started').length === 1, r.panic);
+const firstSale = events(r.out, 'sale_started')[0]?.data[0];
+check('sale started; it opens after max(policy delay, 10 minutes)', !!firstSale && firstSale.opens_at_ms - Date.now() > 9 * 60_000, r.panic);
 r = call(SELLER, 'nft_transfer', { receiver_id: BUYER, token_id: T }, '1 yoctoNEAR', '50 Tgas');
 check('no transfer before the sale opens', /^The sale opens at/.test(r.panic ?? ''), r.panic);
 r = call(BUYER, 'veto_sale', { token_id: T }, '1 yoctoNEAR', '50 Tgas');
@@ -123,8 +124,12 @@ if (waitOpen > 0) {
 a = await audit(VAULT, T);
 check('with the window open the audit says SAFE', a.safe, a.problems.join(' | '));
 const nextBefore = await v('get_next_nonce', { token_id: T });
-r = call(SELLER, 'nft_transfer', { receiver_id: BUYER, token_id: T }, '1 yoctoNEAR', '50 Tgas');
-check('the NFT goes to the buyer', !r.panic && (await v('nft_token', { token_id: T })).owner_id === BUYER, r.panic);
+// M8 review V1: a buyer who audited the first (vetoed) sale binds the transfer to it, and it fails,
+// because the seller signed something between the two sales.
+r = call(SELLER, 'nft_transfer', { receiver_id: BUYER, token_id: T, memo: `sale:${firstSale.sale_id}` }, '1 yoctoNEAR', '50 Tgas');
+check('a transfer bound to an older sale is refused', /^The sale changed since it was audited/.test(r.panic ?? ''), r.panic);
+r = call(SELLER, 'nft_transfer', { receiver_id: BUYER, token_id: T, memo: `sale:${a.sale.sale_id}` }, '1 yoctoNEAR', '50 Tgas');
+check('the NFT goes to the buyer, bound to the audited sale', !r.panic && (await v('nft_token', { token_id: T })).owner_id === BUYER, r.panic);
 const after = await v('get_policy', { token_id: T });
 check('the buyer gets a clean vault: no policy, no queue, no sale',
   !after.has_policy && (await v('list_proposals', { token_id: T })).length === 0 && (await v('get_sale', { token_id: T })) === null);

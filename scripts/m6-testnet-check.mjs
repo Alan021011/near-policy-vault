@@ -6,7 +6,7 @@
 // - selling the NFT empties the queue, and the vault's next nonce does not reset.
 //
 // Usage: node m6-testnet-check.mjs <owner> <vault-contract> <guardian>
-// Keys for the three accounts in the keychain. About 2 minutes (waits a 60 s delay).
+// Keys for the three accounts in the keychain. About 11 minutes (the sale window waits at least 10).
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -68,6 +68,9 @@ const t = events(call(OWNER, 'mint_vault', {}, '0.1 NEAR').out, 'nft_mint')[0]?.
 check('vault minted', t !== undefined);
 call(OWNER, 'set_policy', { token_id: t, policy: policy(10) }, '0.05 NEAR');
 check('policy in force', (await view('get_policy', { token_id: t })).has_policy);
+// The final check sells the vault. Every sale waits at least 10 minutes (M8), so open it now and
+// let the wait run alongside the queue checks (this script signs nothing, so the freeze is harmless).
+const saleOpensAt = events(call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR').out, 'sale_started')[0]?.data[0].opens_at_ms;
 
 // proposals queue; the cap is charged when signing (review P1), not when proposing
 let r = call(OWNER, 'propose', { token_id: t, tx: ptx(6) }, '0.05 NEAR');
@@ -107,9 +110,11 @@ e = await view('check_execution', { token_id: t, proposal_id: Number(b) });
 check('after lowering the cap, B is no longer executable', !e.ready && e.reason === 'Policy now refuses it: ETH daily cap exceeded', e.reason);
 
 // sale empties the queue (M8: through a sale window, which waits the delay)
-call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR');
-console.log(`      waiting ${DELAY_MS / 1000 + 5} s for the sale window to open...`);
-await sleep(DELAY_MS + 5000);
+const saleWait = saleOpensAt - Date.now() + 5000;
+if (saleWait > 0) {
+  console.log(`      waiting ${Math.ceil(saleWait / 1000)} s for the sale window to open (minimum 10 minutes)...`);
+  await sleep(saleWait);
+}
 call(OWNER, 'nft_transfer', { receiver_id: GUARDIAN, token_id: t }, '1 yoctoNEAR');
 check('after the sale the queue is empty', (await view('list_proposals', { token_id: t })).length === 0);
 check('the next nonce is still 0 (not reset, nothing signed)', (await view('get_next_nonce', { token_id: t })) === 0);

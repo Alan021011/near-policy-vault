@@ -59,7 +59,8 @@ export async function audit(contract, tokenId, ethRpc) {
   if (!sale) problems.push('no sale is active: the owner must call start_sale');
   else if (now < sale.opens_at_ms) lines.push(`sale opens in ${Math.ceil((sale.opens_at_ms - now) / 1000)} s (the guardian can still veto it)`);
   else if (now >= sale.closes_at_ms) problems.push('the sale window has closed');
-  else lines.push(`sale open until ${new Date(sale.closes_at_ms).toISOString()}`);
+  else lines.push(`sale ${sale.sale_id} open until ${new Date(sale.closes_at_ms).toISOString()}`);
+  if (sale) lines.push(`bind the purchase to this sale: transfer with memo "sale:${sale.sale_id}" (it fails if the seller restarts the sale)`);
 
   let mined = 0;
   let outstanding = [];
@@ -93,6 +94,8 @@ if (isMain) {
   const r = await audit(contract, tokenId, i > 0 ? process.argv[i + 1] : undefined);
   for (const l of r.lines) console.log('  ' + l);
   for (const p of r.problems) console.log('  ! ' + p);
-  console.log(r.safe ? 'SAFE: no signature from before the sale can still be mined' : 'NOT SAFE: see the points above');
+  console.log(r.safe
+    ? `SAFE for sale ${r.sale.sale_id}: no signature the seller holds can still be mined. Pay only through a transfer bound to "sale:${r.sale.sale_id}".`
+    : 'NOT SAFE: see the points above');
   process.exit(r.safe ? 0 : 2);
 }

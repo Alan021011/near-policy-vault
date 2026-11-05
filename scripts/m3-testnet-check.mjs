@@ -76,16 +76,27 @@ const events = (logs, name) => logs
 const approvalBytes = (id) => BigInt(id.length + 4 + 8);
 const owner = async (t) => (await view('nft_token', { token_id: t })).owner_id;
 
-/** Mints a vault and opens its sale window (M8: no transfer without one). A vault without a
- *  policy has no delay, so the window opens at once. Returns the token id and what the sale
- *  record cost in storage: the transfer that ends the sale refunds exactly that to the seller. */
-async function mint() {
+/** Mints a vault and opens its sale window (M8: no transfer without one; every sale waits at
+ *  least 10 minutes). Returns the token id, when its window opens, and what the sale record cost
+ *  in storage: the transfer that ends the sale refunds exactly that to the seller. */
+async function mintForSale() {
   const r = await call(OWNER, 'mint_vault', {}, '0.1 NEAR');
   const t = events(r.logs, 'nft_mint')[0].data[0].token_ids[0];
   const s = await call(OWNER, 'start_sale', { token_id: t }, '0.01 NEAR');
   const back = s.refunds.filter((x) => x.to === OWNER).reduce((sum, x) => sum + x.amount, 0n);
-  return { t, saleCost: 10n ** 22n - back };
+  const opensAt = events(s.logs, 'sale_started')[0].data[0].opens_at_ms;
+  return { t, saleCost: 10n ** 22n - back, opensAt };
 }
+
+// The four scenarios each need a vault on sale; open all four sales first and wait once.
+const prepared = [];
+for (let i = 0; i < 4; i++) prepared.push(await mintForSale());
+const waitMs = Math.max(...prepared.map((p) => p.opensAt)) - Date.now() + 5000;
+if (waitMs > 0) {
+  console.log(`      waiting ${Math.ceil(waitMs / 1000)} s for the four sale windows to open (minimum 10 minutes)...`);
+  await new Promise((r) => setTimeout(r, waitMs));
+}
+const mint = async () => prepared.shift();
 
 // ---------- A. Approved account transfers (R1) and approvals are refunded (R4) ----------
 {
