@@ -29,6 +29,7 @@
 //! Not here yet: policy, proposals, MPC signing, two-phase sale.
 
 pub mod evm;
+pub mod policy;
 
 use std::collections::HashMap;
 
@@ -51,7 +52,8 @@ use near_sdk::{
     NearToken, PanicOnDefault, Promise, PromiseError, PromiseOrValue,
 };
 
-use crate::evm::keccak256;
+use crate::evm::{keccak256, Eip1559Tx};
+use crate::policy::{Policy, Reservation, SpendState};
 
 /// Prefix of the Chain Signatures derivation path of every vault.
 pub const VAULT_PATH_PREFIX: &str = "vault-";
@@ -89,6 +91,7 @@ enum StorageKey {
     ContractMetadata,
     TransferInfo,
     Vaults,
+    Policies,
 }
 
 /// Fixed-size record (same storage whether resolved or not, so it is paid in full at mint).
@@ -178,15 +181,99 @@ pub struct PolicyVault {
     transfer_info: LookupMap<TokenId, TransferInfo>,
     signer_id: AccountId,
     vaults: LookupMap<TokenId, VaultRecord>,
+    policies: LookupMap<TokenId, VaultPolicyState>,
 }
 
-/// State layout deployed for the M3 review (commit 858e6e5), used only by `migrate`.
+/// State layout deployed for M4 (commit 5e31617), used only by `migrate`.
 #[near(serializers = [borsh])]
-struct PolicyVaultV2 {
+struct PolicyVaultV3 {
     tokens: NonFungibleToken,
     metadata: LazyOption<NFTContractMetadata>,
     next_token_id: u64,
     transfer_info: LookupMap<TokenId, TransferInfo>,
+    signer_id: AccountId,
+    vaults: LookupMap<TokenId, VaultRecord>,
+}
+
+// ---------- M5: policy state, inputs and views ----------
+
+/// A loosening policy change waiting for the current delay to pass (the guardian can veto it).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPolicy {
+    pub policy: Policy,
+    pub apply_after_ms: u64,
+}
+
+/// Everything the contract stores about a vault's policy. Removed on every change of owner.
+#[near(serializers = [borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultPolicyState {
+    pub policy: Policy,
+    pub pending: Option<PendingPolicy>,
+    pub spend: SpendState,
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyView {
+    pub token_id: TokenId,
+    /// `false` means the vault is locked: nothing can be signed.
+    pub has_policy: bool,
+    pub policy: Policy,
+    pub pending: Option<PendingPolicy>,
+    pub spend: SpendState,
+}
+
+/// An EIP-1559 transaction as JSON. Large numbers are decimal strings (`U128`).
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TxInput {
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub max_priority_fee_per_gas: U128,
+    pub max_fee_per_gas: U128,
+    pub gas_limit: u64,
+    /// `0x` + 40 hex characters.
+    pub to: String,
+    pub value: U128,
+    /// `0x` + hex calldata (empty `0x` for a plain transfer).
+    pub data: String,
+}
+
+/// Longest calldata accepted: ERC-20 `transfer`/`approve` are exactly 68 bytes.
+pub const MAX_CALLDATA_LEN: usize = 68;
+
+impl TxInput {
+    pub fn to_tx(&self) -> Result<Eip1559Tx, String> {
+        let to = policy::parse_address(&self.to).ok_or("malformed `to` address")?;
+        let data = policy::parse_hex(&self.data).ok_or("malformed `data` hex")?;
+        if data.len() > MAX_CALLDATA_LEN {
+            return Err("calldata longer than 68 bytes".into());
+        }
+        Ok(Eip1559Tx {
+            chain_id: self.chain_id,
+            nonce: self.nonce,
+            max_priority_fee_per_gas: self.max_priority_fee_per_gas.0,
+            max_fee_per_gas: self.max_fee_per_gas.0,
+            gas_limit: self.gas_limit,
+            to,
+            value: self.value.0,
+            data,
+        })
+    }
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckResult {
+    pub allowed: bool,
+    /// Why the transaction would be refused (`None` when allowed).
+    pub reason: Option<String>,
+    /// The EIP-1559 hash the contract would ask the network to sign (`None` if unparsable).
+    pub signing_hash: Option<String>,
+    /// What it would reserve from the daily caps (`None` when refused).
+    pub reservation: Option<Reservation>,
 }
 
 #[near]
@@ -217,23 +304,25 @@ impl PolicyVault {
             transfer_info: LookupMap::new(StorageKey::TransferInfo),
             signer_id,
             vaults: LookupMap::new(StorageKey::Vaults),
+            policies: LookupMap::new(StorageKey::Policies),
         }
     }
 
-    /// Upgrades the state written by the M3-review deployment. Only the contract account can
-    /// call it. Calling it on the current layout fails, because the old layout no longer parses.
-    /// Vaults minted before this migration have no record; `resolve_vault_address` creates it.
+    /// Upgrades the state written by the M4 deployment. Only the contract account can call it.
+    /// Calling it on the current layout fails, because the old layout no longer parses.
+    /// Existing vaults start without a policy, that is, locked.
     #[private]
     #[init(ignore_state)]
-    pub fn migrate(signer_id: AccountId) -> Self {
-        let old: PolicyVaultV2 = env::state_read().expect("no V2 state to migrate");
+    pub fn migrate() -> Self {
+        let old: PolicyVaultV3 = env::state_read().expect("no V3 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
             next_token_id: old.next_token_id,
             transfer_info: old.transfer_info,
-            signer_id,
-            vaults: LookupMap::new(StorageKey::Vaults),
+            signer_id: old.signer_id,
+            vaults: old.vaults,
+            policies: LookupMap::new(StorageKey::Policies),
         }
     }
 
@@ -426,6 +515,15 @@ impl PolicyVault {
         info.count += 1;
         info.last = Some(record.clone());
         self.transfer_info.insert(token_id, &info);
+        // M5, threat 2: a new owner never inherits the previous owner's policy, pending change
+        // or spending windows. This runs on every change of owner, including a transfer_call
+        // that comes back (so a receiver cannot leave its own policy behind, threat 13).
+        // The freed storage goes back to whoever owned the vault while the policy was set.
+        let before = env::storage_usage();
+        if self.policies.remove(token_id).is_some() {
+            let freed = before.saturating_sub(env::storage_usage());
+            refund_if_any(from, env::storage_byte_cost().saturating_mul(freed.into()));
+        }
         let event = json!({
             "standard": "policy_vault",
             "version": "1.0.0",
@@ -439,6 +537,175 @@ impl PolicyVault {
             }]
         });
         env::log_str(&format!("EVENT_JSON:{event}"));
+    }
+}
+
+// ---------- M5: policy entry points ----------
+
+#[near]
+impl PolicyVault {
+    /// Sets the vault's policy. Only the owner, with a deposit of at least 1 yoctoNEAR (so a
+    /// function-call key alone cannot do it) that also covers any extra storage.
+    /// - If the new policy is not looser than the current one in any respect, or the current
+    ///   delay is 0 (for example, the first policy of a locked vault), it applies at once and
+    ///   any pending change is dropped. Returns `true`.
+    /// - Otherwise it becomes the pending change and applies after the current delay, unless
+    ///   the current guardian vetoes it or the owner cancels it. Returns `false`.
+    #[payable]
+    pub fn set_policy(&mut self, token_id: TokenId, policy: Policy) -> bool {
+        require!(
+            env::attached_deposit() >= NearToken::from_yoctonear(1),
+            "Requires attached deposit of at least 1 yoctoNEAR"
+        );
+        let owner = self.assert_owner(&token_id);
+        let new = policy.normalized().unwrap_or_else(|e| env::panic_str(&e.to_string()));
+        let before = env::storage_usage();
+        let mut st = self.policy_state(&token_id);
+        let now = env::block_timestamp_ms();
+        let applied = policy::is_not_looser(&new, &st.policy) || st.policy.delay_ms == 0;
+        let apply_after_ms = if applied {
+            st.policy = new;
+            st.pending = None;
+            now
+        } else {
+            let at = now.saturating_add(st.policy.delay_ms);
+            st.pending = Some(PendingPolicy { policy: new, apply_after_ms: at });
+            at
+        };
+        self.policies.insert(&token_id, &st);
+        settle_storage(before, &owner);
+        emit_policy_event("policy_set", &token_id, json!({ "applied": applied, "apply_after_ms": apply_after_ms }));
+        applied
+    }
+
+    /// Applies a pending change once its delay has passed. Anyone can call it.
+    pub fn apply_policy(&mut self, token_id: TokenId) {
+        let owner = self.owner_of(&token_id);
+        let before = env::storage_usage();
+        let mut st = self.policies.get(&token_id).unwrap_or_else(|| env::panic_str("No pending policy"));
+        let pending = st.pending.take().unwrap_or_else(|| env::panic_str("No pending policy"));
+        require!(env::block_timestamp_ms() >= pending.apply_after_ms, "Pending policy not ready yet");
+        st.policy = pending.policy;
+        self.policies.insert(&token_id, &st);
+        settle_storage(before, &owner);
+        emit_policy_event("policy_applied", &token_id, json!({}));
+    }
+
+    /// The owner withdraws a pending change.
+    #[payable]
+    pub fn cancel_pending_policy(&mut self, token_id: TokenId) {
+        assert_one_yocto();
+        let owner = self.assert_owner(&token_id);
+        self.drop_pending(&token_id, &owner);
+        emit_policy_event("policy_cancelled", &token_id, json!({}));
+    }
+
+    /// The guardian of the policy in force vetoes a pending change.
+    #[payable]
+    pub fn veto_pending_policy(&mut self, token_id: TokenId) {
+        assert_one_yocto();
+        let owner = self.owner_of(&token_id);
+        let st = self.policies.get(&token_id).unwrap_or_else(|| env::panic_str("No pending policy"));
+        require!(
+            st.policy.guardian.as_ref() == Some(&env::predecessor_account_id()),
+            "Only the guardian can veto"
+        );
+        self.drop_pending(&token_id, &owner);
+        emit_policy_event("policy_vetoed", &token_id, json!({ "guardian": env::predecessor_account_id() }));
+    }
+
+    pub fn get_policy(&self, token_id: TokenId) -> PolicyView {
+        require_token_exists(&self.tokens, &token_id);
+        let stored = self.policies.get(&token_id);
+        let has_policy = stored.is_some();
+        let st = stored.unwrap_or_else(locked_state);
+        PolicyView { token_id, has_policy, policy: st.policy, pending: st.pending, spend: st.spend }
+    }
+
+    /// Would the contract sign this transaction now? Read-only: reserves nothing.
+    pub fn check_transaction(&self, token_id: TokenId, tx: TxInput) -> CheckResult {
+        require_token_exists(&self.tokens, &token_id);
+        let refused = |reason: String, hash: Option<String>| CheckResult {
+            allowed: false,
+            reason: Some(reason),
+            signing_hash: hash,
+            reservation: None,
+        };
+        let tx = match tx.to_tx() {
+            Ok(t) => t,
+            Err(e) => return refused(e, None),
+        };
+        let hash = Some(hex0x(&tx.signing_hash()));
+        let Some(st) = self.policies.get(&token_id) else {
+            return refused("vault has no policy (locked)".into(), hash);
+        };
+        match policy::check(&st.policy, &st.spend, &tx, env::block_timestamp_ms()) {
+            Ok(r) => CheckResult { allowed: true, reason: None, signing_hash: hash, reservation: Some(r) },
+            Err(e) => refused(e.to_string(), hash),
+        }
+    }
+}
+
+impl PolicyVault {
+    fn owner_of(&self, token_id: &TokenId) -> AccountId {
+        self.tokens.owner_by_id.get(token_id).unwrap_or_else(|| env::panic_str("Token not found"))
+    }
+
+    fn assert_owner(&self, token_id: &TokenId) -> AccountId {
+        let owner = self.owner_of(token_id);
+        require!(env::predecessor_account_id() == owner, "Only the vault owner can do this");
+        owner
+    }
+
+    fn policy_state(&self, token_id: &TokenId) -> VaultPolicyState {
+        self.policies.get(token_id).unwrap_or_else(locked_state)
+    }
+
+    fn drop_pending(&mut self, token_id: &TokenId, owner: &AccountId) {
+        let before = env::storage_usage();
+        let mut st = self.policies.get(token_id).unwrap_or_else(|| env::panic_str("No pending policy"));
+        require!(st.pending.take().is_some(), "No pending policy");
+        self.policies.insert(token_id, &st);
+        settle_storage(before, owner);
+    }
+}
+
+fn locked_state() -> VaultPolicyState {
+    VaultPolicyState { policy: Policy::locked(), pending: None, spend: SpendState::default() }
+}
+
+fn emit_policy_event(event: &str, token_id: &TokenId, extra: near_sdk::serde_json::Value) {
+    let mut data = json!({ "token_id": token_id });
+    if let (Some(d), Some(e)) = (data.as_object_mut(), extra.as_object()) {
+        d.extend(e.clone());
+    }
+    let ev = json!({ "standard": "policy_vault", "version": "1.0.0", "event": event, "data": [data] });
+    env::log_str(&format!("EVENT_JSON:{ev}"));
+}
+
+fn refund_if_any(to: &AccountId, amount: NearToken) {
+    if amount > NearToken::from_yoctonear(1) {
+        Promise::new(to.clone()).transfer(amount).detach();
+    }
+}
+
+/// Charges the caller for storage this call added (from the attached deposit, refunding the
+/// rest), or gives the storage it freed back to `freed_to` (the vault owner, who paid for it).
+fn settle_storage(before: u64, freed_to: &AccountId) {
+    let after = env::storage_usage();
+    let price = env::storage_byte_cost();
+    let attached = env::attached_deposit();
+    let caller = env::predecessor_account_id();
+    if after > before {
+        let cost = price.saturating_mul((after - before).into());
+        require!(
+            cost <= attached,
+            format!("Must attach {} to cover storage", cost.exact_amount_display())
+        );
+        refund_if_any(&caller, attached.saturating_sub(cost));
+    } else {
+        refund_if_any(freed_to, price.saturating_mul((before - after).into()));
+        refund_if_any(&caller, attached);
     }
 }
 
@@ -1062,6 +1329,278 @@ mod tests {
         let before = env::storage_usage();
         c.on_derived_key("0".to_string(), Ok(VAULT0_KEY.to_string()));
         assert_eq!(env::storage_usage(), before, "resolving changed storage size");
+    }
+
+    // ---------- M5: policy in the contract ----------
+
+    const HOUR_MS: u64 = 3_600_000;
+    const T0_MS: u64 = 1_800_000_000_000;
+    const DEST: &str = "0x1111111111111111111111111111111111111111";
+    const POLICY_DEPOSIT: NearToken = NearToken::from_millinear(50);
+
+    fn ctx_at(predecessor: AccountId, deposit: NearToken, ms: u64) {
+        let mut b = VMContextBuilder::new();
+        b.current_account_id("vault.testnet".parse().unwrap())
+            .predecessor_account_id(predecessor)
+            .attached_deposit(deposit)
+            .block_timestamp(ms * 1_000_000);
+        testing_env!(b.build());
+    }
+
+    fn guardian() -> AccountId {
+        accounts(4)
+    }
+
+    fn test_policy(cap_wei: u128) -> Policy {
+        Policy {
+            chain_id: 11155111,
+            delay_ms: HOUR_MS,
+            guardian: Some(guardian()),
+            eth_daily_cap: U128(cap_wei),
+            max_gas_cost: U128(21_000 * 50_000_000_000),
+            allowed_destinations: vec![DEST.into()],
+            allowed_spenders: vec![],
+            tokens: vec![],
+        }
+    }
+
+    fn tx_input(value: u128) -> TxInput {
+        TxInput {
+            chain_id: 11155111,
+            nonce: 0,
+            max_priority_fee_per_gas: U128(1_000_000_000),
+            max_fee_per_gas: U128(20_000_000_000),
+            gas_limit: 21_000,
+            to: DEST.into(),
+            value: U128(value),
+            data: "0x".into(),
+        }
+    }
+
+    /// Vault 0 owned by `alice` with `test_policy(0.1 ETH)` in force.
+    fn vault_with_policy() -> (PolicyVault, AccountId) {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS);
+        assert!(c.set_policy("0".into(), test_policy(100_000_000_000_000_000)), "first policy must apply at once");
+        (c, alice)
+    }
+
+    #[test]
+    fn new_vault_is_locked() {
+        let c = setup_with_vault(accounts(1));
+        let v = c.get_policy("0".into());
+        assert!(!v.has_policy);
+        let r = c.check_transaction("0".into(), tx_input(1));
+        assert!(!r.allowed);
+        assert_eq!(r.reason.as_deref(), Some("vault has no policy (locked)"));
+    }
+
+    #[test]
+    fn first_policy_applies_at_once_and_charges_storage() {
+        let (c, alice) = vault_with_policy();
+        let v = c.get_policy("0".into());
+        assert!(v.has_policy && v.pending.is_none());
+        assert_eq!(v.policy.guardian, Some(guardian()));
+        let t = transfers();
+        assert_eq!(t.len(), 1, "excess deposit refunded once: {t:?}");
+        assert_eq!(t[0].0, alice);
+        assert!(t[0].1 < POLICY_DEPOSIT, "storage must have been charged");
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn stranger_cannot_set_policy() {
+        let mut c = setup_with_vault(accounts(1));
+        ctx_at(accounts(2), POLICY_DEPOSIT, T0_MS);
+        c.set_policy("0".into(), test_policy(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Requires attached deposit of at least 1 yoctoNEAR")]
+    fn set_policy_needs_a_deposit() {
+        let mut c = setup_with_vault(accounts(1));
+        ctx_at(accounts(1), NearToken::from_yoctonear(0), T0_MS);
+        c.set_policy("0".into(), test_policy(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid policy: chain_id must not be 0")]
+    fn invalid_policy_is_rejected() {
+        let mut c = setup_with_vault(accounts(1));
+        ctx_at(accounts(1), POLICY_DEPOSIT, T0_MS);
+        let mut p = test_policy(1);
+        p.chain_id = 0;
+        c.set_policy("0".into(), p);
+    }
+
+    #[test]
+    #[should_panic(expected = "to cover storage")]
+    fn set_policy_without_enough_for_storage_fails() {
+        let mut c = setup_with_vault(accounts(1));
+        ctx_at(accounts(1), NearToken::from_yoctonear(1), T0_MS);
+        c.set_policy("0".into(), test_policy(1));
+    }
+
+    #[test]
+    fn loosening_waits_the_delay_then_applies() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        assert!(!c.set_policy("0".into(), test_policy(10_u128.pow(18))), "raising the cap must wait");
+        let v = c.get_policy("0".into());
+        assert_eq!(v.policy.eth_daily_cap.0, 100_000_000_000_000_000, "old cap still in force");
+        assert_eq!(v.pending.as_ref().unwrap().apply_after_ms, T0_MS + 10 + HOUR_MS);
+        // anyone may apply it once the delay has passed
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS);
+        c.apply_policy("0".into());
+        let v = c.get_policy("0".into());
+        assert_eq!(v.policy.eth_daily_cap.0, 10_u128.pow(18));
+        assert!(v.pending.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "Pending policy not ready yet")]
+    fn pending_policy_cannot_apply_early() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), test_policy(10_u128.pow(18)));
+        ctx_at(accounts(3), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS - 1);
+        c.apply_policy("0".into());
+    }
+
+    #[test]
+    fn tightening_applies_at_once_and_drops_pending() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), test_policy(10_u128.pow(18)));
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 20);
+        assert!(c.set_policy("0".into(), test_policy(1)), "lowering the cap applies at once");
+        let v = c.get_policy("0".into());
+        assert_eq!(v.policy.eth_daily_cap.0, 1);
+        assert!(v.pending.is_none());
+    }
+
+    #[test]
+    fn removing_the_guardian_is_a_loosening() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        let mut p = test_policy(100_000_000_000_000_000);
+        p.guardian = None;
+        assert!(!c.set_policy("0".into(), p));
+        assert_eq!(c.get_policy("0".into()).policy.guardian, Some(guardian()));
+    }
+
+    #[test]
+    fn guardian_vetoes_a_pending_change_and_owner_gets_storage_back() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), test_policy(10_u128.pow(18)));
+        ctx_at(guardian(), ONE_YOCTO, T0_MS + 20);
+        c.veto_pending_policy("0".into());
+        assert!(c.get_policy("0".into()).pending.is_none());
+        let t = transfers();
+        assert!(t.iter().any(|(to, _)| *to == alice), "freed storage must go to the owner: {t:?}");
+        assert!(get_logs().iter().any(|l| l.contains("\"policy_vetoed\"")));
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the guardian can veto")]
+    fn stranger_cannot_veto() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), test_policy(10_u128.pow(18)));
+        ctx_at(accounts(3), ONE_YOCTO, T0_MS + 20);
+        c.veto_pending_policy("0".into());
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the guardian can veto")]
+    fn owner_cannot_veto_as_guardian() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), test_policy(10_u128.pow(18)));
+        ctx_at(alice, ONE_YOCTO, T0_MS + 20);
+        c.veto_pending_policy("0".into());
+    }
+
+    #[test]
+    fn owner_cancels_a_pending_change() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), test_policy(10_u128.pow(18)));
+        ctx_at(alice, ONE_YOCTO, T0_MS + 20);
+        c.cancel_pending_policy("0".into());
+        assert!(c.get_policy("0".into()).pending.is_none());
+    }
+
+    #[test]
+    fn check_transaction_allows_and_returns_the_signing_hash() {
+        let (c, _) = vault_with_policy();
+        let input = tx_input(10_000_000_000_000_000);
+        let r = c.check_transaction("0".into(), input.clone());
+        assert!(r.allowed, "{r:?}");
+        let expected = hex0x(&input.to_tx().unwrap().signing_hash());
+        assert_eq!(r.signing_hash.as_deref(), Some(expected.as_str()));
+        assert_eq!(r.reservation.unwrap().eth.0, 10_000_000_000_000_000 + 20_000_000_000 * 21_000);
+    }
+
+    #[test]
+    fn check_transaction_explains_refusals() {
+        let (c, _) = vault_with_policy();
+        let mut stranger = tx_input(1);
+        stranger.to = "0x2222222222222222222222222222222222222222".into();
+        let mut bad_hex = tx_input(1);
+        bad_hex.data = "0xzz".into();
+        let mut too_long = tx_input(0);
+        too_long.data = format!("0x{}", "00".repeat(69));
+        let cases = [
+            (tx_input(10_u128.pow(18)), "ETH daily cap exceeded"),
+            (stranger, "destination not allowed"),
+            (bad_hex, "malformed `data` hex"),
+            (too_long, "calldata longer than 68 bytes"),
+        ];
+        for (input, reason) in cases {
+            let r = c.check_transaction("0".into(), input);
+            assert!(!r.allowed);
+            assert_eq!(r.reason.as_deref(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn transfer_clears_policy_and_refunds_its_storage_to_the_seller() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), ONE_YOCTO, T0_MS + 10);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+        assert!(!c.get_policy("0".into()).has_policy, "buyer must receive a locked vault");
+        let t = transfers();
+        assert!(t.iter().any(|(to, amount)| *to == alice && *amount > NearToken::from_yoctonear(0)), "{t:?}");
+    }
+
+    #[test]
+    fn transfer_call_that_comes_back_clears_the_receivers_policy() {
+        let (alice, bob) = (accounts(1), accounts(2));
+        let mut c = setup_with_vault(alice.clone());
+        ctx_at(alice.clone(), ONE_YOCTO, T0_MS);
+        let _ = c.nft_transfer_call(bob.clone(), "0".into(), None, None, "x".into());
+        // During the call bob owns the vault and sets his own policy...
+        ctx_at(bob.clone(), POLICY_DEPOSIT, T0_MS + 1);
+        assert!(c.set_policy("0".into(), test_policy(1)));
+        // ...then the receiver asks to return the token (nft_on_transfer returned true).
+        let mut b = VMContextBuilder::new();
+        b.current_account_id("vault.testnet".parse().unwrap())
+            .predecessor_account_id("vault.testnet".parse().unwrap())
+            .block_timestamp((T0_MS + 2) * 1_000_000);
+        testing_env!(
+            b.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Successful(b"true".to_vec())]
+        );
+        assert!(!c.nft_resolve_transfer(alice.clone(), bob.clone(), "0".into(), Some(HashMap::new())));
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, alice);
+        assert!(!c.get_policy("0".into()).has_policy, "the receiver's policy survived the return");
+        assert!(transfers().iter().any(|(to, _)| *to == bob), "bob paid for that storage");
     }
 
     #[test]

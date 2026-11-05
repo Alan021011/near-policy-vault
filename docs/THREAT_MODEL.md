@@ -1,6 +1,6 @@
-# Threat model (v1.1)
+# Threat model (v1.2)
 
-Approved by the author on 2026-11-04 before any contract code was written; updated on 2026-11-05 after the M3 review. "Planned" means a mitigation exists on paper only; "Partial" says which part is tested. The spending policy and the two-phase sale are **not built yet**, so threats 1, 2, 4, 5, 6 and 11 are still unmitigated in code.
+Approved by the author on 2026-11-04 before any contract code was written; updated on 2026-11-05 after the M3 review. "Planned" means a mitigation exists on paper only; "Partial" says which part is tested. Updated again on 2026-11-05 after M5 (spending policy). The contract cannot sign anything yet (M6-M7), so no funds are at risk today; the two-phase sale (M8) is not built, so threats 1, 5 and 16 are still unmitigated in code.
 
 ## Assets and actors
 
@@ -18,12 +18,12 @@ The contract stores the transaction fields (chain id, nonce, fees, gas limit, de
 | # | Threat | Planned mitigation | State |
 |---|---|---|---|
 | 1 | **Pre-signed transaction.** The seller obtains a valid signature, sells the NFT and broadcasts the transaction afterwards | Two-phase sale: `start_sale` freezes new signatures; the buyer audits the external-chain nonce against the contract's `next_nonce`; if a signed transaction is outstanding, a cancel transaction with the same nonce is signed; only then does `nft_transfer` succeed | Planned |
-| 2 | The seller adds themself as an allowed destination and drains the cap before selling | Transfer resets allowed destinations, guardian and queue; the daily cap bounds the damage | Planned |
+| 2 | The seller adds themself as an allowed destination and drains the cap before selling | Every change of owner deletes the policy, its pending change and its spending windows; the daily cap bounds the damage | Partial: reset tested (unit + testnet); queue reset comes with M6 |
 | 3 | Misreading of calldata lets a dangerous approval through | Hash is built from validated fields; golden tests compare the Rust hash with viem for the same fields | Partial: the hash matches viem on 19 vectors and the strict classifier is unit-tested; the policy that uses them is not built |
 | 4 | A bug makes the contract sign something it should not | A single signing path; an attack suite that tries each bypass; manual review | Planned |
 | 5 | The `sign` callback sees a different owner than the one who requested it | Each proposal records the owner epoch; transfers are blocked while a signature is in flight | Planned |
-| 6 | Race on the daily cap | Reserve the amount when proposing; release it on veto, cancel or invalidation | Planned |
-| 7 | Permissions the seller left on the external chain | Only approvals to allowed spenders **below a per-vault cap** can be signed (detecting exactly 2^256-1 is not enough: 2^255 is practically unlimited too); the signing history is public so a buyer can audit it | Planned |
+| 6 | Race on the daily cap | Reserve the amount when proposing; release it on veto, cancel or invalidation. Windows are fixed 24 h: across a window boundary up to 2x the cap can be spent (declared) | Partial: windows and reservations unit-tested; proposing is M6 |
+| 7 | Permissions the seller left on the external chain | Only approvals to allowed spenders up to the token's `max_approval` can be signed; amounts above 128 bits are refused, so 2^256-1 and 2^255 both fail | Partial: `check_transaction` refuses them on testnet; signing is M7 |
 | 8 | Trust in the MPC network | Not solved; declared | Residual |
 | 9 | Whoever controls the contract account can change the contract | Today the deployer keeps a full-access key (used for `migrate`). Before submission: delete it and show "0 full access keys"; declared in the README | Pending (documented) |
 | 10 | Stuck nonce or missing gas on the external chain | Documented; the cancel transaction in threat 1 helps | Residual |
@@ -32,6 +32,8 @@ The contract stores the transaction fields (chain id, nonce, fees, gas limit, de
 | 13 | During `nft_transfer_call` the receiver owns the NFT for a moment and may hand it back | The sale freeze and the "signature in flight" lock must treat a pending `transfer_call` as a transfer; ownership changes are recorded (`vault_transfer_info`) | Partial: behaviour checked on testnet (kept, returned, receiver panic); the locks are not built |
 | 14 | An approved account (e.g. a marketplace) moves the NFT | Every transfer path, by the owner or by an approved account, goes through the same wrapper where the locks will live; approvals are cleared on transfer and their deposit refunded | Partial: wrapper and clearing tested; the locks are not built |
 | 15 | A token id is reused, so two owners share one EVM account | Ids are sequential and never reissued; there is no burn | Tested (unit test) |
+| 16 | **Stolen owner key.** A thief with the owner's NEAR key transfers the NFT to an account of theirs; the transfer clears the policy and the first policy of a locked vault applies at once, so the delay and the guardian are skipped | M8: a transfer must wait the current delay and be vetoable by the guardian (sale phase), so the guardian also protects against theft of the NFT | **Open** (found while building M5) |
+| 17 | A loosening policy change applies without anyone noticing | Loosening waits the current delay; the guardian of the policy in force can veto; tightening applies at once; changes emit events | Partial: tested on testnet (veto, early apply refused, apply after delay) |
 
 ## Out of scope
 
