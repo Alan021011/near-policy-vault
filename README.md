@@ -28,8 +28,8 @@ An NFT that **owns an account on another chain** and can only move its funds und
 Each step follows the pattern "run X, expect Y". Nothing is claimed until it has been run.
 
 1. Regenerate the reference vectors with viem:
-   `cd scripts && npm install && node gen-vectors.mjs`
-   Expect: `wrote 19 vectors to .../vectors/eip1559_signing_hash.tsv`.
+   `cd scripts && npm ci && node gen-vectors.mjs`
+   Expect: `wrote 19 vectors to .../vectors/eip1559_signing_hash.tsv` and `git status` shows no change (the committed vectors are reproduced exactly). `npm ci` installs the exact versions in `package-lock.json`.
 2. Run the Rust tests:
    `cd contract && cargo test`
    Expect: 34 unit tests (9 EVM helpers, 25 NFT) and `rust_signing_hash_matches_viem` pass. If you change one character in a vector, that test fails with the case name.
@@ -40,6 +40,8 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
 4. Check the deployed NFT contract on testnet (needs the NEAR CLI and keys for an owner account and the contract account; `test-receiver/` is a helper contract deployed at the third account):
    `cd scripts && node m3-testnet-check.mjs <owner>.testnet <vault-contract>.testnet <receiver>.testnet`
    Expect: 16 `PASS` lines and `ALL CHECKS PASSED`.
+5. Check that the deployed code is this repository's code: compare the SHA-256 printed by step 3 with the `code_hash` of the contract account (`near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now`, or the RPC `view_account`, which gives it in base58).
+   On 2026-11-05 a fresh clone built `01b4939ad8c96fcaa17a5621375b64980bc684786423e154a7a391196587b88b`, identical to the deployed `code_hash`. This was on the author's machine and toolchain (Rust 1.99.1, cargo-near 0.22.0); a byte-identical build on any machine needs `cargo near build reproducible-wasm` (Docker), planned before submission.
 
 ## Known limits
 
