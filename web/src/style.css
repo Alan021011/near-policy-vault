@@ -119,3 +119,4 @@ tr:nth-child(even) td { background: #10131b; }
   td, th { padding: 6px 4px; }
   .hide-sm { display: none; }
 }
+.override { background: var(--red-dim); border-bottom: 1px solid var(--red-line); color: var(--red); padding: 8px 16px; font-size: 13px; text-align: center; }

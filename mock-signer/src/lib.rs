@@ -17,6 +17,8 @@
 //! - "wrong_key": a valid signature by another key (the vault must reject it and undo).
 //! - "garbage": an answer that is not a signature (the vault must treat it as uncertain).
 //! - "fail": the call fails (the vault must treat it as uncertain).
+//! - "v28": a valid signature with `recovery_id` written Ethereum-style (27/28): a format change
+//!   the vault must treat as uncertain, not undo (review M12, R12-5).
 
 use k256::ecdsa::SigningKey;
 use near_sdk::serde::{Deserialize, Serialize};
@@ -66,7 +68,7 @@ impl MockSigner {
     /// Test switch; see the module docs.
     pub fn set_mode(&mut self, mode: String) {
         require!(
-            ["sign", "hold", "wrong_key", "garbage", "fail"].contains(&mode.as_str()),
+            ["sign", "hold", "wrong_key", "garbage", "fail", "v28"].contains(&mode.as_str()),
             "unknown mode"
         );
         self.mode = mode;
@@ -107,8 +109,9 @@ impl MockSigner {
         let answer = match self.mode.as_str() {
             "fail" => env::panic_str("mock signer: forced failure"),
             "garbage" => "\"not a signature\"".to_string(),
-            "wrong_key" => sign_hash(&secret_key(&caller, &format!("{}-wrong", request.path)), &hash),
-            _ => sign_hash(&secret_key(&caller, &request.path), &hash),
+            "wrong_key" => sign_hash(&secret_key(&caller, &format!("{}-wrong", request.path)), &hash, 0),
+            "v28" => sign_hash(&secret_key(&caller, &request.path), &hash, 27),
+            _ => sign_hash(&secret_key(&caller, &request.path), &hash, 0),
         };
         if self.mode == "hold" {
             let index = env::promise_yield_create("on_respond", b"{}", GAS_FOR_RESPOND, GasWeight(0), DATA_ID_REGISTER);
@@ -154,7 +157,7 @@ fn secret_key(predecessor: &AccountId, path: &str) -> SigningKey {
 }
 
 /// Signs a 32-byte hash and answers in the MPC network's JSON format.
-fn sign_hash(key: &SigningKey, hash: &[u8; 32]) -> String {
+fn sign_hash(key: &SigningKey, hash: &[u8; 32], v_offset: u8) -> String {
     let (sig, recid) = key.sign_prehash_recoverable(hash).unwrap_or_else(|_| env::panic_str("mock signer: signing failed"));
     let prefix = if recid.is_y_odd() { "03" } else { "02" };
     let r = hex(&sig.r().to_bytes());
@@ -162,7 +165,7 @@ fn sign_hash(key: &SigningKey, hash: &[u8; 32]) -> String {
     serde_json::to_string(&json!({
         "big_r": { "affine_point": format!("{prefix}{r}").to_uppercase() },
         "s": { "scalar": s.to_uppercase() },
-        "recovery_id": recid.to_byte() & 1,
+        "recovery_id": (recid.to_byte() & 1) + v_offset,
     }))
     .expect("json")
 }

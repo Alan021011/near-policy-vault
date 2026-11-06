@@ -328,7 +328,13 @@ pub fn check(
             if amount > rule.max_approval.0 {
                 return Err(ApprovalTooHigh);
             }
-            (gas_cost, None)
+            // Review M12 (R12-3): an approval lets the spender pull `amount`, so it is charged to
+            // the token's daily cap like a transfer; otherwise repeated approvals to an allowed
+            // spender would move more than the cap with `transferFrom`. Revoking (amount 0) is free.
+            if amount > spend.token_window(&to).remaining(rule.daily_cap.0, now_ms) {
+                return Err(TokenCapExceeded);
+            }
+            (gas_cost, Some((to.clone(), amount)))
         }
         CallKind::Unknown => return Err(CalldataNotAllowed),
     };
@@ -550,11 +556,32 @@ mod tests {
     }
 
     #[test]
-    fn erc20_approve_within_cap_is_allowed_and_reserves_no_token() {
+    fn erc20_approve_within_cap_is_allowed_and_reserves_its_amount() {
+        // Review M12 (R12-3): an approval is charged to the token's daily cap.
         let tx = token_tx(SEL_ERC20_APPROVE, SPENDER, word(500_000));
         let r = check(&policy(), &SpendState::default(), &tx, NOW).unwrap();
-        assert_eq!(r.token_contract, None);
-        assert_eq!(r.token_amount.0, 0);
+        assert_eq!(r.token_contract.as_deref(), Some(TOKEN));
+        assert_eq!(r.token_amount.0, 500_000);
+    }
+
+    #[test]
+    fn repeated_approvals_cannot_exceed_the_token_daily_cap() {
+        // Review M12 (R12-3): before the fix, 50 approvals of max_approval each were all allowed.
+        let p = policy();
+        let mut s = SpendState::default();
+        let tx = token_tx(SEL_ERC20_APPROVE, SPENDER, word(500_000));
+        for _ in 0..2 {
+            let r = check(&p, &s, &tx, NOW).unwrap();
+            s.reserve(&r, NOW);
+        }
+        // Cap 1_000_000 is used up by two approvals of 500_000.
+        assert_eq!(check(&p, &s, &tx, NOW), Err(PolicyError::TokenCapExceeded));
+        // A transfer is refused too: approvals and transfers share the window.
+        let t = token_tx(SEL_ERC20_TRANSFER, DEST, word(1));
+        assert_eq!(check(&p, &s, &t, NOW), Err(PolicyError::TokenCapExceeded));
+        // Revoking (approve 0) is always possible, and the next day the cap is fresh.
+        assert!(check(&p, &s, &token_tx(SEL_ERC20_APPROVE, SPENDER, word(0)), NOW).is_ok());
+        assert!(check(&p, &s, &tx, NOW + DAY_MS).is_ok());
     }
 
     // ---------- every refusal, one by one ----------

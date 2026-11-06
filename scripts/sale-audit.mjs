@@ -14,6 +14,11 @@
 // It also prints the vault's balance on its chain (funds at the same address on other EVM chains
 // cannot be moved by this vault) and how to buy or bind the purchase to the audited sale.
 //
+// Review M12 also checks: a nonce whose signature outcome was uncertain but that is already mined
+// (something the contract never recorded was mined with it), Approval events of the vault on every
+// token its policy names or its history touched, that the sale did not change during the audit,
+// and every version of every nonce (list_signed pages by record count).
+//
 // Usage: node sale-audit.mjs <vault-contract> <token_id> [--eth-rpc <url>] [--expect-code <hex>]
 // Exit code 0 = SAFE, 2 = NOT SAFE.
 import { fileURLToPath } from 'node:url';
@@ -62,17 +67,22 @@ function base58ToHex(s) {
 
 const word = (addr) => addr.toLowerCase().replace(/^0x/, '').padStart(64, '0');
 
-/** Every signed record of a vault, all versions, oldest nonce first. */
+const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
+const LOG_RANGE = 50_000; // the public RPC's largest eth_getLogs range
+
+/** Every signed record of a vault, all versions. list_signed pages by record count, so a full
+ *  page is continued from its last nonce and duplicates are dropped (review M12, R12-8). */
 async function allSigned(contract, tokenId, next) {
-  const out = [];
+  const seen = new Map();
   let from = 0;
-  while (from < next) {
+  for (let guard = 0; from < next && guard < 1000; guard++) {
     const page = await nearView(contract, 'list_signed', { token_id: tokenId, from_nonce: from, limit: 100 });
     if (page.length === 0) break;
-    out.push(...page);
-    from = page[page.length - 1].nonce + 1;
+    for (const r of page) seen.set(`${r.nonce}|${r.tx_hash}`, r);
+    const last = page[page.length - 1].nonce;
+    from = page.length < 100 || page[0].nonce === last ? last + 1 : last;
   }
-  return out;
+  return [...seen.values()];
 }
 
 /** Returns { safe, lines[], problems[], outstanding[], allowances[], ... } for a vault. */
@@ -86,6 +96,8 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
   const uncertain = await nearView(contract, 'get_uncertain', { token_id: tokenId });
   const inflight = await nearView(contract, 'get_inflight', { token_id: tokenId });
   const sale = await nearView(contract, 'get_sale', { token_id: tokenId });
+  const token = await nearView(contract, 'nft_token', { token_id: tokenId });
+  const policy = await nearView(contract, 'get_policy', { token_id: tokenId });
   lines.push(`vault ${tokenId} of ${contract}, owner ${owner}`);
   lines.push(`EVM address ${info.evm_address ?? '(not resolved)'}, chain ${chain ?? '(never signed)'}`);
 
@@ -126,14 +138,31 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
       problems.push(`nonce ${n} is signed but not mined: ${kinds.join(', ') || 'outcome unknown'} — the seller should cancel_nonce(${n}); anyone can then broadcast the cancellation (get_signed_versions) and it must be mined`);
     }
 
-    // ERC-20 allowances left by approvals the vault signed (general review H2).
+    // ERC-20 allowances (general review H2; review M12, R12-6): approvals in the signed history
+    // and Approval events of the vault on every token its policy names or its history touched.
     const pairs = new Map();
+    const tokens = new Set();
+    for (const t of policy?.policy?.tokens ?? []) tokens.add(t.contract.toLowerCase());
+    for (const t of policy?.pending?.policy?.tokens ?? []) tokens.add(t.contract.toLowerCase());
     for (const rec of await allSigned(contract, tokenId, next)) {
       const tx = parseTransaction(rec.signed_tx);
+      if (tx.data && tx.data.length >= 10 && tx.to) tokens.add(tx.to.toLowerCase());
       if (tx.data && tx.data.startsWith(SEL_APPROVE) && tx.data.length === 2 + 8 + 128) {
         const spender = '0x' + tx.data.slice(2 + 8 + 24, 2 + 8 + 64);
         pairs.set(`${tx.to.toLowerCase()}|${spender}`, { token: tx.to.toLowerCase(), spender });
       }
+    }
+    try {
+      const latest = Number(BigInt(await eth(rpc, 'eth_blockNumber', [])));
+      const from = Math.max(0, latest - Math.ceil((Date.now() - Number(token?.metadata?.issued_at ?? 0)) / 12000) - 2000);
+      for (const t of tokens) {
+        for (let f = from; f <= latest; f += LOG_RANGE) {
+          const logs = await eth(rpc, 'eth_getLogs', [{ address: t, fromBlock: '0x' + f.toString(16), toBlock: '0x' + Math.min(latest, f + LOG_RANGE - 1).toString(16), topics: [APPROVAL_TOPIC, '0x' + word(info.evm_address)] }]);
+          for (const l of logs) pairs.set(`${t}|0x${l.topics[2].slice(26)}`, { token: t, spender: '0x' + l.topics[2].slice(26) });
+        }
+      }
+    } catch (e) {
+      lines.push(`note: Approval events could not be scanned (${e.message}); only approvals in the signed history were checked`);
     }
     for (const { token, spender } of pairs.values()) {
       const left = BigInt(await eth(rpc, 'eth_call', [{ to: token, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, 'latest']));
@@ -150,10 +179,15 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
     const bal = BigInt(await eth(rpc, 'eth_getBalance', [info.evm_address, 'latest']));
     lines.push(`balance on chain ${chain ?? '(the policy chain)'}: ${bal} wei; funds at this address on other EVM chains cannot be moved by this vault`);
   }
-  const openUncertain = uncertain.filter((u) => u.nonce >= mined);
-  for (const u of openUncertain) {
-    if (!outstanding.some((o) => o.nonce === u.nonce)) problems.push(`nonce ${u.nonce} has an uncertain signature`);
+  // Review M12 (R12-6): an uncertain nonce below the mined nonce means something the contract
+  // never recorded was mined with it (it could have been an approval or a payment).
+  for (const u of uncertain) {
+    if (u.nonce < mined) problems.push(`nonce ${u.nonce} was mined, but the contract never recorded what was signed (uncertain outcome, signing hash ${u.signing_hash}): check that transaction before buying`);
+    else if (!outstanding.some((o) => o.nonce === u.nonce)) problems.push(`nonce ${u.nonce} has an uncertain signature`);
   }
+  // Review M12 (R12-7): the sale must not have changed while auditing.
+  const saleAfter = await nearView(contract, 'get_sale', { token_id: tokenId });
+  if (JSON.stringify(saleAfter) !== JSON.stringify(sale)) problems.push('the sale changed while auditing: run the audit again');
   return { safe: problems.length === 0, lines, problems, outstanding, allowances, mined, next, owner, sale, codeHex, fullKeys };
 }
 

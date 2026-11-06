@@ -1,7 +1,8 @@
-// The buyer's audit (M8, general review H2/H5), the same checks as scripts/sale-audit.mjs, run in
-// the browser against public RPCs. The contract cannot read Ethereum, so these checks live here.
+// The buyer's audit (M8, general review H2/H5, review M12), the same checks as
+// scripts/sale-audit.mjs, run in the browser against public RPCs. The contract cannot read
+// Ethereum, so these checks live here.
 import { parseTransaction } from 'viem';
-import { CONTRACT, DEFAULT_CHAIN, eth, nearRpc, view } from './near';
+import { CONTRACT, DEFAULT_CHAIN, EXPECTED_CODE, OVERRIDDEN, eth, nearRpc, view } from './near';
 
 export type CheckState = 'pass' | 'fail' | 'warn' | 'info';
 export interface Check {
@@ -26,18 +27,48 @@ function base58ToHex(s: string): string {
 const word = (addr: string) => addr.toLowerCase().replace(/^0x/, '').padStart(64, '0');
 const SEL_APPROVE = '0x095ea7b3';
 const SEL_ALLOWANCE = '0xdd62ed3e';
+const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
+const LOG_RANGE = 50_000; // the public RPC's largest eth_getLogs range
+const SEPOLIA_BLOCK_MS = 12_000;
 
-export async function audit(tokenId: string, expectCode?: string): Promise<AuditResult> {
+/** Every signed record of a vault, every version. `list_signed` pages by record count, so a page
+ *  that ends inside a nonce is continued from that nonce (review M12, R12-8). */
+async function allSigned(tokenId: string, next: number): Promise<any[]> {
+  const seen = new Map<string, any>();
+  let from = 0;
+  for (let guard = 0; from < next && guard < 1000; guard++) {
+    const page = await view<any[]>('list_signed', { token_id: tokenId, from_nonce: from, limit: 100 }, CONTRACT, 'final');
+    if (page.length === 0) break;
+    for (const r of page) seen.set(`${r.nonce}|${r.tx_hash}`, r);
+    const last = page[page.length - 1].nonce;
+    // A full page may have cut the last nonce's versions: read that nonce again (duplicates are
+    // dropped), unless the whole page is that one nonce.
+    from = page.length < 100 || page[0].nonce === last ? last + 1 : last;
+  }
+  return [...seen.values()];
+}
+
+export async function audit(tokenId: string): Promise<AuditResult> {
   const checks: Check[] = [];
-  const [info, chainRaw, next, uncertain, inflight, sale] = await Promise.all([
-    view('vault_info', { token_id: tokenId }),
-    view<number | null>('get_vault_chain', { token_id: tokenId }),
-    view<number>('get_next_nonce', { token_id: tokenId }),
-    view<any[]>('get_uncertain', { token_id: tokenId }),
-    view('get_inflight', { token_id: tokenId }),
-    view('get_sale', { token_id: tokenId }),
+  const v = <T = any>(m: string, a: object) => view<T>(m, a, CONTRACT, 'final');
+  // Review M12 (R12-7): the sale is read before and after everything else; if it changed, the
+  // audit says nothing about it.
+  const saleBefore = await v('get_sale', { token_id: tokenId });
+  const [info, chainRaw, next, uncertain, inflight, policy, token] = await Promise.all([
+    v('vault_info', { token_id: tokenId }),
+    v<number | null>('get_vault_chain', { token_id: tokenId }),
+    v<number>('get_next_nonce', { token_id: tokenId }),
+    v<any[]>('get_uncertain', { token_id: tokenId }),
+    v('get_inflight', { token_id: tokenId }),
+    v('get_policy', { token_id: tokenId }),
+    v('nft_token', { token_id: tokenId }),
   ]);
   const chain = chainRaw ?? DEFAULT_CHAIN;
+  const sale = saleBefore;
+
+  // Review M12 (R12-2): a link can point the page at another contract or RPC.
+  if (OVERRIDDEN)
+    checks.push({ state: 'fail', title: 'This page was opened with a custom contract or RPC', detail: 'The audit only vouches for the default contract and public RPCs. Open the page without ?contract= / ?near_rpc= / ?eth_rpc=.' });
 
   // The sale itself.
   const now = Date.now();
@@ -50,6 +81,7 @@ export async function audit(tokenId: string, expectCode?: string): Promise<Audit
 
   // Kept signatures: every nonce the contract signed must already be used on the vault's chain.
   let mined = 0;
+  const signed = next > 0 ? await allSigned(tokenId, next) : [];
   if (next > 0) {
     mined = Number(BigInt(await eth<string>(chain, 'eth_getTransactionCount', [info.evm_address, 'latest'])));
     if (mined >= next) {
@@ -63,55 +95,74 @@ export async function audit(tokenId: string, expectCode?: string): Promise<Audit
     checks.push({ state: 'pass', title: 'The vault never signed anything', detail: 'No signature can be pending.' });
   }
 
-  // ERC-20 allowances left by approvals the vault signed (general review H2).
-  if (next > 0) {
-    const pairs = new Map<string, { token: string; spender: string }>();
-    for (let from = 0; from < next; ) {
-      const page = await view<any[]>('list_signed', { token_id: tokenId, from_nonce: from, limit: 100 });
-      if (page.length === 0) break;
-      for (const rec of page) {
-        const tx = parseTransaction(rec.signed_tx as `0x${string}`);
-        if (tx.data && tx.data.startsWith(SEL_APPROVE) && tx.data.length === 2 + 8 + 128 && tx.to) {
-          const spender = '0x' + tx.data.slice(2 + 8 + 24, 2 + 8 + 64);
-          pairs.set(`${tx.to.toLowerCase()}|${spender}`, { token: tx.to.toLowerCase(), spender });
+  // Review M12 (R12-6): an uncertain nonce below the mined nonce means something was mined with
+  // it that the contract never recorded (it could have been an approval or a payment).
+  for (const u of uncertain) {
+    if (u.nonce < mined)
+      checks.push({ state: 'fail', title: `Nonce ${u.nonce} was mined, but the contract never recorded what was signed`, detail: `Its signature outcome was uncertain (signing hash ${u.signing_hash}). Check that transaction on the explorer before buying.` });
+  }
+
+  // ERC-20 allowances (general review H2; review M12, R12-6): every token the vault's policy
+  // names or its signed history touched, from approvals in the history and from Approval events.
+  const pairs = new Map<string, { token: string; spender: string }>();
+  const tokens = new Set<string>();
+  for (const t of policy?.policy?.tokens ?? []) tokens.add(t.contract.toLowerCase());
+  for (const t of policy?.pending?.policy?.tokens ?? []) tokens.add(t.contract.toLowerCase());
+  for (const rec of signed) {
+    const tx = parseTransaction(rec.signed_tx as `0x${string}`);
+    if (tx.data && tx.data.length >= 10 && tx.to) tokens.add(tx.to.toLowerCase());
+    if (tx.data && tx.data.startsWith(SEL_APPROVE) && tx.data.length === 2 + 8 + 128 && tx.to) {
+      const spender = '0x' + tx.data.slice(2 + 8 + 24, 2 + 8 + 64);
+      pairs.set(`${tx.to.toLowerCase()}|${spender}`, { token: tx.to.toLowerCase(), spender });
+    }
+  }
+  let logsScanned = true;
+  if (tokens.size && info.evm_address) {
+    try {
+      const latest = Number(BigInt(await eth<string>(chain, 'eth_blockNumber', [])));
+      const issued = Number(token?.metadata?.issued_at ?? 0);
+      const from = Math.max(0, latest - Math.ceil((now - issued) / SEPOLIA_BLOCK_MS) - 2000);
+      for (const t of tokens) {
+        for (let f = from; f <= latest; f += LOG_RANGE) {
+          const logs = await eth<any[]>(chain, 'eth_getLogs', [{ address: t, fromBlock: '0x' + f.toString(16), toBlock: '0x' + Math.min(latest, f + LOG_RANGE - 1).toString(16), topics: [APPROVAL_TOPIC, '0x' + word(info.evm_address)] }]);
+          for (const l of logs) pairs.set(`${t}|0x${l.topics[2].slice(26)}`, { token: t, spender: '0x' + l.topics[2].slice(26) });
         }
       }
-      from = page[page.length - 1].nonce + 1;
+    } catch {
+      logsScanned = false;
     }
-    let left = 0;
-    for (const { token, spender } of pairs.values()) {
-      const amount = BigInt(await eth<string>(chain, 'eth_call', [{ to: token, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, 'latest']));
-      if (amount > 0n) {
-        left++;
-        checks.push({ state: 'fail', title: `An ERC-20 approval survives the sale`, detail: `Token ${token}: ${spender} may still take ${amount} units. The seller cancels the sale, signs approve(${spender}, 0), mines it and starts a new sale.` });
-      }
+  }
+  let left = 0;
+  for (const { token: t, spender } of pairs.values()) {
+    const amount = BigInt(await eth<string>(chain, 'eth_call', [{ to: t, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, 'latest']));
+    if (amount > 0n) {
+      left++;
+      checks.push({ state: 'fail', title: 'An ERC-20 approval survives the sale', detail: `Token ${t}: ${spender} may still take ${amount} units. The seller cancels the sale, signs approve(${spender}, 0), mines it and starts a new sale.` });
     }
-    if (left === 0) checks.push({ state: 'pass', title: 'No ERC-20 approval is left', detail: `${pairs.size} approval(s) ever signed, none with an allowance left.` });
   }
+  if (left === 0)
+    checks.push({ state: 'pass', title: 'No ERC-20 approval is left', detail: `${pairs.size} approval(s) found (signed history and Approval events of ${tokens.size} token(s)), none with an allowance left.` });
+  if (!logsScanned)
+    checks.push({ state: 'warn', title: 'Approval events could not be scanned', detail: 'Only the approvals in the signed history were checked.' });
 
-  // Uncertain signatures that are not covered above.
-  for (const u of uncertain.filter((u) => u.nonce >= mined && u.nonce >= next)) {
-    checks.push({ state: 'fail', title: `Nonce ${u.nonce} has an uncertain signature` });
-  }
-
-  // The contract itself (threat 9).
+  // The contract itself (threat 9; review M12, R12-2: a different code hash is a failure).
   const acct = await nearRpc('query', { request_type: 'view_account', finality: 'final', account_id: CONTRACT });
   const codeHex = base58ToHex(acct.code_hash);
   const keys = await nearRpc('query', { request_type: 'view_access_key_list', finality: 'final', account_id: CONTRACT });
   const fullKeys = keys.keys.filter((k: any) => k.access_key.permission === 'FullAccess').length;
-  if (expectCode) {
-    checks.push(expectCode.toLowerCase() === codeHex
-      ? { state: 'pass', title: 'The contract code is the expected build', detail: `sha256 ${codeHex}` }
-      : { state: 'fail', title: 'The contract code is not the expected build', detail: `sha256 ${codeHex}, expected ${expectCode}` });
-  } else {
-    checks.push({ state: 'info', title: 'Contract code hash', detail: `sha256 ${codeHex}: compare it with a build of the repository.` });
-  }
+  checks.push(codeHex === EXPECTED_CODE
+    ? { state: 'pass', title: 'The contract runs the expected code', detail: `sha256 ${codeHex}, the build published in the repository.` }
+    : { state: 'fail', title: 'The contract does not run the expected code', detail: `sha256 ${codeHex}, expected ${EXPECTED_CODE}.` });
   if (fullKeys > 0)
     checks.push({ state: 'warn', title: `The contract has ${fullKeys} full-access key(s)`, detail: 'Whoever holds one can change the contract code (threat 9). It will be deleted before submission.' });
 
   // Funds: only the vault's own chain can be moved by this vault.
   const bal = BigInt(await eth<string>(chain, 'eth_getBalance', [info.evm_address, 'latest']));
   checks.push({ state: 'info', title: `Balance on chain ${chain}: ${Number(bal) / 1e18} ETH`, detail: 'Funds at this address on other EVM chains cannot be moved by this vault.' });
+
+  const saleAfter = await v('get_sale', { token_id: tokenId });
+  if (JSON.stringify(saleAfter) !== JSON.stringify(saleBefore))
+    checks.push({ state: 'fail', title: 'The sale changed while auditing', detail: 'Run the audit again.' });
 
   const safe = !checks.some((c) => c.state === 'fail');
   return { safe, checks, sale, codeHex, fullKeys };

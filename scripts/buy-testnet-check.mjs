@@ -130,7 +130,7 @@ check(`vault ${X} minted for the transfer_call attack, its sale started`, X !== 
 
 // ---------- B. an ERC-20 approval survives a sale; the audit catches it ----------
 const loose = { ...pol.policy, eth_daily_cap: '10000000000000000', max_gas_cost: String(200000n * 10n * 10n ** 9n),
-  allowed_spenders: [funder], tokens: [{ contract: WETH, daily_cap: '0', max_approval: '1000000' }] };
+  allowed_spenders: [funder], tokens: [{ contract: WETH, daily_cap: '1000000', max_approval: '1000000' }] }; // approvals count against daily_cap (review M12, R12-3)
 r = await call(SELLER, 'set_policy', { token_id: T, policy: loose }, '0.05 NEAR');
 await waitMs(delay + 5000, 'for the looser policy (WETH approvals to the seller) to apply');
 r = await call(SELLER, 'apply_policy', { token_id: T }, '0 NEAR');

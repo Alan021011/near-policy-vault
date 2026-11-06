@@ -88,8 +88,10 @@ trait ChainSignatures {
 pub const SIGN_DEPOSIT: NearToken = NearToken::from_yoctonear(1);
 /// Gas kept for our callback (measured: 2.76 Tgas used); all the remaining gas goes to `sign`.
 pub const GAS_FOR_SIGN_CALLBACK: Gas = Gas::from_tgas(20);
-/// Least prepaid gas to start a signature (measured: about 14 Tgas in total; review S7).
-pub const MIN_PREPAID_GAS_FOR_SIGNING: Gas = Gas::from_tgas(60);
+/// Least prepaid gas to start a signature (measured: about 14 Tgas in total; review S7). Raised
+/// from 60 to 100 Tgas after review M12 (R12-12): a signer call that runs out of gas makes the
+/// outcome uncertain, which wastes a nonce and the charge.
+pub const MIN_PREPAID_GAS_FOR_SIGNING: Gas = Gas::from_tgas(100);
 /// Storage paid at execution for the signed record written later by the callback.
 pub const SIGNED_RECORD_RESERVE_BYTES: u64 = 1000;
 /// After this long without an answer the owner may abandon a signature (review S2). Far above
@@ -188,6 +190,9 @@ pub struct SignedRecord {
     pub signed_ms: u64,
 }
 
+/// The only `verify_signature` error that proves the answer cannot move the vault's funds.
+pub const WRONG_KEY: &str = "signature does not match the vault key";
+
 /// Checks the signer's answer against the vault's own key and returns `(y_parity, r, s)` with
 /// `s` normalized to the lower half (EIP-2). The contract never trusts the MPC answer blindly.
 pub fn verify_signature(
@@ -212,7 +217,7 @@ pub fn verify_signature(
     sig[32..].copy_from_slice(&s);
     let recovered = env::ecrecover(hash, &sig, resp.recovery_id, false).ok_or("ecrecover failed")?;
     if &recovered != vault_key {
-        return Err("signature does not match the vault key");
+        return Err(WRONG_KEY);
     }
     let (s_low, parity) = evm::normalize_s(&s, resp.recovery_id);
     Ok((parity, r, s_low))
@@ -1396,7 +1401,7 @@ pub struct PreparedExecution {
 
 #[near]
 impl PolicyVault {
-    /// Signs a ready proposal. Only the owner, with at least 60 Tgas. In one synchronous step it
+    /// Signs a ready proposal. Only the owner, with at least 100 Tgas. In one synchronous step it
     /// charges the daily caps, takes the nonce and locks the vault (no second signature, no
     /// transfer) until the MPC answer arrives in `on_signed`.
     /// - Nonce: the vault's next one; a proposal pinned after an uncertain outcome always uses
@@ -1547,8 +1552,17 @@ impl PolicyVault {
                 self.store_signed(&token_id, &f, &tx, parity, &r, &s);
                 true
             }
-            Err(reason) => {
+            // Only a signature that recovers to another key provably cannot move the vault's
+            // funds, so only then is everything undone.
+            Err(reason) if reason == WRONG_KEY => {
                 self.reject_signature(&token_id, &f, reason);
+                false
+            }
+            // Review M12 (R12-5): any other problem (a format the contract does not expect, such
+            // as recovery_id 27/28 or an uncompressed point) may hide a valid signature, so the
+            // outcome is uncertain: the nonce stays used and the charge stays.
+            Err(reason) => {
+                self.mark_uncertain(&token_id, &f, reason);
                 false
             }
         }
@@ -1641,7 +1655,7 @@ impl PolicyVault {
     fn assert_can_sign(&self, token_id: &TokenId) {
         require!(
             env::prepaid_gas() >= MIN_PREPAID_GAS_FOR_SIGNING,
-            "Attach at least 60 Tgas to sign"
+            "Attach at least 100 Tgas to sign"
         );
         require!(self.inflight.get(token_id).is_none(), "A signature is already in flight for this vault");
         require!(
@@ -3648,14 +3662,14 @@ mod tests {
 
     /// Review S7.
     #[test]
-    #[should_panic(expected = "Attach at least 60 Tgas to sign")]
+    #[should_panic(expected = "Attach at least 100 Tgas to sign")]
     fn signing_needs_enough_gas() {
         let (mut c, alice, id) = ready_a1_proposal();
         let mut b = VMContextBuilder::new();
         b.current_account_id("vault.testnet".parse().unwrap())
             .predecessor_account_id(alice)
             .attached_deposit(EXEC_DEPOSIT)
-            .prepaid_gas(Gas::from_tgas(30))
+            .prepaid_gas(Gas::from_tgas(90))
             .block_timestamp((T0_MS + 10 + HOUR_MS) * 1_000_000);
         testing_env!(b.build());
         let _ = c.execute_proposal("0".into(), id, None, None);
@@ -3697,14 +3711,30 @@ mod tests {
         assert!((bytes as u64) <= SIGNED_RECORD_RESERVE_BYTES, "record needs {bytes} bytes");
     }
 
+    /// Review M12 (R12-5): an answer in a format the contract does not expect may still hide a
+    /// valid signature (the signer has it), so it is uncertain, never undone.
     #[test]
-    fn malformed_answer_is_undone() {
+    fn malformed_answer_is_uncertain_not_undone() {
         let (mut c, _, id) = ready_a1_proposal();
         let _ = c.execute_proposal("0".into(), id, None, None);
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
         let mut bad = a1_response();
         bad.big_r.affine_point = "054057bd4e77d6989afeabbb8eaef7cbe4554cc0eb036393d05a6195347cbf1d98".into();
         assert!(!answer(&mut c, ok(&bad)));
-        assert_rolled_back(&c, id, "not a compressed point");
+        assert_uncertain(&c, id, 0, spent, "not a compressed point");
+    }
+
+    /// Review M12 (R12-5): the real A1 signature with `recovery_id` written as 28 (Ethereum's
+    /// 27/28 style) is a valid signature in another format: uncertain, the nonce stays used.
+    #[test]
+    fn valid_signature_in_another_format_is_uncertain() {
+        let (mut c, _, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
+        let mut v28 = a1_response();
+        v28.recovery_id += 27;
+        assert!(!answer(&mut c, ok(&v28)));
+        assert_uncertain(&c, id, 0, spent, "recovery_id must be 0 or 1");
     }
 
     #[test]

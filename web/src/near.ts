@@ -2,13 +2,28 @@
 import { NearConnector } from '@hot-labs/near-connect';
 
 const params = new URLSearchParams(location.search);
-export const CONTRACT = params.get('contract') ?? 'm3.alan-vault-2026.testnet';
+const DEFAULT_CONTRACT = 'm3.alan-vault-2026.testnet';
+/** SHA-256 of the contract build published in the repository (README "How to verify"). */
+export const EXPECTED_CODE = '71e9bac8513e53f795d4e040d40b3d03d9a81f5d3e4a999a44ce5b2c0fe223b8';
+// Review M12 (R12-1, R12-2): URL parameters are only accepted when well formed, and any override
+// is shown and makes the audit refuse to say SAFE.
+const ACCOUNT_RE = /^(?=.{2,64}$)[a-z0-9]+([-_][a-z0-9]+)*(\.[a-z0-9]+([-_][a-z0-9]+)*)*$/;
+const HTTPS_RE = /^https:\/\/[a-z0-9.-]+(:\d+)?(\/[\w./-]*)?$/i;
+const pick = (name: string, re: RegExp) => {
+  const v = params.get(name);
+  return v && re.test(v) ? v : null;
+};
+const contractParam = pick('contract', ACCOUNT_RE);
+const nearRpcParam = pick('near_rpc', HTTPS_RE);
+const ethRpcParam = pick('eth_rpc', HTTPS_RE);
+export const OVERRIDDEN = !!(contractParam || nearRpcParam || ethRpcParam);
+export const CONTRACT = contractParam ?? DEFAULT_CONTRACT;
 // Public testnet RPCs, tried in order (the official one rate-limits browsers).
-export const NEAR_RPCS = params.get('near_rpc')
-  ? [params.get('near_rpc')!]
+export const NEAR_RPCS = nearRpcParam
+  ? [nearRpcParam]
   : ['https://rpc.testnet.fastnear.com', 'https://test.rpc.fastnear.com', 'https://rpc.testnet.near.org'];
 export const ETH_RPC: Record<number, string> = {
-  11155111: params.get('eth_rpc') ?? 'https://ethereum-sepolia-rpc.publicnode.com',
+  11155111: ethRpcParam ?? 'https://ethereum-sepolia-rpc.publicnode.com',
 };
 export const EXPLORER: Record<number, string> = { 11155111: 'https://sepolia.etherscan.io' };
 export const NEAR_EXPLORER = 'https://testnet.nearblocks.io';
@@ -40,10 +55,10 @@ export async function nearRpc(method: string, rpcParams: unknown, attempt = 1): 
 
 const b64 = (s: string) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
 
-export async function view<T = any>(method: string, args: object = {}, contract = CONTRACT): Promise<T> {
+export async function view<T = any>(method: string, args: object = {}, contract = CONTRACT, finality: 'optimistic' | 'final' = 'optimistic'): Promise<T> {
   const r = await nearRpc('query', {
     request_type: 'call_function',
-    finality: 'optimistic',
+    finality,
     account_id: contract,
     method_name: method,
     args_base64: b64(JSON.stringify(args)),

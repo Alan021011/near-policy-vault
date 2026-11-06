@@ -13,7 +13,7 @@ accounts and 10–15 minutes each. These tests sit in between: anyone can run th
 | Contract | Source | Role |
 |---|---|---|
 | `policy_vault.wasm` | `contract/` | The product, built from this source. On the author's machine (Windows, Rust 1.99.1, cargo-near 0.22.0) it is byte-identical to the testnet deployment (`sha256 27e7b8ae…`) and the tests were run on those bytes; other machines (e.g. the CI runner) produce different bytes until the reproducible Docker build lands. |
-| `mock_signer.wasm` | `mock-signer/` | Stands in for Chain Signatures (`v1.signer-prod.testnet`), which does not exist in a sandbox. Same call and answer shapes. It can answer at once, **hold its answer with yield/resume like the real MPC network**, sign with the wrong key, answer garbage or fail. |
+| `mock_signer.wasm` | `mock-signer/` | Stands in for Chain Signatures (`v1.signer-prod.testnet`), which does not exist in a sandbox. Same call and answer shapes. It can answer at once, **hold its answer with yield/resume like the real MPC network**, sign with the wrong key, answer garbage, answer a valid signature in another format (recovery_id 27/28) or fail. |
 | `test_receiver.wasm` | `test-receiver/` | The `nft_transfer_call` receiver used for the H1 attack. |
 
 ## Tests (`tests/sandbox.rs`)
@@ -35,7 +35,7 @@ fails exactly the four matching tests and passes the other four.
 
 ## Attack suite (`tests/attacks.rs`, M10)
 
-One sandbox, 42 attacks taken from `docs/THREAT_MODEL.md`, each labelled with its threat number.
+One sandbox, 44 attacks taken from `docs/THREAT_MODEL.md`, each labelled with its threat number, or `auth` (only the owner or the guardian may act), `policy` (a single transaction outside the policy) or `sale` (sale rules).
 Each attack must be refused with the contract's own reason (or, for the signer's answers, leave the
 vault unlocked and charged once). It prints one `BLOCKED [threat] attack` line per attack and
 fails if any gets through:
@@ -51,7 +51,7 @@ is covered by unit tests, because moving the sandbox clock 24 hours takes about 
 
 Negative control: with three rules removed from the contract (no `transfer_call` lock, transfer
 allowed with a signature in flight, any key accepted), exactly those three attacks get through
-(39/42).
+(39/42 at the time). Against the build before the M12 review (`27e7b8ae…`, rebuilt from git), exactly the two attacks added after it get through (42/44): repeated approvals above the token cap, and a signer answering in another format.
 
 ## What these tests do not cover
 

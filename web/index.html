@@ -3,6 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Review M12 (R12-1): no plugins, no <base> hijack, forms post only here. Scripts are not
+         restricted further because the wallet connector runs wallet code in sandboxed iframes. -->
+    <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; form-action 'self'" />
     <title>Policy Vault</title>
     <meta name="description" content="An NFT that owns an Ethereum account and can only spend under a policy enforced by a NEAR contract (NEAR Chain Signatures, testnet + Sepolia)." />
     <link rel="preconnect" href="https://fonts.googleapis.com" />

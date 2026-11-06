@@ -2,7 +2,7 @@ import './style.css';
 import { formatEther, parseEther } from 'viem';
 import { audit, type AuditResult } from './audit';
 import {
-  CONTRACT, DEFAULT_CHAIN, EXPLORER, NEAR_EXPLORER, accountId, call, connect, disconnect, eth, events,
+  CONTRACT, DEFAULT_CHAIN, EXPLORER, NEAR_EXPLORER, OVERRIDDEN, accountId, call, connect, disconnect, eth, events,
   nearToYocto, onAccountChange, view, yoctoToNear,
 } from './near';
 
@@ -62,7 +62,14 @@ onAccountChange(() => {
   route();
 });
 renderAccount();
-document.getElementById('contract-link')!.innerHTML = `Contract <a class="mono" target="_blank" rel="noreferrer" href="${NEAR_EXPLORER}/address/${CONTRACT}">${CONTRACT}</a>`;
+// Review M12 (R12-1): everything that can come from the URL is escaped.
+document.getElementById('contract-link')!.innerHTML = `Contract <a class="mono" target="_blank" rel="noreferrer" href="${NEAR_EXPLORER}/address/${encodeURIComponent(CONTRACT)}">${esc(CONTRACT)}</a>`;
+if (OVERRIDDEN) {
+  const warn = document.createElement('div');
+  warn.className = 'override';
+  warn.textContent = `This page was opened with a custom contract or RPC (${CONTRACT}). Its audit never says SAFE. Open https://alan021011.github.io/near-policy-vault/ without parameters.`;
+  document.body.prepend(warn);
+}
 
 // ---------- router ----------
 window.addEventListener('hashchange', route);
@@ -342,6 +349,7 @@ async function vaultPage(id: string, rid: number) {
     d.inflight ? `<span class="badge warn">signature in flight · nonce ${d.inflight.nonce}</span>` : '',
     frozen ? '<span class="badge warn">on sale</span>' : '',
     d.policy.has_policy ? '<span class="badge ok">policy active</span>' : '<span class="badge">locked</span>',
+    d.policy.has_policy && !d.policy.policy.guardian ? '<span class="badge warn" title="Without a guardian nobody can veto a sale: an owner (or a thief with the key) can sell the vault to another account of theirs after 10 minutes and start again with fresh daily caps.">no guardian</span>' : '',
     `<span class="badge">you: ${role}</span>`,
   ].join(' ');
   const signedHtml = await signedSection(d, isOwner);
