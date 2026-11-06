@@ -33,6 +33,26 @@ Negative control (run once by hand): a contract built with four rules removed (n
 lock, transfer allowed with a signature in flight, any key accepted, `buy` not paying the seller)
 fails exactly the four matching tests and passes the other four.
 
+## Attack suite (`tests/attacks.rs`, M10)
+
+One sandbox, 42 attacks taken from `docs/THREAT_MODEL.md`, each labelled with its threat number.
+Each attack must be refused with the contract's own reason (or, for the signer's answers, leave the
+vault unlocked and charged once). It prints one `BLOCKED [threat] attack` line per attack and
+fails if any gets through:
+
+```bash
+cargo test --test attacks -- --nocapture     # or: cd ../scripts && npm run attack
+```
+
+Not in the suite, because the contract cannot stop them on its own: threat 7 (an ERC-20 approval
+already mined: the buyer's audit), 8 (trust in the MPC network), 9 (upgrade keys), 10 (fees on
+Ethereum) and 15 (token ids are never reused: unit test). Threat 22 (a sale that closed a day ago)
+is covered by unit tests, because moving the sandbox clock 24 hours takes about 45 minutes.
+
+Negative control: with three rules removed from the contract (no `transfer_call` lock, transfer
+allowed with a signature in flight, any key accepted), exactly those three attacks get through
+(39/42).
+
 ## What these tests do not cover
 
 - **The real MPC network.** The mock signer has the same interface, but its keys are not the
