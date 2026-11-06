@@ -12,7 +12,7 @@ accounts and 10–15 minutes each. These tests sit in between: anyone can run th
 
 | Contract | Source | Role |
 |---|---|---|
-| `policy_vault.wasm` | `contract/` | The product. Same bytes as the testnet deployment (`sha256 27e7b8ae…`). |
+| `policy_vault.wasm` | `contract/` | The product, built from this source. On the author's machine (Windows, Rust 1.99.1, cargo-near 0.22.0) it is byte-identical to the testnet deployment (`sha256 27e7b8ae…`) and the tests were run on those bytes; other machines (e.g. the CI runner) produce different bytes until the reproducible Docker build lands. |
 | `mock_signer.wasm` | `mock-signer/` | Stands in for Chain Signatures (`v1.signer-prod.testnet`), which does not exist in a sandbox. Same call and answer shapes. It can answer at once, **hold its answer with yield/resume like the real MPC network**, sign with the wrong key, answer garbage or fail. |
 | `test_receiver.wasm` | `test-receiver/` | The `nft_transfer_call` receiver used for the H1 attack. |
 
