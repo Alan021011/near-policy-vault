@@ -1,0 +1,53 @@
+# Runs every automated check on a clean Linux machine, so anyone can see them pass without
+# installing anything: unit tests (contract), golden EVM vectors, and the M9 sandbox tests
+# (the real wasm in a local NEAR sandbox, nearcore 2.14.0).
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_NEAR_VERSION: "0.22.0"
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: cargo-near
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/near/cargo-near/releases/download/cargo-near-v${CARGO_NEAR_VERSION}/cargo-near-installer.sh" | sh
+          cargo near --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Contract unit tests and golden vectors
+        working-directory: contract
+        run: cargo test --locked
+
+      - name: Build the three wasm files
+        run: ./sandbox-tests/build-wasm.sh
+
+      - name: Sandbox tests (M9)
+        working-directory: sandbox-tests
+        run: cargo test --locked -- --test-threads=4
