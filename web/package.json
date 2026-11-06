@@ -1,0 +1,17 @@
+{
+  "name": "near-policy-vault-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web page for near-policy-vault (M11): owner, buyer audit and guardian views",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@hot-labs/near-connect": "0.11.4",
+    "viem": "2.57.16",
+    "vite": "8.3.5"
+  }
+}
