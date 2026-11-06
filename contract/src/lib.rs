@@ -26,7 +26,10 @@
 //! - If that call fails (for example out of gas), the vault stays "unresolved" and anyone can
 //!   retry with `resolve_vault_address`. A resolved address is never overwritten.
 //!
-//! Not here yet: policy, proposals, MPC signing, two-phase sale.
+//! Later modules, each in its own section below: M5 spending policy (`policy.rs`), M6 proposal
+//! queue, M7 signing through the MPC network (`on_signed`), M8 two-phase sale (`start_sale`,
+//! `buy`), and the general review after M8 (H1: no owner action while a `transfer_call` is
+//! unresolved). The threats they address are in docs/THREAT_MODEL.md.
 
 pub mod evm;
 pub mod policy;
@@ -35,7 +38,7 @@ use std::collections::HashMap;
 
 use near_contract_standards::non_fungible_token::approval::NonFungibleTokenApproval;
 use near_contract_standards::non_fungible_token::core::{
-    NonFungibleTokenCore, NonFungibleTokenResolver,
+    ext_nft_receiver, ext_nft_resolver, NonFungibleTokenCore, NonFungibleTokenResolver,
 };
 use near_contract_standards::non_fungible_token::enumeration::NonFungibleTokenEnumeration;
 use near_contract_standards::non_fungible_token::events::NftMint;
@@ -238,6 +241,7 @@ enum StorageKey {
     Pinned,
     VaultChain,
     Sales,
+    TransferCalls,
 }
 
 /// Fixed-size record (same storage whether resolved or not, so it is paid in full at mint).
@@ -353,10 +357,37 @@ pub struct PolicyVault {
     sales: LookupMap<TokenId, Sale>,
     /// M8 review V1: sale numbers are unique, so a buyer can bind a transfer to the audited sale.
     next_sale_id: u64,
+    /// General review H1: vaults sent with `nft_transfer_call` whose transfer has not resolved
+    /// yet, with the time it started. Meanwhile the receiver cannot act as owner.
+    transfer_calls: LookupMap<TokenId, u64>,
 }
 
-/// State layout deployed for M8 (commit b539799), used only by `migrate`. Its sale records had no
-/// `sale_id`; migrating is only safe when no vault has a sale record (checked before deploying).
+/// State layout deployed for the M8 review fixes (commit 7b1a136), used only by `migrate`. Its
+/// sale records had no price or buyer; migrating is only safe when no vault has a sale record
+/// (checked before deploying).
+#[near(serializers = [borsh])]
+struct PolicyVaultV10 {
+    tokens: NonFungibleToken,
+    metadata: LazyOption<NFTContractMetadata>,
+    next_token_id: u64,
+    transfer_info: LookupMap<TokenId, TransferInfo>,
+    signer_id: AccountId,
+    vaults: LookupMap<TokenId, VaultRecord>,
+    policies: LookupMap<TokenId, VaultPolicyState>,
+    nonces: LookupMap<TokenId, u64>,
+    next_proposal_id: u64,
+    inflight: LookupMap<TokenId, InFlight>,
+    signed: LookupMap<String, SignedRecord>,
+    signed_versions: LookupMap<String, u32>,
+    uncertain: LookupMap<TokenId, Vec<UncertainNonce>>,
+    pinned: LookupMap<u64, u64>,
+    vault_chain: LookupMap<TokenId, u64>,
+    sales: LookupMap<TokenId, Sale>,
+    next_sale_id: u64,
+}
+
+/// State layout deployed for M8 (commit b539799), kept for reference.
+#[allow(dead_code)]
 #[near(serializers = [borsh])]
 struct PolicyVaultV9 {
     tokens: NonFungibleToken,
@@ -408,6 +439,15 @@ pub const SALE_WINDOW_MS: u64 = 86_400_000;
 /// owner's key leaks, the owner, who still holds it, has this long to cancel the thief's sale.
 pub const MIN_SALE_DELAY_MS: u64 = 600_000;
 
+/// Gas kept for `nft_resolve_transfer` (the library keeps 5 Tgas; this contract does more work
+/// there: it records the return, refunds storage and releases the transfer_call lock).
+pub const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas::from_tgas(20);
+/// Least prepaid gas for `nft_transfer_call`, so the resolution always has its gas.
+pub const MIN_PREPAID_GAS_FOR_TRANSFER_CALL: Gas = Gas::from_tgas(50);
+/// If a transfer_call never resolves (its callback ran out of gas), the lock lapses after this.
+/// A resolution cannot be delayed this long: a receipt chain ends within minutes.
+pub const TRANSFER_CALL_TIMEOUT_MS: u64 = 3_600_000;
+
 /// A sale window. While it is active (not closed) the vault cannot sign new transactions (only
 /// cancellations), so its state is stable for the buyer's audit. Transfers are only possible
 /// between `opens_at_ms` and `closes_at_ms`, and the guardian can veto it at any time (threat 16).
@@ -423,6 +463,10 @@ pub struct Sale {
     pub closes_at_ms: u64,
     /// Owner epoch when it was started; a sale never carries over to a later owner.
     pub owner_epoch: u64,
+    /// Price in yoctoNEAR for `buy` (general review H3). `None`: the seller transfers it.
+    pub price: Option<U128>,
+    /// If set, only this account can `buy`.
+    pub buyer: Option<AccountId>,
 }
 
 /// State layout deployed for the M7 review fixes (commit a00bed7), kept for reference.
@@ -638,15 +682,16 @@ impl PolicyVault {
             vault_chain: LookupMap::new(StorageKey::VaultChain),
             sales: LookupMap::new(StorageKey::Sales),
             next_sale_id: 0,
+            transfer_calls: LookupMap::new(StorageKey::TransferCalls),
         }
     }
 
-    /// Upgrades the state written by the M8 deployment. Only the contract account can call it.
-    /// Calling it on the current layout fails, because the old layout no longer parses.
+    /// Upgrades the state written by the M8 review deployment. Only the contract account can
+    /// call it. Calling it on the current layout fails, because the old layout no longer parses.
     #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let old: PolicyVaultV9 = env::state_read().expect("no V9 state to migrate");
+        let old: PolicyVaultV10 = env::state_read().expect("no V10 state to migrate");
         Self {
             tokens: old.tokens,
             metadata: old.metadata,
@@ -664,7 +709,8 @@ impl PolicyVault {
             pinned: old.pinned,
             vault_chain: old.vault_chain,
             sales: old.sales,
-            next_sale_id: 0,
+            next_sale_id: old.next_sale_id,
+            transfer_calls: LookupMap::new(StorageKey::TransferCalls),
         }
     }
 
@@ -674,8 +720,11 @@ impl PolicyVault {
     /// new transactions, only cancellations (`cancel_nonce`), so the buyer can audit a stable
     /// state. Not allowed while a signature is in flight. A sale whose window has closed is
     /// replaced (M8 review V2).
+    /// - `price` (yoctoNEAR, above 0): anyone, or only `buyer` if given, can then `buy` the vault
+    ///   at that price during the window (general review H3). Without a price the seller transfers
+    ///   it (`nft_transfer`, ideally bound with `memo: "sale:<id>"`).
     #[payable]
-    pub fn start_sale(&mut self, token_id: TokenId) -> Sale {
+    pub fn start_sale(&mut self, token_id: TokenId, price: Option<U128>, buyer: Option<AccountId>) -> Sale {
         require!(
             env::attached_deposit() >= NearToken::from_yoctonear(1),
             "Requires attached deposit of at least 1 yoctoNEAR"
@@ -686,6 +735,9 @@ impl PolicyVault {
             self.inflight.get(&token_id).is_none(),
             "A signature is in flight for this vault; start the sale after it completes"
         );
+        require!(price.map_or(true, |p| p.0 > 0), "The price must be above 0");
+        require!(buyer.is_none() || price.is_some(), "A reserved buyer needs a price");
+        require!(buyer.as_ref() != Some(&owner), "The owner cannot be the buyer");
         let now = env::block_timestamp_ms();
         let delay = self.policies.get(&token_id).map(|s| s.policy.delay_ms).unwrap_or(0);
         let opens_at_ms = now.saturating_add(delay.max(MIN_SALE_DELAY_MS));
@@ -695,6 +747,8 @@ impl PolicyVault {
             opens_at_ms,
             closes_at_ms: opens_at_ms.saturating_add(SALE_WINDOW_MS),
             owner_epoch: self.owner_epoch(&token_id),
+            price,
+            buyer,
         };
         self.next_sale_id += 1;
         let before = env::storage_usage();
@@ -703,9 +757,57 @@ impl PolicyVault {
         emit_policy_event(
             "sale_started",
             &token_id,
-            json!({ "sale_id": sale.sale_id, "opens_at_ms": sale.opens_at_ms, "closes_at_ms": sale.closes_at_ms }),
+            json!({
+                "sale_id": sale.sale_id,
+                "opens_at_ms": sale.opens_at_ms,
+                "closes_at_ms": sale.closes_at_ms,
+                "price": sale.price,
+                "buyer": sale.buyer,
+            }),
         );
         sale
+    }
+
+    /// Buys a vault on sale at its price (general review H3). The caller attaches at least the
+    /// price (the rest is refunded) and names the `sale_id` it audited: if the seller cancelled
+    /// and restarted the sale meanwhile, the purchase fails and the deposit goes back. In one
+    /// step the NFT goes to the buyer, the seller's policy and sale end, and the price goes to the
+    /// seller. The buyer still runs the audit first (`scripts/sale-audit.mjs`): the contract
+    /// cannot read Ethereum.
+    #[payable]
+    pub fn buy(&mut self, token_id: TokenId, sale_id: u64) {
+        let buyer = env::predecessor_account_id();
+        let memo = format!("sale:{sale_id}");
+        // Same rules as any transfer: open window of this owner, that very sale, no signature in
+        // flight, no unresolved transfer_call.
+        self.assert_transferable(&token_id, Some(&memo));
+        let sale = self.sales.get(&token_id).expect("checked by assert_transferable");
+        let price = sale
+            .price
+            .unwrap_or_else(|| env::panic_str("This sale has no price; the seller transfers the vault"))
+            .0;
+        if let Some(reserved) = &sale.buyer {
+            require!(reserved == &buyer, "This sale is reserved for another buyer");
+        }
+        let seller = self.owner_of(&token_id);
+        require!(buyer != seller, "The owner cannot buy their own vault");
+        let attached = env::attached_deposit();
+        require!(
+            attached.as_yoctonear() >= price,
+            format!("Attach the price: {}", NearToken::from_yoctonear(price).exact_amount_display())
+        );
+        let (old_owner, cleared) = self.tokens.internal_transfer(&seller, &buyer, &token_id, None, Some(memo));
+        refund_cleared_approvals(&old_owner, &cleared);
+        self.record_transfer(&token_id, "buy", &old_owner, &buyer, None);
+        // If the seller's account no longer exists, this transfer fails and the price stays in
+        // the contract (documented limit).
+        Promise::new(old_owner.clone()).transfer(NearToken::from_yoctonear(price)).detach();
+        refund_if_any(&buyer, NearToken::from_yoctonear(attached.as_yoctonear() - price));
+        emit_policy_event(
+            "sale_bought",
+            &token_id,
+            json!({ "sale_id": sale_id, "seller": old_owner, "buyer": buyer, "price": U128(price) }),
+        );
     }
 
     /// The owner withdraws a sale; the vault can sign again.
@@ -903,6 +1005,7 @@ impl PolicyVault {
     /// the current owner, and, if the memo names a sale (`sale:<id>`), that very sale.
     fn assert_transferable(&self, token_id: &TokenId, memo: Option<&str>) {
         require_token_exists(&self.tokens, token_id);
+        self.assert_no_transfer_call(token_id);
         require!(
             self.inflight.get(token_id).is_none(),
             "A signature is in flight for this vault; transfer after it completes"
@@ -921,7 +1024,8 @@ impl PolicyVault {
         require!(now < sale.closes_at_ms, "The sale window has closed; start a new sale");
         // M8 review V1: a buyer or escrow that audited sale N transfers with memo "sale:N"; if the
         // seller cancelled and restarted the sale (and could have signed in between), it fails.
-        if let Some(bound) = memo.and_then(|m| m.trim().strip_prefix("sale:")) {
+        // General review H6: "Sale:N" or "SALE:N" bind too, they are never silently ignored.
+        if let Some(bound) = memo.and_then(sale_binding) {
             let id: u64 = bound
                 .trim()
                 .parse()
@@ -929,6 +1033,19 @@ impl PolicyVault {
             require!(
                 id == sale.sale_id,
                 format!("The sale changed since it was audited (audited {id}, current {})", sale.sale_id)
+            );
+        }
+    }
+
+    /// General review H1: during `nft_transfer_call` the receiver owns the vault until the
+    /// transfer resolves, and may still hand it back. Until then nobody acts as its owner
+    /// (no policy, proposal, signature, cancellation, sale, approval or transfer), so a
+    /// receiver cannot spend from a vault and then return it.
+    fn assert_no_transfer_call(&self, token_id: &TokenId) {
+        if let Some(started) = self.transfer_calls.get(token_id) {
+            require!(
+                env::block_timestamp_ms() >= started.saturating_add(TRANSFER_CALL_TIMEOUT_MS),
+                "A transfer_call is in progress for this vault; wait until it resolves"
             );
         }
     }
@@ -1124,9 +1241,12 @@ impl PolicyVault {
         self.tokens.owner_by_id.get(token_id).unwrap_or_else(|| env::panic_str("Token not found"))
     }
 
+    /// The caller must own the vault, and the vault must not be in an unresolved transfer_call
+    /// (general review H1).
     fn assert_owner(&self, token_id: &TokenId) -> AccountId {
         let owner = self.owner_of(token_id);
         require!(env::predecessor_account_id() == owner, "Only the vault owner can do this");
+        self.assert_no_transfer_call(token_id);
         owner
     }
 
@@ -1243,6 +1363,15 @@ impl PolicyVault {
     pub fn check_execution(&self, token_id: TokenId, proposal_id: u64) -> ExecutionCheck {
         require_token_exists(&self.tokens, &token_id);
         let nonce = self.nonces.get(&token_id).unwrap_or(0);
+        // General review H4: report the sale freeze, as `execute_proposal` would.
+        if self.active_sale(&token_id).is_some() {
+            return ExecutionCheck {
+                ready: false,
+                reason: Some("The vault is frozen for a sale; only cancel_nonce can sign until the sale ends".into()),
+                nonce,
+                signing_hash: None,
+            };
+        }
         match self.prepare_execution(&token_id, proposal_id, env::block_timestamp_ms(), None) {
             Ok(prep) => ExecutionCheck {
                 ready: true,
@@ -1830,6 +1959,12 @@ fn settle_storage(before: u64, freed_to: &AccountId) {
     }
 }
 
+/// The text after `sale:` in a memo, whatever its capitals, or `None` if the memo binds no sale.
+fn sale_binding(memo: &str) -> Option<&str> {
+    let m = memo.trim();
+    m.get(..5).filter(|p| p.eq_ignore_ascii_case("sale:")).map(|_| &m[5..])
+}
+
 fn vault_path_for(token_id: &str) -> String {
     format!("{VAULT_PATH_PREFIX}{token_id}")
 }
@@ -1872,6 +2007,10 @@ impl NonFungibleTokenCore for PolicyVault {
         self.record_transfer(&token_id, "transfer", &old_owner, &receiver_id, authorized);
     }
 
+    /// Same steps as the library's `nft_transfer_call` (transfer, call `nft_on_transfer` with all
+    /// the remaining gas, then `nft_resolve_transfer`), with two changes: the resolution gets
+    /// `GAS_FOR_RESOLVE_TRANSFER` instead of 5 Tgas, and the vault is locked for owner actions
+    /// until it resolves (general review H1), so the receiver cannot spend and hand it back.
     #[payable]
     fn nft_transfer_call(
         &mut self,
@@ -1881,15 +2020,28 @@ impl NonFungibleTokenCore for PolicyVault {
         memo: Option<String>,
         msg: String,
     ) -> PromiseOrValue<bool> {
+        assert_one_yocto();
+        require!(
+            env::prepaid_gas() >= MIN_PREPAID_GAS_FOR_TRANSFER_CALL,
+            "Attach at least 50 Tgas to nft_transfer_call"
+        );
         self.assert_transferable(&token_id, memo.as_deref());
-        let old_owner = self.tokens.owner_by_id.get(&token_id).expect("checked above");
         let sender_id = env::predecessor_account_id();
-        let result =
-            self.tokens.nft_transfer_call(receiver_id.clone(), token_id.clone(), approval_id, memo, msg);
-        // Reached only if the library's checks passed and the owner is now `receiver_id`.
-        let authorized = (sender_id != old_owner).then_some(sender_id);
+        let (old_owner, old_approvals) =
+            self.tokens.internal_transfer(&sender_id, &receiver_id, &token_id, approval_id, memo);
+        let authorized = (sender_id != old_owner).then_some(sender_id.clone());
         self.record_transfer(&token_id, "transfer_call", &old_owner, &receiver_id, authorized);
-        result
+        self.transfer_calls.insert(&token_id, &env::block_timestamp_ms());
+        ext_nft_receiver::ext(receiver_id.clone())
+            .with_unused_gas_weight(1)
+            .nft_on_transfer(sender_id, old_owner.clone(), token_id.clone(), msg)
+            .then(
+                ext_nft_resolver::ext(env::current_account_id())
+                    .with_static_gas(GAS_FOR_RESOLVE_TRANSFER)
+                    .with_unused_gas_weight(0)
+                    .nft_resolve_transfer(old_owner, receiver_id, token_id, old_approvals),
+            )
+            .into()
     }
 
     fn nft_token(&self, token_id: TokenId) -> Option<Token> {
@@ -1911,6 +2063,8 @@ impl NonFungibleTokenResolver for PolicyVault {
         token_id: TokenId,
         approved_account_ids: Option<HashMap<AccountId, u64>>,
     ) -> bool {
+        // H1: the transfer_call has resolved; whoever owns the vault now can act again.
+        self.transfer_calls.remove(&token_id);
         let cleared = approved_account_ids.clone();
         let kept = self.tokens.nft_resolve_transfer(
             previous_owner_id.clone(),
@@ -1942,16 +2096,22 @@ impl NonFungibleTokenApproval for PolicyVault {
         account_id: AccountId,
         msg: Option<String>,
     ) -> Option<Promise> {
+        require_token_exists(&self.tokens, &token_id);
+        self.assert_no_transfer_call(&token_id);
         self.tokens.nft_approve(token_id, account_id, msg)
     }
 
     #[payable]
     fn nft_revoke(&mut self, token_id: TokenId, account_id: AccountId) {
+        require_token_exists(&self.tokens, &token_id);
+        self.assert_no_transfer_call(&token_id);
         self.tokens.nft_revoke(token_id, account_id)
     }
 
     #[payable]
     fn nft_revoke_all(&mut self, token_id: TokenId) {
+        require_token_exists(&self.tokens, &token_id);
+        self.assert_no_transfer_call(&token_id);
         self.tokens.nft_revoke_all(token_id)
     }
 
@@ -2023,7 +2183,7 @@ mod tests {
         let epoch = c.owner_epoch(&"0".to_string());
         c.sales.insert(
             &"0".to_string(),
-            &Sale { sale_id: 9_999, started_ms: 0, opens_at_ms: 0, closes_at_ms: u64::MAX, owner_epoch: epoch },
+            &Sale { sale_id: 9_999, started_ms: 0, opens_at_ms: 0, closes_at_ms: u64::MAX, owner_epoch: epoch, price: None, buyer: None },
         );
     }
 
@@ -2731,32 +2891,134 @@ mod tests {
         assert!(t.iter().any(|(to, amount)| *to == alice && *amount > NearToken::from_yoctonear(0)), "{t:?}");
     }
 
-    #[test]
-    fn transfer_call_that_comes_back_clears_the_receivers_policy() {
-        let (alice, bob) = (accounts(1), accounts(2));
-        let mut c = setup_with_vault(alice.clone());
-        ctx_at(alice.clone(), ONE_YOCTO, T0_MS);
+    // ---------- General review H1: no owner action while a transfer_call is unresolved ----------
+
+    /// Alice (with a policy and an open sale) sends vault 0 to bob with `nft_transfer_call`.
+    fn transfer_call_to_bob() -> (PolicyVault, AccountId, AccountId) {
+        let (mut c, alice) = vault_with_policy();
+        let bob = accounts(2);
         open_sale(&mut c);
+        ctx_at(alice.clone(), ONE_YOCTO, T0_MS);
         let _ = c.nft_transfer_call(bob.clone(), "0".into(), None, None, "x".into());
-        // During the call bob owns the vault and sets his own policy...
-        ctx_at(bob.clone(), POLICY_DEPOSIT, T0_MS + 1);
-        assert!(c.set_policy("0".into(), test_policy(1)));
-        // ...then the receiver asks to return the token (nft_on_transfer returned true).
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, bob);
+        (c, alice, bob)
+    }
+
+    /// Runs `nft_resolve_transfer` as the runtime does, with the receiver's answer
+    /// (`true` = give it back, `false` = keep it).
+    fn resolve(c: &mut PolicyVault, previous: &AccountId, receiver: &AccountId, give_back: bool, ms: u64) -> bool {
         let mut b = VMContextBuilder::new();
         b.current_account_id("vault.testnet".parse().unwrap())
             .predecessor_account_id("vault.testnet".parse().unwrap())
-            .block_timestamp((T0_MS + 2) * 1_000_000);
+            .block_timestamp(ms * 1_000_000);
+        let answer = if give_back { b"true".to_vec() } else { b"false".to_vec() };
         testing_env!(
             b.build(),
             near_sdk::test_vm_config(),
             near_sdk::RuntimeFeesConfig::test(),
             Default::default(),
-            vec![near_sdk::PromiseResult::Successful(b"true".to_vec())]
+            vec![near_sdk::PromiseResult::Successful(answer)]
         );
-        assert!(!c.nft_resolve_transfer(alice.clone(), bob.clone(), "0".into(), Some(HashMap::new())));
+        c.nft_resolve_transfer(previous.clone(), receiver.clone(), "0".into(), Some(HashMap::new()))
+    }
+
+    /// The attack found in the review: the receiver sets a policy with delay 0 (applied at once
+    /// on a locked vault) to sign a payment before handing the vault back. It fails at the start.
+    #[test]
+    #[should_panic(expected = "A transfer_call is in progress for this vault; wait until it resolves")]
+    fn a_transfer_call_receiver_cannot_set_a_policy_before_it_resolves() {
+        let (mut c, _, bob) = transfer_call_to_bob();
+        let mut p = test_policy(1);
+        p.delay_ms = 0;
+        ctx_at(bob, POLICY_DEPOSIT, T0_MS + 1);
+        c.set_policy("0".into(), p);
+    }
+
+    #[test]
+    #[should_panic(expected = "A transfer_call is in progress for this vault; wait until it resolves")]
+    fn a_transfer_call_receiver_cannot_start_a_sale_before_it_resolves() {
+        let (mut c, _, bob) = transfer_call_to_bob();
+        ctx_at(bob, NearToken::from_millinear(10), T0_MS + 1);
+        c.start_sale("0".into(), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "A transfer_call is in progress for this vault; wait until it resolves")]
+    fn a_transfer_call_receiver_cannot_approve_before_it_resolves() {
+        let (mut c, _, bob) = transfer_call_to_bob();
+        ctx_at(bob, NearToken::from_millinear(10), T0_MS + 1);
+        let _ = c.nft_approve("0".into(), accounts(3), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "A transfer_call is in progress for this vault; wait until it resolves")]
+    fn a_transfer_call_receiver_cannot_pass_the_vault_on_before_it_resolves() {
+        let (mut c, _, bob) = transfer_call_to_bob();
+        open_sale(&mut c);
+        ctx_at(bob, ONE_YOCTO, T0_MS + 1);
+        c.nft_transfer(accounts(3), "0".into(), None, None);
+    }
+
+    #[test]
+    fn a_receiver_that_keeps_the_vault_owns_it_normally() {
+        let (mut c, alice, bob) = transfer_call_to_bob();
+        assert!(resolve(&mut c, &alice, &bob, false, T0_MS + 2));
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, bob);
+        ctx_at(bob, POLICY_DEPOSIT, T0_MS + 3);
+        assert!(c.set_policy("0".into(), test_policy(1)));
+    }
+
+    /// A returned vault comes back without the sender's policy (it ended on the way out, and the
+    /// sender got that storage back) and without the lock.
+    #[test]
+    fn a_returned_vault_comes_back_without_policy_and_unlocked() {
+        let (mut c, alice, bob) = transfer_call_to_bob();
+        assert!(transfers().iter().any(|(to, _)| *to == alice), "alice got her policy's storage back");
+        assert!(!resolve(&mut c, &alice, &bob, true, T0_MS + 2));
         assert_eq!(c.nft_token("0".into()).unwrap().owner_id, alice);
-        assert!(!c.get_policy("0".into()).has_policy, "the receiver's policy survived the return");
-        assert!(transfers().iter().any(|(to, _)| *to == bob), "bob paid for that storage");
+        assert!(!c.get_policy("0".into()).has_policy);
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 3);
+        assert!(c.set_policy("0".into(), test_policy(1)));
+    }
+
+    /// If the resolution never runs (its callback ran out of gas, so the receiver keeps the vault),
+    /// the lock lapses after an hour.
+    #[test]
+    fn the_transfer_call_lock_lapses_if_it_never_resolves() {
+        let (mut c, _, bob) = transfer_call_to_bob();
+        ctx_at(bob, POLICY_DEPOSIT, T0_MS + TRANSFER_CALL_TIMEOUT_MS);
+        assert!(c.set_policy("0".into(), test_policy(1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Attach at least 50 Tgas to nft_transfer_call")]
+    fn transfer_call_needs_gas_for_its_resolution() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        open_sale(&mut c);
+        let mut b = VMContextBuilder::new();
+        b.current_account_id("vault.testnet".parse().unwrap())
+            .predecessor_account_id(alice)
+            .attached_deposit(ONE_YOCTO)
+            .prepaid_gas(Gas::from_tgas(30));
+        testing_env!(b.build());
+        let _ = c.nft_transfer_call(accounts(2), "0".into(), None, None, "x".into());
+    }
+
+    /// The resolution gets 20 Tgas, not the library's 5.
+    #[test]
+    fn transfer_call_gives_its_resolution_enough_gas() {
+        let (_, _, _) = transfer_call_to_bob();
+        let receipts = get_created_receipts();
+        let resolve_gas = receipts
+            .iter()
+            .flat_map(|r| r.actions.iter())
+            .find_map(|a| match a {
+                MockAction::FunctionCallWeight { method_name, prepaid_gas, .. } if method_name == b"nft_resolve_transfer" => Some(*prepaid_gas),
+                _ => None,
+            })
+            .expect("a resolve call");
+        assert_eq!(resolve_gas, GAS_FOR_RESOLVE_TRANSFER);
     }
 
     // ---------- M6: proposals ----------
@@ -3592,7 +3854,7 @@ mod tests {
 
     fn start_sale_as(c: &mut PolicyVault, who: &AccountId, ms: u64) -> Sale {
         ctx_at(who.clone(), SALE_DEPOSIT, ms);
-        c.start_sale("0".into())
+        c.start_sale("0".into(), None, None)
     }
 
     fn transfer_as(c: &mut PolicyVault, who: &AccountId, to: AccountId, ms: u64) {
@@ -3876,5 +4138,181 @@ mod tests {
         let m = c.nft_metadata();
         assert_eq!(m.spec, NFT_METADATA_SPEC);
         assert_eq!(m.symbol, "PVAULT");
+    }
+
+    // ---------- General review H3: buy at the sale price ----------
+
+    const PRICE: NearToken = NearToken::from_near(2);
+
+    /// Vault 0 of alice, with a policy (delay 1 h) and a sale at `PRICE`, optionally reserved.
+    fn sale_with_price(buyer: Option<AccountId>) -> (PolicyVault, AccountId, Sale) {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), SALE_DEPOSIT, T0_MS + 1);
+        let sale = c.start_sale("0".into(), Some(U128(PRICE.as_yoctonear())), buyer);
+        (c, alice, sale)
+    }
+
+    fn buy_as(c: &mut PolicyVault, who: &AccountId, deposit: NearToken, sale_id: u64, ms: u64) {
+        ctx_at(who.clone(), deposit, ms);
+        c.buy("0".into(), sale_id);
+    }
+
+    #[test]
+    fn a_buyer_pays_the_price_and_gets_a_clean_vault() {
+        let (mut c, alice, sale) = sale_with_price(None);
+        let bob = accounts(2);
+        buy_as(&mut c, &bob, PRICE, sale.sale_id, sale.opens_at_ms);
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, bob);
+        assert!(!c.get_policy("0".into()).has_policy);
+        assert_eq!(c.get_sale("0".into()), None);
+        let t = transfers();
+        assert!(t.iter().any(|(to, amount)| *to == alice && *amount == PRICE), "the seller is paid: {t:?}");
+        assert!(get_logs().iter().any(|l| l.contains("\"sale_bought\"")));
+        assert_eq!(c.vault_transfer_info("0".into()).unwrap().last.unwrap().kind, "buy");
+    }
+
+    #[test]
+    fn a_buyer_who_attaches_too_much_gets_the_rest_back() {
+        let (mut c, _, sale) = sale_with_price(None);
+        let bob = accounts(2);
+        buy_as(&mut c, &bob, NearToken::from_near(3), sale.sale_id, sale.opens_at_ms);
+        assert!(transfers().iter().any(|(to, amount)| *to == bob && *amount == NearToken::from_near(1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Attach the price")]
+    fn a_buyer_who_attaches_less_than_the_price_fails() {
+        let (mut c, _, sale) = sale_with_price(None);
+        buy_as(&mut c, &accounts(2), NearToken::from_near(1), sale.sale_id, sale.opens_at_ms);
+    }
+
+    #[test]
+    #[should_panic(expected = "The sale opens at")]
+    fn nobody_buys_before_the_sale_opens() {
+        let (mut c, _, sale) = sale_with_price(None);
+        buy_as(&mut c, &accounts(2), PRICE, sale.sale_id, sale.opens_at_ms - 1);
+    }
+
+    /// Threat 23 closed on-chain: the buyer names the sale it audited. If the seller cancelled it,
+    /// signed something and started another, the purchase fails and the deposit goes back.
+    #[test]
+    #[should_panic(expected = "The sale changed since it was audited")]
+    fn a_purchase_of_an_older_sale_fails() {
+        let (mut c, alice, first) = sale_with_price(None);
+        ctx_at(alice.clone(), ONE_YOCTO, T0_MS + 2);
+        c.cancel_sale("0".into());
+        ctx_at(alice, SALE_DEPOSIT, T0_MS + 3);
+        let second = c.start_sale("0".into(), Some(U128(PRICE.as_yoctonear())), None);
+        buy_as(&mut c, &accounts(2), PRICE, first.sale_id, second.opens_at_ms);
+    }
+
+    #[test]
+    #[should_panic(expected = "This sale has no price; the seller transfers the vault")]
+    fn a_sale_without_price_cannot_be_bought() {
+        let (mut c, alice) = vault_with_policy();
+        let sale = start_sale_as(&mut c, &alice, T0_MS + 1);
+        buy_as(&mut c, &accounts(2), PRICE, sale.sale_id, sale.opens_at_ms);
+    }
+
+    #[test]
+    #[should_panic(expected = "This sale is reserved for another buyer")]
+    fn a_reserved_sale_refuses_other_buyers() {
+        let (mut c, _, sale) = sale_with_price(Some(accounts(2)));
+        buy_as(&mut c, &accounts(3), PRICE, sale.sale_id, sale.opens_at_ms);
+    }
+
+    #[test]
+    fn a_reserved_sale_sells_to_its_buyer() {
+        let (mut c, _, sale) = sale_with_price(Some(accounts(2)));
+        buy_as(&mut c, &accounts(2), PRICE, sale.sale_id, sale.opens_at_ms);
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, accounts(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "The owner cannot buy their own vault")]
+    fn the_owner_cannot_buy_their_own_vault() {
+        let (mut c, alice, sale) = sale_with_price(None);
+        buy_as(&mut c, &alice, PRICE, sale.sale_id, sale.opens_at_ms);
+    }
+
+    #[test]
+    #[should_panic(expected = "The price must be above 0")]
+    fn a_sale_price_of_zero_is_refused() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, SALE_DEPOSIT, T0_MS + 1);
+        c.start_sale("0".into(), Some(U128(0)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "The owner cannot be the buyer")]
+    fn the_owner_cannot_reserve_the_sale_for_themselves() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice.clone(), SALE_DEPOSIT, T0_MS + 1);
+        c.start_sale("0".into(), Some(U128(PRICE.as_yoctonear())), Some(alice));
+    }
+
+    #[test]
+    #[should_panic(expected = "A reserved buyer needs a price")]
+    fn a_reserved_buyer_needs_a_price() {
+        let (mut c, alice) = vault_with_policy();
+        ctx_at(alice, SALE_DEPOSIT, T0_MS + 1);
+        c.start_sale("0".into(), None, Some(accounts(2)));
+    }
+
+    /// Threat 16: the guardian's veto also stops a purchase.
+    #[test]
+    #[should_panic(expected = "Start a sale (start_sale) and wait for it to open before transferring")]
+    fn a_vetoed_sale_cannot_be_bought() {
+        let (mut c, _, sale) = sale_with_price(None);
+        ctx_at(guardian(), ONE_YOCTO, T0_MS + 2);
+        c.veto_sale("0".into());
+        buy_as(&mut c, &accounts(2), PRICE, sale.sale_id, sale.opens_at_ms);
+    }
+
+    #[test]
+    #[should_panic(expected = "A signature is in flight for this vault; transfer after it completes")]
+    fn no_purchase_while_a_cancellation_is_in_flight() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        answer(&mut c, ok(&a1_response()));
+        ctx_at(alice.clone(), SALE_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let sale = c.start_sale("0".into(), Some(U128(PRICE.as_yoctonear())), None);
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let _ = c.cancel_nonce("0".into(), 0, U128(40_000_000_000), U128(2_000_000_000), None, None);
+        buy_as(&mut c, &accounts(2), PRICE, sale.sale_id, sale.opens_at_ms);
+    }
+
+    // ---------- General review H4 and H6 ----------
+
+    #[test]
+    fn check_execution_reports_the_sale_freeze() {
+        let (mut c, alice, id) = ready_a1_proposal();
+        start_sale_as(&mut c, &alice, T0_MS + 10 + HOUR_MS);
+        let e = c.check_execution("0".into(), id);
+        assert!(!e.ready);
+        assert_eq!(
+            e.reason.as_deref(),
+            Some("The vault is frozen for a sale; only cancel_nonce can sign until the sale ends")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "The sale changed since it was audited (audited 5, current 9999)")]
+    fn a_binding_in_capitals_is_still_checked() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        open_sale(&mut c);
+        ctx_at(alice, ONE_YOCTO, T0_MS);
+        c.nft_transfer(accounts(2), "0".into(), None, Some("SALE:5".into()));
+    }
+
+    #[test]
+    fn a_binding_in_capitals_to_the_current_sale_succeeds() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        open_sale(&mut c);
+        ctx_at(alice, ONE_YOCTO, T0_MS);
+        c.nft_transfer(accounts(2), "0".into(), None, Some(" Sale: 9999 ".into()));
+        assert_eq!(c.nft_token("0".into()).unwrap().owner_id, accounts(2));
     }
 }

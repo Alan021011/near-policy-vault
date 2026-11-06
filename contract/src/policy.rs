@@ -21,8 +21,9 @@
 //!
 //! Daily caps use a fixed 24-hour window that starts at the first reservation and restarts
 //! when it expires. Worst case across a window boundary is twice the cap; this is documented
-//! in the threat model. Reservations are made when a transaction is proposed and released if
-//! it is cancelled or vetoed (module M6).
+//! in the threat model. A transaction is checked when it is proposed, but its spend is charged
+//! to the caps only when it is signed (M7, review P1), and given back only if the signature
+//! turns out not to be the vault's.
 //!
 //! Changing a policy: `is_not_looser(new, old)` decides whether a change may apply at once
 //! (it only tightens) or must wait the current delay, during which the guardian can veto it.
