@@ -25,6 +25,11 @@
 //! to the caps only when it is signed (M7, review P1), and given back only if the signature
 //! turns out not to be the vault's.
 //!
+//! Agent mode and NFTs (after M12): a policy may name a `proposer`, an account (for example an
+//! AI agent) that can propose and sign transactions but never change the policy, sell or transfer
+//! the vault; and `nfts`, ERC-721 / ERC-1155 collections the vault may send with `safeTransferFrom`
+//! from its own address to an allowed destination, at most `daily_count` items a day each.
+//!
 //! Changing a policy: `is_not_looser(new, old)` decides whether a change may apply at once
 //! (it only tightens) or must wait the current delay, during which the guardian can veto it.
 
@@ -58,6 +63,17 @@ pub struct TokenRule {
     pub max_approval: U128,
 }
 
+/// Rules for one NFT collection (ERC-721 or ERC-1155).
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NftRule {
+    /// Collection contract address, `0x` + 40 lowercase hex characters.
+    pub contract: String,
+    /// Most items sent with `safeTransferFrom` per 24-hour window (1 per ERC-721 transfer, the
+    /// amount for ERC-1155).
+    pub daily_count: U128,
+}
+
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -78,6 +94,14 @@ pub struct Policy {
     pub allowed_spenders: Vec<String>,
     /// ERC-20 contracts the vault may call, with their caps.
     pub tokens: Vec<TokenRule>,
+    /// Account that may propose and sign transactions (for example an AI agent), never change
+    /// the policy, sell or transfer the vault. Its proposals wait the delay like the owner's and
+    /// the guardian can veto them.
+    #[serde(default)]
+    pub proposer: Option<AccountId>,
+    /// NFT collections the vault may send, with their daily counts.
+    #[serde(default)]
+    pub nfts: Vec<NftRule>,
 }
 
 impl Policy {
@@ -92,6 +116,8 @@ impl Policy {
             allowed_destinations: Vec::new(),
             allowed_spenders: Vec::new(),
             tokens: Vec::new(),
+            proposer: None,
+            nfts: Vec::new(),
         }
     }
 
@@ -107,6 +133,7 @@ impl Policy {
         if self.allowed_destinations.len() > MAX_LIST_LEN
             || self.allowed_spenders.len() > MAX_LIST_LEN
             || self.tokens.len() > MAX_LIST_LEN
+            || self.nfts.len() > MAX_LIST_LEN
         {
             return Err(InvalidPolicy("a list has more than 32 entries"));
         }
@@ -119,15 +146,24 @@ impl Policy {
         if has_duplicates(&self.allowed_destinations) || has_duplicates(&self.allowed_spenders) {
             return Err(InvalidPolicy("duplicate address"));
         }
-        let contracts: Vec<String> = self.tokens.iter().map(|t| t.contract.clone()).collect();
+        for n in self.nfts.iter_mut() {
+            n.contract = normalize_address(&n.contract).ok_or(InvalidPolicy("malformed NFT address"))?;
+        }
+        // A contract is either a token or an NFT collection: they share one daily window.
+        let contracts: Vec<String> =
+            self.tokens.iter().map(|t| t.contract.clone()).chain(self.nfts.iter().map(|n| n.contract.clone())).collect();
         if has_duplicates(&contracts) {
-            return Err(InvalidPolicy("duplicate token"));
+            return Err(InvalidPolicy("duplicate token or NFT contract"));
         }
         Ok(self)
     }
 
     fn token(&self, contract: &str) -> Option<&TokenRule> {
         self.tokens.iter().find(|t| t.contract == contract)
+    }
+
+    fn nft(&self, contract: &str) -> Option<&NftRule> {
+        self.nfts.iter().find(|n| n.contract == contract)
     }
 }
 
@@ -148,6 +184,9 @@ pub enum PolicyError {
     TokenCapExceeded,
     EthCapExceeded,
     CalldataNotAllowed,
+    NftNotAllowed,
+    NftNotFromVault,
+    NftCapExceeded,
     Overflow,
     InvalidPolicy(&'static str),
 }
@@ -168,7 +207,10 @@ impl fmt::Display for PolicyError {
             Self::ApprovalTooHigh => "approval above the token's max_approval",
             Self::TokenCapExceeded => "token daily cap exceeded",
             Self::EthCapExceeded => "ETH daily cap exceeded",
-            Self::CalldataNotAllowed => "calldata is not a plain transfer, ERC-20 transfer or approve",
+            Self::CalldataNotAllowed => "calldata is not a plain transfer, ERC-20 transfer or approve, or NFT safeTransferFrom",
+            Self::NftNotAllowed => "NFT contract not allowed",
+            Self::NftNotFromVault => "an NFT transfer must send from the vault's own address",
+            Self::NftCapExceeded => "NFT daily count exceeded",
             Self::Overflow => "arithmetic overflow",
             Self::InvalidPolicy(why) => return write!(f, "invalid policy: {why}"),
         };
@@ -269,12 +311,20 @@ pub struct Reservation {
     pub token_amount: U128,
 }
 
-/// Decides whether `tx` may be signed under `policy` given the current reservations.
-pub fn check(
+/// Decides whether `tx` may be signed under `policy` given the current reservations, for a vault
+/// whose address is not given: NFT transfers are refused (they must name the vault as sender).
+pub fn check(policy: &Policy, spend: &SpendState, tx: &Eip1559Tx, now_ms: u64) -> Result<Reservation, PolicyError> {
+    check_with_vault(policy, spend, tx, now_ms, None)
+}
+
+/// Decides whether `tx` may be signed under `policy` given the current reservations. `vault` is
+/// the vault's own EVM address (`0x` lowercase), required for NFT transfers.
+pub fn check_with_vault(
     policy: &Policy,
     spend: &SpendState,
     tx: &Eip1559Tx,
     now_ms: u64,
+    vault: Option<&str>,
 ) -> Result<Reservation, PolicyError> {
     use PolicyError::*;
     if tx.chain_id != policy.chain_id {
@@ -336,6 +386,15 @@ pub fn check(
             }
             (gas_cost, Some((to.clone(), amount)))
         }
+        CallKind::Erc721Transfer { from, to: recipient } => {
+            nft_check(policy, spend, &to, &from, &recipient, 1, tx.value, vault, now_ms)?;
+            (gas_cost, Some((to.clone(), 1)))
+        }
+        CallKind::Erc1155Transfer { from, to: recipient, amount } => {
+            let amount = u128_from_word(&amount).ok_or(AmountTooLarge)?;
+            nft_check(policy, spend, &to, &from, &recipient, amount, tx.value, vault, now_ms)?;
+            (gas_cost, Some((to.clone(), amount)))
+        }
         CallKind::Unknown => return Err(CalldataNotAllowed),
     };
 
@@ -347,6 +406,37 @@ pub fn check(
         token_contract: token.as_ref().map(|(c, _)| c.clone()),
         token_amount: U128(token.map(|(_, a)| a).unwrap_or(0)),
     })
+}
+
+/// Rules shared by ERC-721 and ERC-1155 transfers: an allowed collection, sent from the vault
+/// itself to an allowed destination, within the collection's daily count, with no ETH attached.
+#[allow(clippy::too_many_arguments)]
+fn nft_check(
+    policy: &Policy,
+    spend: &SpendState,
+    contract: &str,
+    from: &Address,
+    recipient: &Address,
+    count: u128,
+    value: u128,
+    vault: Option<&str>,
+    now_ms: u64,
+) -> Result<(), PolicyError> {
+    use PolicyError::*;
+    if value != 0 {
+        return Err(ValueWithCalldata);
+    }
+    let rule = policy.nft(contract).ok_or(NftNotAllowed)?;
+    if vault != Some(address_hex(from).as_str()) {
+        return Err(NftNotFromVault);
+    }
+    if !policy.allowed_destinations.contains(&address_hex(recipient)) {
+        return Err(DestinationNotAllowed);
+    }
+    if count > spend.token_window(contract).remaining(rule.daily_count.0, now_ms) {
+        return Err(NftCapExceeded);
+    }
+    Ok(())
 }
 
 /// `true` when `new` is at most as permissive as `old` in every dimension, so it may apply at
@@ -370,6 +460,9 @@ pub fn is_not_looser(new: &Policy, old: &Policy) -> bool {
                 .map(|o| t.daily_cap.0 <= o.daily_cap.0 && t.max_approval.0 <= o.max_approval.0)
                 .unwrap_or(false)
         })
+        && new.nfts.iter().all(|n| old.nft(&n.contract).map(|o| n.daily_count.0 <= o.daily_count.0).unwrap_or(false))
+        // A new or different proposer gains power over the vault: that is a loosening.
+        && (new.proposer.is_none() || new.proposer == old.proposer)
 }
 
 /// A cancellation: a 0-value transfer from the vault to itself that re-uses a nonce, so whatever
@@ -474,6 +567,8 @@ mod tests {
     const OTHER: &str = "0x2222222222222222222222222222222222222222";
     const TOKEN: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SPENDER: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const NFT: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
+    const VAULT: &str = "0xdddddddddddddddddddddddddddddddddddddddd";
     const GWEI: u128 = 1_000_000_000;
     const ETH: u128 = 1_000_000_000_000_000_000;
     const NOW: u64 = 1_700_000_000_000;
@@ -496,6 +591,8 @@ mod tests {
                 daily_cap: U128(1_000_000),
                 max_approval: U128(500_000),
             }],
+            proposer: None,
+            nfts: vec![NftRule { contract: NFT.into(), daily_count: U128(2) }],
         }
     }
 
@@ -534,6 +631,95 @@ mod tests {
 
     fn gas_cost(tx: &Eip1559Tx) -> u128 {
         tx.max_fee_per_gas * tx.gas_limit as u128
+    }
+
+    fn word_addr(a: &str) -> Vec<u8> {
+        let mut w = vec![0u8; 12];
+        w.extend_from_slice(&addr(a));
+        w
+    }
+
+    fn nft721_tx(from: &str, to: &str) -> Eip1559Tx {
+        let mut tx = eth_tx(NFT, 0);
+        tx.gas_limit = 50_000;
+        let mut d = crate::evm::SEL_ERC721_SAFE_TRANSFER.to_vec();
+        d.extend(word_addr(from));
+        d.extend(word_addr(to));
+        d.extend_from_slice(&word(7));
+        tx.data = d;
+        tx
+    }
+
+    fn nft1155_tx(from: &str, to: &str, amount: u128, data_len: u8) -> Eip1559Tx {
+        let mut tx = nft721_tx(from, to);
+        let mut d = crate::evm::SEL_ERC1155_SAFE_TRANSFER.to_vec();
+        d.extend(word_addr(from));
+        d.extend(word_addr(to));
+        d.extend_from_slice(&word(7));
+        d.extend_from_slice(&word(amount));
+        d.extend_from_slice(&word(0xa0));
+        d.extend_from_slice(&word(data_len as u128));
+        tx.data = d;
+        tx
+    }
+
+    // ---------- NFTs (after M12) ----------
+
+    #[test]
+    fn an_nft_sent_from_the_vault_to_an_allowed_destination_is_allowed_and_counted() {
+        let p = policy();
+        let mut s = SpendState::default();
+        let tx = nft721_tx(VAULT, DEST);
+        let r = check_with_vault(&p, &s, &tx, NOW, Some(VAULT)).unwrap();
+        assert_eq!((r.token_contract.as_deref(), r.token_amount.0), (Some(NFT), 1));
+        assert_eq!(r.eth.0, gas_cost(&tx), "only gas is charged in ETH");
+        s.reserve(&r, NOW);
+        s.reserve(&r, NOW);
+        assert_eq!(check_with_vault(&p, &s, &tx, NOW, Some(VAULT)), Err(PolicyError::NftCapExceeded), "2 a day");
+        assert!(check_with_vault(&p, &s, &tx, NOW + DAY_MS, Some(VAULT)).is_ok(), "fresh window the next day");
+    }
+
+    #[test]
+    fn nft_refusals() {
+        use PolicyError::*;
+        let p = policy();
+        let s = SpendState::default();
+        assert_eq!(check_with_vault(&p, &s, &nft721_tx(DEST, DEST), NOW, Some(VAULT)), Err(NftNotFromVault), "someone else's NFT");
+        assert_eq!(check(&p, &s, &nft721_tx(VAULT, DEST), NOW), Err(NftNotFromVault), "vault address unknown");
+        assert_eq!(check_with_vault(&p, &s, &nft721_tx(VAULT, SPENDER), NOW, Some(VAULT)), Err(DestinationNotAllowed));
+        let mut other = nft721_tx(VAULT, DEST);
+        other.to = addr(TOKEN);
+        assert_eq!(check_with_vault(&p, &s, &other, NOW, Some(VAULT)), Err(NftNotAllowed));
+        let mut with_eth = nft721_tx(VAULT, DEST);
+        with_eth.value = 1;
+        assert_eq!(check_with_vault(&p, &s, &with_eth, NOW, Some(VAULT)), Err(ValueWithCalldata));
+        assert_eq!(check_with_vault(&p, &s, &nft1155_tx(VAULT, DEST, 3, 0), NOW, Some(VAULT)), Err(NftCapExceeded), "3 items > 2 a day");
+        assert_eq!(check_with_vault(&p, &s, &nft1155_tx(VAULT, DEST, 1, 4), NOW, Some(VAULT)), Err(CalldataNotAllowed), "non-empty data");
+    }
+
+    #[test]
+    fn an_erc1155_transfer_counts_its_amount() {
+        let r = check_with_vault(&policy(), &SpendState::default(), &nft1155_tx(VAULT, DEST, 2, 0), NOW, Some(VAULT)).unwrap();
+        assert_eq!((r.token_contract.as_deref(), r.token_amount.0), (Some(NFT), 2));
+    }
+
+    #[test]
+    fn naming_a_proposer_or_raising_an_nft_count_is_a_loosening() {
+        let old = policy();
+        let mut agent = old.clone();
+        agent.proposer = Some("agent.testnet".parse().unwrap());
+        assert!(!is_not_looser(&agent, &old), "a new proposer gains power");
+        assert!(is_not_looser(&old, &agent), "removing it tightens");
+        assert!(is_not_looser(&agent, &agent));
+        let mut other = agent.clone();
+        other.proposer = Some("other.testnet".parse().unwrap());
+        assert!(!is_not_looser(&other, &agent), "a different proposer");
+        let mut more = old.clone();
+        more.nfts[0].daily_count = U128(3);
+        assert!(!is_not_looser(&more, &old));
+        let mut fewer = old.clone();
+        fewer.nfts.clear();
+        assert!(is_not_looser(&fewer, &old));
     }
 
     // ---------- allowed shapes ----------
@@ -764,7 +950,9 @@ mod tests {
         assert!(matches!(bad(|p| p.delay_ms = MAX_DELAY_MS + 1), Some(PolicyError::InvalidPolicy(_))));
         assert!(matches!(bad(|p| p.allowed_destinations.push("0x12".into())), Some(PolicyError::InvalidPolicy(_))));
         assert!(matches!(bad(|p| p.allowed_destinations.push(DEST.to_uppercase().replace("0X", "0x"))), Some(PolicyError::InvalidPolicy("duplicate address"))));
-        assert!(matches!(bad(|p| p.tokens.push(p.tokens[0].clone())), Some(PolicyError::InvalidPolicy("duplicate token"))));
+        assert!(matches!(bad(|p| p.tokens.push(p.tokens[0].clone())), Some(PolicyError::InvalidPolicy("duplicate token or NFT contract"))));
+        // A contract cannot be both a token and an NFT collection (they share one daily window).
+        assert!(matches!(bad(|p| p.nfts.push(NftRule { contract: TOKEN.into(), daily_count: U128(1) })), Some(PolicyError::InvalidPolicy("duplicate token or NFT contract"))));
         assert!(matches!(bad(|p| p.allowed_spenders = vec!["0x".to_string() + &"11".repeat(20); 33]), Some(PolicyError::InvalidPolicy(_))));
     }
 

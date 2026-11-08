@@ -44,10 +44,22 @@ pub fn wasm(name: &str) -> Result<Vec<u8>> {
 
 /// A fresh sandbox with the three contracts and four funded accounts.
 pub async fn setup() -> Result<Env> {
+    setup_with_vault_wasm(&wasm("policy_vault")?).await
+}
+
+/// Same as `setup`, with a given build of the vault contract (the migration rehearsal deploys the
+/// previous build first).
+pub async fn setup_with_vault_wasm(vault_wasm: &[u8]) -> Result<Env> {
     let worker = near_workspaces::sandbox().await?;
     let root = worker.root_account()?;
     let signer = deploy(&root, "signer", "mock_signer").await?;
-    let vault = deploy(&root, "vault", "policy_vault").await?;
+    let vault_account = root
+        .create_subaccount("vault")
+        .initial_balance(NearToken::from_near(30))
+        .transact()
+        .await?
+        .into_result()?;
+    let vault = vault_account.deploy(vault_wasm).await?.into_result()?;
     vault
         .call("new")
         .args_json(json!({ "signer_id": signer.id() }))

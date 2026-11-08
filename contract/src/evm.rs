@@ -22,6 +22,10 @@ pub type Address = [u8; 20];
 pub const SEL_ERC20_TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 /// `approve(address,uint256)`
 pub const SEL_ERC20_APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
+/// ERC-721 `safeTransferFrom(address,address,uint256)`
+pub const SEL_ERC721_SAFE_TRANSFER: [u8; 4] = [0x42, 0x84, 0x2e, 0x0e];
+/// ERC-1155 `safeTransferFrom(address,address,uint256,uint256,bytes)`
+pub const SEL_ERC1155_SAFE_TRANSFER: [u8; 4] = [0xf2, 0x42, 0x43, 0x2a];
 
 /// Fields of an EIP-1559 transaction with an empty access list and no contract creation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,6 +201,10 @@ pub enum CallKind {
     PlainTransfer,
     Erc20Transfer { recipient: Address, amount: [u8; 32] },
     Erc20Approve { spender: Address, amount: [u8; 32] },
+    /// ERC-721 `safeTransferFrom(from, to, id)` (100 bytes).
+    Erc721Transfer { from: Address, to: Address },
+    /// ERC-1155 `safeTransferFrom(from, to, id, amount, "")` (196 bytes, empty `data` only).
+    Erc1155Transfer { from: Address, to: Address, amount: [u8; 32] },
     Unknown,
 }
 
@@ -204,6 +212,23 @@ pub enum CallKind {
 pub fn classify(data: &[u8]) -> CallKind {
     if data.is_empty() {
         return CallKind::PlainTransfer;
+    }
+    if data.len() >= 4 && data[0..4] == SEL_ERC721_SAFE_TRANSFER && data.len() == 4 + 32 * 3 {
+        return match (word_address(&data[4..36]), word_address(&data[36..68])) {
+            (Some(from), Some(to)) => CallKind::Erc721Transfer { from, to },
+            _ => CallKind::Unknown,
+        };
+    }
+    if data.len() >= 4 && data[0..4] == SEL_ERC1155_SAFE_TRANSFER && data.len() == 4 + 32 * 6 {
+        // The bytes argument must be empty: its offset word is 0xa0 (5 head words) and its length 0.
+        let offset_ok = data[132..164].iter().take(31).all(|b| *b == 0) && data[163] == 0xa0;
+        let empty = data[164..196].iter().all(|b| *b == 0);
+        let mut amount = [0u8; 32];
+        amount.copy_from_slice(&data[100..132]);
+        return match (word_address(&data[4..36]), word_address(&data[36..68]), offset_ok && empty) {
+            (Some(from), Some(to), true) => CallKind::Erc1155Transfer { from, to, amount },
+            _ => CallKind::Unknown,
+        };
     }
     if data.len() != 68 {
         return CallKind::Unknown;
@@ -225,6 +250,16 @@ pub fn classify(data: &[u8]) -> CallKind {
     } else {
         CallKind::Unknown
     }
+}
+
+/// An ABI address word: the 12 high bytes must be zero.
+fn word_address(word: &[u8]) -> Option<Address> {
+    if word.len() != 32 || word[..12].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&word[12..]);
+    Some(a)
 }
 
 /// `true` when the amount is 2^256 - 1, the usual "unlimited approval".
@@ -409,6 +444,39 @@ mod tests {
         let mut d = sample_tx();
         d.to = [0x22; 20];
         assert_ne!(a.signing_hash(), d.signing_hash());
+    }
+
+    #[test]
+    fn classify_nft_transfers() {
+        let w = |b: u8| { let mut x = [0u8; 32]; x[12..].copy_from_slice(&[b; 20]); x };
+        let mut d721 = SEL_ERC721_SAFE_TRANSFER.to_vec();
+        d721.extend_from_slice(&w(0xaa));
+        d721.extend_from_slice(&w(0xbb));
+        d721.extend_from_slice(&[7u8; 32]);
+        assert_eq!(classify(&d721), CallKind::Erc721Transfer { from: [0xaa; 20], to: [0xbb; 20] });
+        let mut dirty = d721.clone();
+        dirty[4] = 1; // high byte of the from word
+        assert_eq!(classify(&dirty), CallKind::Unknown);
+        assert_eq!(classify(&d721[..99]), CallKind::Unknown, "wrong length");
+
+        let mut d1155 = SEL_ERC1155_SAFE_TRANSFER.to_vec();
+        d1155.extend_from_slice(&w(0xaa));
+        d1155.extend_from_slice(&w(0xbb));
+        d1155.extend_from_slice(&[7u8; 32]);
+        let mut amount = [0u8; 32];
+        amount[31] = 3;
+        d1155.extend_from_slice(&amount);
+        let mut off = [0u8; 32];
+        off[31] = 0xa0;
+        d1155.extend_from_slice(&off);
+        d1155.extend_from_slice(&[0u8; 32]);
+        assert_eq!(classify(&d1155), CallKind::Erc1155Transfer { from: [0xaa; 20], to: [0xbb; 20], amount });
+        let mut bad_off = d1155.clone();
+        bad_off[163] = 0xc0;
+        assert_eq!(classify(&bad_off), CallKind::Unknown, "data must be the empty bytes at 0xa0");
+        let mut with_data = d1155.clone();
+        with_data[195] = 1;
+        assert_eq!(classify(&with_data), CallKind::Unknown, "non-empty data");
     }
 
     fn calldata(selector: [u8; 4], addr_byte: u8, amount: [u8; 32]) -> Vec<u8> {

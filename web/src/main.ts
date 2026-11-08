@@ -211,6 +211,8 @@ function policySection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
         <div><div class="label">Allowed destinations</div><div class="v">${p.allowed_destinations.map(esc).join('<br>') || 'none'}</div></div>
         <div><div class="label">Allowed spenders</div><div class="v">${p.allowed_spenders.map(esc).join('<br>') || 'none'}</div></div>
         <div><div class="label">Tokens</div><div class="v">${p.tokens.map((t: any) => `${esc(short(t.contract, 8, 6))}: ${esc(t.daily_cap)}/day, approve ≤ ${esc(t.max_approval)}`).join('<br>') || 'none'}</div></div>
+        <div><div class="label">NFT collections</div><div class="v">${(p.nfts ?? []).map((t: any) => `${esc(short(t.contract, 8, 6))}: ${esc(t.daily_count)}/day`).join('<br>') || 'none'}</div></div>
+        <div><div class="label">Agent (proposer)</div><div class="v">${esc(p.proposer ?? 'none')}</div></div>
       </div>`
     : `<p class="muted">Locked: no policy, so nothing can be signed. The first policy of a locked vault applies at once.</p>`;
   const pending = pend
@@ -234,6 +236,8 @@ function policySection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
           <label class="full"><div class="label">Allowed destinations (comma separated)</div><input name="dest" value="${esc(draft.allowed_destinations.join(', '))}" /></label>
           <label class="full"><div class="label">Allowed spenders (comma separated)</div><input name="spenders" value="${esc(draft.allowed_spenders.join(', '))}" /></label>
           <label class="full"><div class="label">Tokens (JSON: [{"contract","daily_cap","max_approval"}])</div><textarea name="tokens" rows="2">${esc(JSON.stringify(draft.tokens))}</textarea></label>
+          <label class="full"><div class="label">NFT collections (JSON: [{"contract","daily_count"}])</div><textarea name="nfts" rows="2">${esc(JSON.stringify(draft.nfts ?? []))}</textarea></label>
+          <label class="full"><div class="label">Agent (proposer): an account that may propose and sign, never change the policy or sell</div><input name="proposer" value="${esc(draft.proposer ?? '')}" placeholder="none" /></label>
           <div class="full"><button class="btn primary">Submit (0.05 NEAR storage deposit, the rest is refunded)</button></div>
         </form></details>`
     : '';
@@ -241,26 +245,30 @@ function policySection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
     <div class="body">${rules}${pending}${form}</div></div>`;
 }
 
-function queueSection(d: VaultData, isOwner: boolean, isGuardian: boolean, frozen: boolean) {
+function queueSection(d: VaultData, isOwner: boolean, isGuardian: boolean, frozen: boolean, isAgent = false) {
+  const canSign = isOwner || isAgent;
   const rows = d.proposals.map((p) => {
     const c = d.checks[p.id];
     const tx = p.tx;
-    const what = tx.data && tx.data !== '0x' ? `token call to ${short(tx.to, 8, 6)} <span class="faint">${esc(short(tx.data, 10, 8))}</span>` : `${ethFmt(tx.value)} to ${esc(short(tx.to, 8, 6))}`;
+    const kind = !tx.data || tx.data === '0x' ? 'eth' : tx.data.startsWith('0x42842e0e') || tx.data.startsWith('0xf242432a') ? 'NFT transfer' : 'token call';
+    const what = kind === 'eth' ? `${ethFmt(tx.value)} to ${esc(short(tx.to, 8, 6))}` : `${kind} on ${short(tx.to, 8, 6)} <span class="faint">${esc(short(tx.data, 10, 8))}</span>`;
     const status = c?.ready ? '<span class="badge ok">ready to sign</span>'
       : Date.now() < p.executable_after_ms ? `<span class="badge warn">waiting ${inTime(p.executable_after_ms)}</span>`
       : `<span class="badge bad" title="${esc(c?.reason)}">refused</span> <span class="faint">${esc(c?.reason ?? '')}</span>`;
     return `<tr><td class="mono">#${esc(p.id)}</td><td class="mono">${what}</td><td>${status}</td><td class="row">
-      ${isOwner ? `<button class="btn small primary" data-action="execute" data-id="${p.id}" ${c?.ready ? '' : 'disabled'}>Sign</button>
-      <button class="btn small" data-action="cancel-proposal" data-id="${p.id}">Cancel</button>` : ''}
+      ${canSign ? `<button class="btn small primary" data-action="execute" data-id="${p.id}" ${c?.ready ? '' : 'disabled'}>Sign</button>` : ''}
+      ${isOwner ? `<button class="btn small" data-action="cancel-proposal" data-id="${p.id}">Cancel</button>` : ''}
       ${isGuardian ? `<button class="btn small danger" data-action="veto-proposal" data-id="${p.id}">Veto</button>` : ''}</td></tr>`;
   }).join('');
-  const form = isOwner && d.policy.has_policy
+  const form = canSign && d.policy.has_policy
     ? `<details style="margin-top:12px"><summary class="btn small" style="display:inline-block">New proposal</summary>
         <form id="propose-form" class="form">
           <label><div class="label">To (EVM address)</div><input name="to" placeholder="0x…" value="${esc(d.policy.policy.allowed_destinations[0] ?? '')}" /></label>
           <label><div class="label">ETH amount</div><input name="value" value="0.0001" /></label>
           <label><div class="label">Or: ERC-20 contract (optional)</div><input name="token" placeholder="0x… (leave empty for ETH)" /></label>
           <label><div class="label">Token amount (base units)</div><input name="amount" placeholder="e.g. 60000000000000" /></label>
+          <label><div class="label">Or: NFT collection (optional)</div><input name="nft" placeholder="0x… (ERC-721 or ERC-1155)" /></label>
+          <label><div class="label">NFT token id · ERC-1155 amount (empty = ERC-721)</div><div class="row"><input name="nft_id" placeholder="id" style="max-width:45%" /><input name="nft_amount" placeholder="amount" style="max-width:45%" /></div></label>
           <div class="full"><button class="btn primary">Propose (0.05 NEAR storage deposit)</button>
           <span class="faint">The fee is taken from Sepolia now; the policy is checked when proposing and again when signing.</span></div>
         </form></details>`
@@ -343,8 +351,9 @@ async function vaultPage(id: string, rid: number) {
   if (rid !== renderId) return;
   const isOwner = !!accountId && accountId === d.owner;
   const isGuardian = !!accountId && d.policy.policy.guardian === accountId;
+  const isAgent = !!accountId && d.policy.policy.proposer === accountId;
   const frozen = !!d.sale && Date.now() < d.sale.closes_at_ms;
-  const role = isOwner ? 'owner' : isGuardian ? 'guardian' : accountId ? 'visitor' : 'not connected';
+  const role = isOwner ? 'owner' : isAgent ? 'agent' : isGuardian ? 'guardian' : accountId ? 'visitor' : 'not connected';
   const pills = [
     d.inflight ? `<span class="badge warn">signature in flight · nonce ${d.inflight.nonce}</span>` : '',
     frozen ? '<span class="badge warn">on sale</span>' : '',
@@ -367,7 +376,7 @@ async function vaultPage(id: string, rid: number) {
       <div><div class="label">Ownership changes</div><div class="v">${esc(d.transfer?.count ?? 0)}</div></div>
     </div></div>
     ${policySection(d, isOwner, isGuardian)}
-    ${queueSection(d, isOwner, isGuardian, frozen)}
+    ${queueSection(d, isOwner, isGuardian, frozen, isAgent)}
     ${signedHtml}
     ${saleSection(d, isOwner, isGuardian)}
     ${auditSection(d)}`;
@@ -383,8 +392,8 @@ function wireVault(d: VaultData) {
   if (policyForm) policyForm.onsubmit = (e) => {
     e.preventDefault();
     const f = new FormData(policyForm);
-    let tokens;
-    try { tokens = JSON.parse(String(f.get('tokens') || '[]')); } catch { return toast('Tokens must be JSON', 'bad'); }
+    let tokens, nfts;
+    try { tokens = JSON.parse(String(f.get('tokens') || '[]')); nfts = JSON.parse(String(f.get('nfts') || '[]')); } catch { return toast('Tokens and NFT collections must be JSON', 'bad'); }
     const policy = {
       chain_id: d.policy.has_policy ? d.policy.policy.chain_id : DEFAULT_CHAIN,
       delay_ms: Math.round(Number(f.get('delay')) * 1000),
@@ -394,6 +403,8 @@ function wireVault(d: VaultData) {
       allowed_destinations: csv(String(f.get('dest'))),
       allowed_spenders: csv(String(f.get('spenders'))),
       tokens,
+      nfts,
+      proposer: String(f.get('proposer') || '').trim() || null,
     };
     act('Set policy', () => call('set_policy', { token_id: t, policy }, nearToYocto('0.05')), (r) =>
       toast(r?.value === true ? 'Policy applied at once' : 'Policy queued: it applies after the delay unless the guardian vetoes it', 'ok'));
@@ -404,10 +415,21 @@ function wireVault(d: VaultData) {
     const f = new FormData(proposeForm);
     const to = String(f.get('to')).trim().toLowerCase();
     const token = String(f.get('token') || '').trim().toLowerCase();
+    const nft = String(f.get('nft') || '').trim().toLowerCase();
+    const word = (x: string | bigint) => (typeof x === 'bigint' ? x.toString(16) : x.replace(/^0x/, '')).padStart(64, '0');
     try {
       const fees = await feeFields(d.chain);
       let tx;
-      if (token) {
+      if (nft) {
+        const id = BigInt(String(f.get('nft_id') || '0'));
+        const amount = String(f.get('nft_amount') || '').trim();
+        const from = d.info.evm_address as string;
+        const data = amount
+          ? '0xf242432a' + word(from) + word(to) + word(id) + word(BigInt(amount)) + word(0xa0n) + word(0n)
+          : '0x42842e0e' + word(from) + word(to) + word(id);
+        const est = BigInt(await eth<string>(d.chain, 'eth_estimateGas', [{ from, to: nft, data }]));
+        tx = { chain_id: d.chain, ...fees, gas_limit: Number((est * 13n) / 10n), to: nft, value: '0', data };
+      } else if (token) {
         const data = '0xa9059cbb' + to.replace(/^0x/, '').padStart(64, '0') + BigInt(String(f.get('amount'))).toString(16).padStart(64, '0');
         const est = BigInt(await eth<string>(d.chain, 'eth_estimateGas', [{ from: d.info.evm_address, to: token, data }]));
         tx = { chain_id: d.chain, ...fees, gas_limit: Number((est * 13n) / 10n), to: token, value: '0', data };

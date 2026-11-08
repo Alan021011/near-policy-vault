@@ -48,7 +48,7 @@ async fn a_proposal_is_signed_after_its_delay() -> anyhow::Result<()> {
 
     let pid = propose(&e, &e.alice, &t, VALUE).await?;
     assert_refused(&execute(&e, &e.alice, &t, pid).await?, "Proposal delay has not passed yet");
-    assert_refused(&execute(&e, &e.stranger, &t, pid).await?, "Only the vault owner can do this");
+    assert_refused(&execute(&e, &e.stranger, &t, pid).await?, "Only the vault owner or its proposer can do this");
 
     advance_ms(&e.worker, 61_000).await?;
     let r = execute(&e, &e.alice, &t, pid).await?;
@@ -324,6 +324,41 @@ async fn a_transfer_call_receiver_cannot_act_as_owner() -> anyhow::Result<()> {
     assert_ok(&r);
     assert!(returned::<bool>(&r)?);
     assert_eq!(owner_of(&e, &t).await?, e.receiver.id().to_string());
+    Ok(())
+}
+
+/// Agent mode (after M12): an agent account named in the policy proposes and signs within the
+/// policy, after the delay; the guardian vetoes one of its proposals; a sale removes the agent.
+#[tokio::test]
+async fn an_agent_spends_within_the_policy_and_the_guardian_can_veto() -> anyhow::Result<()> {
+    let e = setup().await?;
+    let t = mint(&e, &e.alice).await?;
+    let vault_address = view(&e.vault, "vault_info", json!({ "token_id": t })).await?["evm_address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut p = policy(60_000, Some(&e.guardian));
+    p["proposer"] = json!(e.bob.id());
+    assert_ok(&set_policy(&e, &e.alice, &t, p).await?);
+
+    let vetoed = propose(&e, &e.bob, &t, VALUE).await?;
+    let kept = propose(&e, &e.bob, &t, VALUE).await?;
+    assert_ok(&call(&e.guardian, &e.vault, "veto_proposal", json!({ "token_id": t, "proposal_id": vetoed }), yocto(1), 30).await?);
+    assert_refused(&execute(&e, &e.bob, &t, kept).await?, "Proposal delay has not passed yet");
+    advance_ms(&e.worker, 61_000).await?;
+    let r = execute(&e, &e.bob, &t, kept).await?;
+    assert_ok(&r);
+    assert!(returned::<bool>(&r)?, "the agent's proposal was signed");
+    let rec = view(&e.vault, "get_signed", json!({ "token_id": t, "nonce": 0 })).await?;
+    check_signed_record(&rec, &vault_address, DEST, VALUE, 0)?;
+    assert_refused(&set_policy(&e, &e.bob, &t, policy(0, None)).await?, "Only the vault owner can do this");
+
+    // A sale ends the agent's rights with the seller's policy.
+    assert_ok(&start_sale(&e, &e.alice, &t, None, None).await?);
+    advance_ms(&e.worker, 601_000).await?;
+    assert_ok(&call(&e.alice, &e.vault, "nft_transfer", json!({ "receiver_id": e.stranger.id(), "token_id": t }), yocto(1), 30).await?);
+    let r = call(&e.bob, &e.vault, "propose", json!({ "token_id": t, "tx": eth_tx(VALUE) }), millinear(50), 100).await?;
+    assert_refused(&r, "Only the vault owner or its proposer can do this");
     Ok(())
 }
 

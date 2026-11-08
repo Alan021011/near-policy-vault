@@ -21,6 +21,7 @@ const SPENDER: &str = "0x5555555555555555555555555555555555555555";
 const SELLER_EVM: &str = "0x4444444444444444444444444444444444444444";
 const OTHER: &str = "0x9999999999999999999999999999999999999999";
 const ETH_4: u128 = 4_000_000_000_000_000; // 0.004 ETH
+const NFT: &str = "0x6666666666666666666666666666666666666666";
 
 struct Suite {
     rows: Vec<(String, String, Result<String, String>)>,
@@ -127,7 +128,7 @@ async fn attack_suite() -> anyhow::Result<()> {
     let r = set_policy(&e, &e.stranger, &a, policy(0, None)).await?;
     s.refused("auth", "a stranger sets a policy on someone else's vault", &r, "Only the vault owner can do this");
     let r = propose_tx(&e, &e.stranger, &a, eth_tx(1)).await?;
-    s.refused("auth", "a stranger proposes a payment from someone else's vault", &r, "Only the vault owner can do this");
+    s.refused("auth", "a stranger proposes a payment from someone else's vault", &r, "Only the vault owner or its proposer can do this");
     let r = call(&e.stranger, &e.vault, "on_signed", json!({ "token_id": a, "signing_hash": "0x00" }), yocto(0), 30).await?;
     s.refused("4", "anyone calls the signing callback to inject a signature", &r, "Method on_signed is private");
     let r = call(&e.stranger, &e.vault, "on_derived_key", json!({ "token_id": a }), yocto(0), 30).await?;
@@ -311,6 +312,32 @@ async fn attack_suite() -> anyhow::Result<()> {
     let refused = r.logs().iter().any(|l| l.contains("set_policy REFUSED during transfer_call"));
     let back = owner_of(&e, &c).await? == e.alice.id().to_string();
     s.check("13", "the transfer_call receiver acts as owner, then returns the NFT", refused && back, "its set_policy was refused and the NFT came back");
+
+    // ---------- vault E: agent mode and NFTs (after M12) ----------
+    // Bob is the agent (proposer); the guardian keeps its veto; one NFT a day from collection NFT.
+    let ev = mint(&e, &e.alice).await?;
+    let ev_addr = view(&e.vault, "vault_info", json!({ "token_id": ev })).await?["evm_address"].as_str().unwrap().to_string();
+    let mut agent_policy = policy(0, Some(&e.guardian));
+    agent_policy["proposer"] = json!(e.bob.id());
+    agent_policy["nfts"] = json!([{ "contract": NFT, "daily_count": "1" }]);
+    assert_ok(&set_policy(&e, &e.alice, &ev, agent_policy).await?);
+    let r = set_policy(&e, &e.bob, &ev, policy(0, None)).await?;
+    s.refused("agent", "the agent removes the guardian from its own policy", &r, "Only the vault owner can do this");
+    let r = start_sale(&e, &e.bob, &ev, None, None).await?;
+    s.refused("agent", "the agent puts the vault on sale", &r, "Only the vault owner can do this");
+    let r = call(&e.stranger, &e.vault, "propose", json!({ "token_id": ev, "tx": eth_tx(1_000) }), millinear(50), 100).await?;
+    s.refused("auth", "someone who is neither owner nor agent proposes", &r, "Only the vault owner or its proposer can do this");
+    let nft_tx = |from: &str| {
+        let data = format!("0x42842e0e{}{}{}", word_addr(from), word_addr(DEST), word_u128(7));
+        tx(NFT, 0, &data, 30_000, 30)
+    };
+    let r = propose_tx(&e, &e.bob, &ev, nft_tx(OTHER)).await?;
+    s.refused("3", "send an NFT the vault does not own (from another address)", &r, "an NFT transfer must send from the vault's own address");
+    let n1 = returned::<u64>(&propose_tx(&e, &e.bob, &ev, nft_tx(&ev_addr)).await?)?;
+    let n2 = returned::<u64>(&propose_tx(&e, &e.bob, &ev, nft_tx(&ev_addr)).await?)?;
+    assert!(returned::<bool>(&execute(&e, &e.bob, &ev, n1).await?)?, "the agent signs the first NFT transfer");
+    let r = execute(&e, &e.bob, &ev, n2).await?;
+    s.refused("6", "the agent sends more NFTs than the daily count", &r, "NFT daily count exceeded");
 
     // ---------- summary ----------
     let blocked = s.rows.iter().filter(|r| r.2.is_ok()).count();

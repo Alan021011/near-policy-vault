@@ -516,6 +516,62 @@ pub struct PendingPolicy {
     pub apply_after_ms: u64,
 }
 
+/// Policy layout before agent mode and NFTs (kept to migrate stored state).
+#[near(serializers = [borsh])]
+#[derive(Clone)]
+pub struct PolicyV1 {
+    pub chain_id: u64,
+    pub delay_ms: u64,
+    pub guardian: Option<AccountId>,
+    pub eth_daily_cap: U128,
+    pub max_gas_cost: U128,
+    pub allowed_destinations: Vec<String>,
+    pub allowed_spenders: Vec<String>,
+    pub tokens: Vec<policy::TokenRule>,
+}
+
+impl From<PolicyV1> for Policy {
+    fn from(o: PolicyV1) -> Self {
+        Policy {
+            chain_id: o.chain_id,
+            delay_ms: o.delay_ms,
+            guardian: o.guardian,
+            eth_daily_cap: o.eth_daily_cap,
+            max_gas_cost: o.max_gas_cost,
+            allowed_destinations: o.allowed_destinations,
+            allowed_spenders: o.allowed_spenders,
+            tokens: o.tokens,
+            proposer: None,
+            nfts: Vec::new(),
+        }
+    }
+}
+
+#[near(serializers = [borsh])]
+pub struct PendingPolicyV1 {
+    pub policy: PolicyV1,
+    pub apply_after_ms: u64,
+}
+
+#[near(serializers = [borsh])]
+pub struct VaultPolicyStateV1 {
+    pub policy: PolicyV1,
+    pub pending: Option<PendingPolicyV1>,
+    pub spend: SpendState,
+    pub proposals: Vec<Proposal>,
+}
+
+impl From<VaultPolicyStateV1> for VaultPolicyState {
+    fn from(o: VaultPolicyStateV1) -> Self {
+        VaultPolicyState {
+            policy: o.policy.into(),
+            pending: o.pending.map(|p| PendingPolicy { policy: p.policy.into(), apply_after_ms: p.apply_after_ms }),
+            spend: o.spend,
+            proposals: o.proposals,
+        }
+    }
+}
+
 /// Everything the contract stores about a vault's policy. Removed on every change of owner.
 #[near(serializers = [borsh])]
 #[derive(Clone, Debug, PartialEq)]
@@ -614,14 +670,15 @@ pub struct TxInput {
 }
 
 /// Longest calldata accepted: ERC-20 `transfer`/`approve` are exactly 68 bytes.
-pub const MAX_CALLDATA_LEN: usize = 68;
+/// Longest calldata the contract signs: an ERC-1155 `safeTransferFrom` with empty data.
+pub const MAX_CALLDATA_LEN: usize = 196;
 
 impl TxInput {
     pub fn to_tx(&self) -> Result<Eip1559Tx, String> {
         let to = policy::parse_address(&self.to).ok_or("malformed `to` address")?;
         let data = policy::parse_hex(&self.data).ok_or("malformed `data` hex")?;
         if data.len() > MAX_CALLDATA_LEN {
-            return Err("calldata longer than 68 bytes".into());
+            return Err("calldata longer than 196 bytes".into());
         }
         Ok(Eip1559Tx {
             chain_id: self.chain_id,
@@ -717,6 +774,32 @@ impl PolicyVault {
             next_sale_id: old.next_sale_id,
             transfer_calls: LookupMap::new(StorageKey::TransferCalls),
         }
+    }
+
+    /// Converts stored policies written before agent mode and NFTs (two new Policy fields) to the
+    /// current layout, for token ids in [from, from + limit). Only the contract account can call
+    /// it. Idempotent: entries already in the current layout are left alone. Returns how many
+    /// entries it converted.
+    #[private]
+    pub fn migrate_policies(&mut self, from: u64, limit: u64) -> u64 {
+        use near_sdk::borsh::BorshDeserialize;
+        use near_sdk::IntoStorageKey;
+        let prefix = StorageKey::Policies.into_storage_key();
+        let end = self.next_token_id.min(from.saturating_add(limit));
+        let mut converted = 0;
+        for id in from..end {
+            let mut key = prefix.clone();
+            key.extend(near_sdk::borsh::to_vec(&id.to_string()).expect("borsh"));
+            let Some(raw) = env::storage_read(&key) else { continue };
+            if VaultPolicyState::try_from_slice(&raw).is_ok() {
+                continue;
+            }
+            let old = VaultPolicyStateV1::try_from_slice(&raw)
+                .unwrap_or_else(|_| env::panic_str(&format!("policy of token {id} is in neither layout")));
+            env::storage_write(&key, &near_sdk::borsh::to_vec(&VaultPolicyState::from(old)).expect("borsh"));
+            converted += 1;
+        }
+        converted
     }
 
     /// Opens a sale window (M8). Only the owner, with a deposit that covers its storage. The
@@ -1234,7 +1317,8 @@ impl PolicyVault {
         let Some(st) = self.policies.get(&token_id) else {
             return refused("vault has no policy (locked)".into(), hash);
         };
-        match policy::check(&st.policy, &st.spend, &tx, env::block_timestamp_ms()) {
+        let vault = self.vault_address(&token_id);
+        match policy::check_with_vault(&st.policy, &st.spend, &tx, env::block_timestamp_ms(), vault.as_deref()) {
             Ok(r) => CheckResult { allowed: true, reason: None, signing_hash: hash, reservation: Some(r) },
             Err(e) => refused(e.to_string(), hash),
         }
@@ -1253,6 +1337,25 @@ impl PolicyVault {
         require!(env::predecessor_account_id() == owner, "Only the vault owner can do this");
         self.assert_no_transfer_call(token_id);
         owner
+    }
+
+    /// The caller must own the vault or be the proposer named in its policy (agent mode), and the
+    /// vault must not be in an unresolved transfer_call. Returns the caller.
+    fn assert_owner_or_proposer(&self, token_id: &TokenId) -> AccountId {
+        let caller = env::predecessor_account_id();
+        let owner = self.owner_of(token_id);
+        let proposer = self.policies.get(token_id).and_then(|s| s.policy.proposer);
+        require!(
+            caller == owner || proposer.as_ref() == Some(&caller),
+            "Only the vault owner or its proposer can do this"
+        );
+        self.assert_no_transfer_call(token_id);
+        caller
+    }
+
+    /// The vault's EVM address (`0x` lowercase), once resolved.
+    fn vault_address(&self, token_id: &TokenId) -> Option<String> {
+        self.vaults.get(token_id).filter(|v| v.resolved).map(|v| hex0x(&v.evm_address))
     }
 
     fn policy_state(&self, token_id: &TokenId) -> VaultPolicyState {
@@ -1292,7 +1395,7 @@ impl PolicyVault {
             env::attached_deposit() >= NearToken::from_yoctonear(1),
             "Requires attached deposit of at least 1 yoctoNEAR"
         );
-        let owner = self.assert_owner(&token_id);
+        let caller = self.assert_owner_or_proposer(&token_id);
         let before = env::storage_usage();
         let mut st = self
             .policies
@@ -1303,7 +1406,8 @@ impl PolicyVault {
         let candidate = tx.to_tx(0).unwrap_or_else(|e| env::panic_str(&e));
         let now = env::block_timestamp_ms();
         st.spend.prune_expired(now);
-        let reservation = policy::check(&st.policy, &st.spend, &candidate, now)
+        let vault = self.vault_address(&token_id);
+        let reservation = policy::check_with_vault(&st.policy, &st.spend, &candidate, now, vault.as_deref())
             .unwrap_or_else(|e| env::panic_str(&e.to_string()));
         let id = self.next_proposal_id;
         self.next_proposal_id += 1;
@@ -1317,11 +1421,11 @@ impl PolicyVault {
             executable_after_ms,
         });
         self.policies.insert(&token_id, &st);
-        settle_storage(before, &owner);
+        settle_storage(before, &caller);
         emit_policy_event(
             "proposal_created",
             &token_id,
-            json!({ "proposal_id": id, "executable_after_ms": executable_after_ms }),
+            json!({ "proposal_id": id, "executable_after_ms": executable_after_ms, "by": caller }),
         );
         id
     }
@@ -1419,9 +1523,11 @@ impl PolicyVault {
         replace_nonce: Option<u64>,
         sign_deposit: Option<U128>,
     ) -> Promise {
-        let owner = self.assert_owner(&token_id);
+        // The owner, or the policy's proposer (agent mode): either way the proposal already
+        // waited the delay and the guardian could veto it.
+        let caller = self.assert_owner_or_proposer(&token_id);
         self.assert_can_sign(&token_id);
-        // M8: a vault on sale only signs cancellations, so the buyer audits a stable state.
+        // M8: a vault on sale only signs cancellations, so the buyer can audit a stable state.
         require!(
             self.active_sale(&token_id).is_none(),
             "The vault is frozen for a sale; only cancel_nonce can sign until the sale ends"
@@ -1438,7 +1544,7 @@ impl PolicyVault {
             signing_hash,
             charge: prep.charge,
             charged,
-            payer: owner,
+            payer: caller,
             started_ms: now,
         };
         self.start_signing(&token_id, f, before, sign_deposit)
@@ -1901,7 +2007,8 @@ impl PolicyVault {
             (None, None) => (next, true),
         };
         let tx = p.tx.to_tx(nonce)?;
-        let charge = policy::check(&st.policy, &st.spend, &tx, now_ms)
+        let vault = self.vault_address(token_id);
+        let charge = policy::check_with_vault(&st.policy, &st.spend, &tx, now_ms, vault.as_deref())
             .map_err(|e| format!("Policy now refuses it: {e}"))?;
         Ok(PreparedExecution { tx, charge, from_next })
     }
@@ -2689,6 +2796,8 @@ mod tests {
             allowed_destinations: vec![DEST.into()],
             allowed_spenders: vec![],
             tokens: vec![],
+            proposer: None,
+            nfts: vec![],
         }
     }
 
@@ -2880,12 +2989,12 @@ mod tests {
         let mut bad_hex = tx_input(1);
         bad_hex.data = "0xzz".into();
         let mut too_long = tx_input(0);
-        too_long.data = format!("0x{}", "00".repeat(69));
+        too_long.data = format!("0x{}", "00".repeat(197));
         let cases = [
             (tx_input(10_u128.pow(18)), "ETH daily cap exceeded"),
             (stranger, "destination not allowed"),
             (bad_hex, "malformed `data` hex"),
-            (too_long, "calldata longer than 68 bytes"),
+            (too_long, "calldata longer than 196 bytes"),
         ];
         for (input, reason) in cases {
             let r = c.check_transaction("0".into(), input);
@@ -3215,7 +3324,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Only the vault owner can do this")]
+    #[should_panic(expected = "Only the vault owner or its proposer can do this")]
     fn stranger_cannot_propose() {
         let (mut c, _) = vault_with_policy();
         propose_as(&mut c, &accounts(3), 1, T0_MS + 10);
@@ -3421,6 +3530,173 @@ mod tests {
         let id = c.propose("0".into(), a1_ptx());
         ctx_at(alice.clone(), EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
         (c, alice, id)
+    }
+
+    // ---------- agent mode (after M12) ----------
+
+    /// The A1 vault with `agent` named as the proposer of its policy.
+    fn a1_with_agent() -> (PolicyVault, AccountId, AccountId) {
+        let alice = accounts(1);
+        let agent = accounts(3);
+        let mut c = setup_with_vault(alice.clone());
+        assert!(c.on_derived_key("0".into(), Ok(A1_KEY.into())));
+        let mut p = test_policy(100_000_000_000_000_000);
+        p.allowed_destinations = vec![A1_ADDR.into()];
+        p.proposer = Some(agent.clone());
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS);
+        assert!(c.set_policy("0".into(), p), "first policy of a locked vault applies at once");
+        (c, alice, agent)
+    }
+
+    #[test]
+    fn the_agent_proposes_and_signs_after_the_delay() {
+        let (mut c, _, agent) = a1_with_agent();
+        ctx_at(agent.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), a1_ptx());
+        ctx_at(agent.clone(), EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert_eq!(c.get_inflight("0".into()).expect("in flight").payer, agent, "the agent pays the signature");
+        assert!(answer(&mut c, ok(&a1_response())));
+        assert!(c.get_signed("0".into(), 0).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "Proposal delay has not passed yet")]
+    fn the_agent_waits_the_delay_too() {
+        let (mut c, _, agent) = a1_with_agent();
+        ctx_at(agent.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), a1_ptx());
+        ctx_at(agent, EXEC_DEPOSIT, T0_MS + 20);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+    }
+
+    #[test]
+    fn the_guardian_vetoes_an_agent_proposal() {
+        let (mut c, _, agent) = a1_with_agent();
+        ctx_at(agent, POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), a1_ptx());
+        ctx_at(guardian(), ONE_YOCTO, T0_MS + 20);
+        c.veto_proposal("0".into(), id);
+        assert!(c.list_proposals("0".into()).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn the_agent_cannot_change_the_policy() {
+        let (mut c, _, agent) = a1_with_agent();
+        ctx_at(agent, POLICY_DEPOSIT, T0_MS + 10);
+        c.set_policy("0".into(), test_policy(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn the_agent_cannot_start_a_sale() {
+        let (mut c, _, agent) = a1_with_agent();
+        ctx_at(agent, POLICY_DEPOSIT, T0_MS + 10);
+        let _ = c.start_sale("0".into(), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn the_agent_cannot_cancel_a_nonce() {
+        let (mut c, _, agent) = a1_with_agent();
+        ctx_at(agent, EXEC_DEPOSIT, T0_MS + 10);
+        let _ = c.cancel_nonce("0".into(), 0, U128(30_000_000_000), U128(1_000_000_000), None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner can do this")]
+    fn the_agent_cannot_cancel_the_owners_proposal() {
+        let (mut c, alice, agent) = a1_with_agent();
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), a1_ptx());
+        ctx_at(agent, ONE_YOCTO, T0_MS + 20);
+        c.cancel_proposal("0".into(), id);
+    }
+
+    #[test]
+    #[should_panic(expected = "Sender not approved")]
+    fn the_agent_cannot_transfer_the_vault() {
+        let (mut c, _, agent) = a1_with_agent();
+        open_sale(&mut c);
+        ctx_at(agent, ONE_YOCTO, T0_MS + 10);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+    }
+
+    #[test]
+    fn naming_an_agent_waits_the_delay_and_removing_it_is_immediate() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS);
+        assert!(c.set_policy("0".into(), test_policy(1_000)));
+        let mut with_agent = test_policy(1_000);
+        with_agent.proposer = Some(accounts(3));
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        assert!(!c.set_policy("0".into(), with_agent.clone()), "a new agent is a loosening");
+        assert!(c.get_policy("0".into()).policy.proposer.is_none(), "not yet");
+        ctx_at(accounts(5), NearToken::from_yoctonear(0), T0_MS + 10 + HOUR_MS);
+        c.apply_policy("0".into());
+        assert_eq!(c.get_policy("0".into()).policy.proposer, Some(accounts(3)));
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        assert!(c.set_policy("0".into(), test_policy(1_000)), "removing the agent tightens");
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the vault owner or its proposer can do this")]
+    fn a_sale_removes_the_agent() {
+        let (mut c, alice, agent) = a1_with_agent();
+        open_sale(&mut c);
+        ctx_at(alice, ONE_YOCTO, T0_MS + 10);
+        c.nft_transfer(accounts(2), "0".into(), None, None);
+        ctx_at(agent, POLICY_DEPOSIT, T0_MS + 20);
+        let _ = c.propose("0".into(), a1_ptx());
+    }
+
+    // ---------- migration of stored policies (after M12) ----------
+
+    #[test]
+    fn stored_policies_from_before_agent_mode_are_migrated() {
+        use near_sdk::IntoStorageKey;
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice);
+        let old = VaultPolicyStateV1 {
+            policy: PolicyV1 {
+                chain_id: 11155111,
+                delay_ms: HOUR_MS,
+                guardian: Some(guardian()),
+                eth_daily_cap: U128(5),
+                max_gas_cost: U128(7),
+                allowed_destinations: vec![DEST.into()],
+                allowed_spenders: vec![],
+                tokens: vec![],
+            },
+            pending: Some(PendingPolicyV1 {
+                policy: PolicyV1 {
+                    chain_id: 11155111,
+                    delay_ms: 0,
+                    guardian: None,
+                    eth_daily_cap: U128(9),
+                    max_gas_cost: U128(7),
+                    allowed_destinations: vec![],
+                    allowed_spenders: vec![],
+                    tokens: vec![],
+                },
+                apply_after_ms: 42,
+            }),
+            spend: SpendState::default(),
+            proposals: vec![],
+        };
+        let mut key = StorageKey::Policies.into_storage_key();
+        key.extend(near_sdk::borsh::to_vec(&"0".to_string()).unwrap());
+        env::storage_write(&key, &near_sdk::borsh::to_vec(&old).unwrap());
+        assert_eq!(c.migrate_policies(0, 10), 1);
+        let p = c.get_policy("0".into());
+        assert!(p.has_policy);
+        assert_eq!((p.policy.delay_ms, p.policy.eth_daily_cap.0, p.policy.proposer.clone()), (HOUR_MS, 5, None));
+        assert!(p.policy.nfts.is_empty());
+        let pending = p.pending.expect("pending kept");
+        assert_eq!((pending.apply_after_ms, pending.policy.eth_daily_cap.0), (42, 9));
+        assert_eq!(c.migrate_policies(0, 10), 0, "idempotent: nothing left to convert");
     }
 
     #[test]
@@ -3772,7 +4048,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Only the vault owner can do this")]
+    #[should_panic(expected = "Only the vault owner or its proposer can do this")]
     fn stranger_cannot_execute() {
         let (mut c, _, id) = ready_a1_proposal();
         ctx_at(accounts(3), EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
