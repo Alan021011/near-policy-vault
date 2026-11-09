@@ -4,7 +4,7 @@ import { NearConnector } from '@hot-labs/near-connect';
 const params = new URLSearchParams(location.search);
 const DEFAULT_CONTRACT = 'm3.alan-vault-2026.testnet';
 /** SHA-256 of the contract build published in the repository (README "How to verify"). */
-export const EXPECTED_CODE = '9407e9669863c733677edd84a0f7b37c05986493f563e3126228f25bbd469843';
+export const EXPECTED_CODE = '7d4dbb6bddb1eef996dd43bc44aa8b42b9d14a53e34ff3304ad2b5841160000a';
 // Review M12 (R12-1, R12-2): URL parameters are only accepted when well formed, and any override
 // is shown and makes the audit refuse to say SAFE.
 const ACCOUNT_RE = /^(?=.{2,64}$)[a-z0-9]+([-_][a-z0-9]+)*(\.[a-z0-9]+([-_][a-z0-9]+)*)*$/;
