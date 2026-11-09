@@ -31,6 +31,7 @@
 //! `buy`), and the general review after M8 (H1: no owner action while a `transfer_call` is
 //! unresolved). The threats they address are in docs/THREAT_MODEL.md.
 
+pub mod art;
 pub mod evm;
 pub mod policy;
 
@@ -1353,6 +1354,40 @@ impl PolicyVault {
         caller
     }
 
+    /// M26: puts the vault's live SVG card in the token's `media` (computed on every read; nothing
+    /// is stored, so the image follows the rules as soon as they change).
+    fn with_image(&self, mut t: Token) -> Token {
+        let id = t.token_id.clone();
+        let stored = self.policies.get(&id);
+        let address = self.vault_address(&id);
+        let chain_id = self
+            .vault_chain
+            .get(&id)
+            .or_else(|| stored.as_ref().map(|s| s.policy.chain_id))
+            .unwrap_or(11155111);
+        let rules = stored.as_ref().map(|s| art::CardRules {
+            eth_daily_cap_wei: s.policy.eth_daily_cap.0,
+            delay_ms: s.policy.delay_ms,
+            guardian: s.policy.guardian.as_ref().map(|g| g.as_str()),
+            agent: s.policy.proposer.as_ref().map(|a| a.as_str()),
+            nft_collections: s.policy.nfts.len(),
+            tokens: s.policy.tokens.len(),
+        });
+        let card = art::VaultCard {
+            token_id: &id,
+            evm_address: address.as_deref(),
+            chain_id,
+            rules,
+            handover_open: self.active_sale(&id).is_some(),
+            signing: self.inflight.get(&id).is_some(),
+        };
+        if let Some(m) = t.metadata.as_mut() {
+            m.media = Some(art::vault_media(&card));
+            m.media_hash = None;
+        }
+        t
+    }
+
     /// The vault's EVM address (`0x` lowercase), once resolved.
     fn vault_address(&self, token_id: &TokenId) -> Option<String> {
         self.vaults.get(token_id).filter(|v| v.resolved).map(|v| hex0x(&v.evm_address))
@@ -2185,7 +2220,7 @@ impl NonFungibleTokenCore for PolicyVault {
     }
 
     fn nft_token(&self, token_id: TokenId) -> Option<Token> {
-        self.tokens.nft_token(token_id)
+        self.tokens.nft_token(token_id).map(|t| self.with_image(t))
     }
 }
 
@@ -2272,7 +2307,7 @@ impl NonFungibleTokenEnumeration for PolicyVault {
     }
 
     fn nft_tokens(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<Token> {
-        self.tokens.nft_tokens(from_index, limit)
+        self.tokens.nft_tokens(from_index, limit).into_iter().map(|t| self.with_image(t)).collect()
     }
 
     fn nft_supply_for_owner(&self, account_id: AccountId) -> U128 {
@@ -2285,7 +2320,7 @@ impl NonFungibleTokenEnumeration for PolicyVault {
         from_index: Option<U128>,
         limit: Option<u64>,
     ) -> Vec<Token> {
-        self.tokens.nft_tokens_for_owner(account_id, from_index, limit)
+        self.tokens.nft_tokens_for_owner(account_id, from_index, limit).into_iter().map(|t| self.with_image(t)).collect()
     }
 }
 
@@ -4758,5 +4793,43 @@ mod tests {
         let key = signed_version_key(&record.token_id, record.nonce, u32::MAX);
         let bytes = near_sdk::borsh::to_vec(&record).unwrap().len() + near_sdk::borsh::to_vec(&key).unwrap().len() + 40 + 1;
         assert!((bytes as u64) <= SIGNED_RECORD_RESERVE_BYTES, "record needs {bytes} bytes");
+    }
+
+    // ---------- M26: the vault NFT draws its current state ----------
+    fn media_svg(c: &PolicyVault) -> String {
+        let media = c.nft_token("0".into()).unwrap().metadata.unwrap().media.unwrap();
+        let enc = media.strip_prefix("data:image/svg+xml;charset=utf-8,").expect("an SVG data URI");
+        let mut out = Vec::new();
+        let b = enc.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                out.push(u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap(), 16).unwrap());
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_vault_image_follows_its_rules() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        assert!(c.on_derived_key("0".into(), Ok(A1_KEY.into())));
+        let before = media_svg(&c);
+        assert!(before.contains("Vault #0") && before.contains("NO RULES YET"));
+        let mut p = test_policy(1_000_000_000_000_000);
+        p.allowed_destinations = vec![A1_ADDR.into()];
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS);
+        assert!(c.set_policy("0".into(), p));
+        let after = media_svg(&c);
+        assert!(after.contains("RULES ACTIVE") && after.contains("0.001 ETH") && after.contains(guardian().as_str()));
+        assert_ne!(before, after);
+        // the enumeration methods carry the same image
+        let listed = c.nft_tokens(None, None)[0].metadata.clone().unwrap().media;
+        assert_eq!(listed, c.nft_token("0".into()).unwrap().metadata.unwrap().media);
     }
 }
