@@ -3,6 +3,16 @@ name = "policy-vault"
 version = "0.1.0"
 edition = "2021"
 publish = false
+repository = "https://github.com/Alan021011/near-policy-vault"
+
+# M22: reproducible build. `cargo near build reproducible-wasm` runs this pinned image (the same
+# cargo-near 0.22.0 and Rust 1.99.1 as the author's machine), so anyone can rebuild the deployed
+# wasm byte for byte from a clean checkout of the commit.
+[package.metadata.near.reproducible_build]
+image = "sourcescan/cargo-near:0.22.0-rust-1.99.1"
+image_digest = "sha256:c9655eaf7436b90c87ea8b25739f91063032c5c30ba24cfeafe72c142943b5bb"
+passed_env = []
+container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked", "--no-abi"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
