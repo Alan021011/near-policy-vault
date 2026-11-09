@@ -141,7 +141,7 @@ async function homePage(id: number) {
       <div class="feature"><div class="ico">◷</div><h3>Waiting time</h3><p>Nothing is paid instantly. Every payment waits before it is signed, so there is time to react.</p></div>
       <div class="feature"><div class="ico">✋</div><h3>Human veto</h3><p>A guardian can stop any payment while it waits. The agent can never change the rules.</p></div>
     </div>
-    <p class="faint small-note">No private key for the vault's Ethereum account exists: NEAR Chain Signatures signs only what the contract checked. Testnet and test funds only.</p>
+    <p class="faint small-note">No single party holds the key to the vault's Ethereum account: NEAR Chain Signatures, an MPC network, signs only what the contract checked. Testnet and test funds only.</p>
     <div class="section-head"><h2>Live demo vaults</h2><span class="spacer"></span>
       <form id="open" class="row"><input id="open-id" class="mono" style="max-width:110px" placeholder="vault #" inputmode="numeric" aria-label="Vault number" /><button class="btn small">Open</button></form></div>
     <div class="grid demo-grid">
@@ -351,7 +351,8 @@ function queueSection(d: VaultData, isOwner: boolean, isGuardian: boolean, froze
 
 /** The recorded runs of the payments agent, each line linked to its NEAR and Sepolia transactions. */
 function agentSection(d: VaultData) {
-  const runs = AGENT_RUNS[d.id];
+  // Review M21 (R21-9): the recorded runs belong to the default contract only.
+  const runs = OVERRIDDEN ? undefined : AGENT_RUNS[d.id];
   if (!runs) return '';
   const chip = (o: AgentStep['outcome']) => ({
     paid: '<span class="chip paid">Paid</span>',
@@ -363,7 +364,7 @@ function agentSection(d: VaultData) {
   return `<div class="card"><header><h2>What the agent tried — and what stopped it</h2><span class="spacer"></span>
       <a href="https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml" target="_blank" rel="noreferrer">49 attacks blocked in CI →</a></header>
     <div class="body">
-      <p class="muted">A payments agent (<span class="mono">scripts/agent.mjs</span>) reads four invoices and tries to pay them. It holds no key: the contract checks every request, and a person can stop what is inside the rules but wrong. Recorded runs on testnet; every line links to its transaction.</p>
+      <p class="muted">A payments agent (<span class="mono">scripts/agent.mjs</span>) reads four invoices and tries to pay them. It holds no key to the vault’s account: the contract checks every request, and a person can stop what is inside the rules but wrong. Recorded runs on testnet; every line links to its transaction.</p>
       ${runs.map((r) => `<h3 class="run-title">${esc(r.title)} <span class="faint">· ${esc(r.when)}</span></h3>
         <ol class="timeline">${r.steps.map((st) => `<li class="${st.outcome}">
           <div class="tl-req">“${esc(st.request)}”</div>
@@ -399,7 +400,8 @@ async function signedSection(d: VaultData, isOwner: boolean) {
   const rows = d.signed.map((r, i) => {
     const st = statuses[i];
     const pill = st === 'mined' ? 'ok' : st === 'not mined' ? 'warn' : st === 'checking' ? '' : 'bad';
-    const label = { mined: 'paid', 'not mined': 'not sent yet', checking: 'checking…', replaced: 'replaced', reverted: 'failed on chain' }[st] ?? st;
+    const cancel = r.proposal_id > 1e18;
+    const label = cancel && st === 'mined' ? 'cancellation mined' : ({ mined: 'paid', 'not mined': 'not sent yet', checking: 'checking…', replaced: 'replaced', reverted: 'failed on chain' }[st] ?? st);
     const kind = r.proposal_id > 1e18 ? 'cancellation' : `request #${r.proposal_id}`;
     return `<tr><td class="mono">${esc(r.nonce)}</td><td>${kind}</td><td>${txLink(d.chain, r.tx_hash)}</td><td><span class="badge ${pill}">${label}</span></td><td class="row">
       ${st === 'not mined' ? `<button class="btn small" data-action="broadcast" data-raw="${esc(r.signed_tx)}">Send to Ethereum</button>` : ''}
@@ -591,8 +593,12 @@ app.addEventListener('click', async (e) => {
       return act('Approve & send', () => call('execute_proposal', { token_id: t, proposal_id: pid }, nearToYocto('0.02'), 300n), async (r) => {
         const signed = events(r.logs, 'transaction_signed')[0];
         if (r?.value !== true || !signed) {
-          const why = events(r.logs, 'signature_failed')[0] ?? events(r.logs, 'signature_uncertain')[0];
-          return toast(`Not signed: ${human(JSON.stringify(why ?? {}))}`, 'bad');
+          // Review M21 (R21-9): explain the outcome instead of showing raw JSON.
+          const uncertain = events(r.logs, 'signature_uncertain')[0];
+          const failed = events(r.logs, 'signature_failed')[0];
+          if (uncertain)
+            return toast('The signing result is unknown (the signer did not answer clearly). The payment stays reserved and its number is kept: "Approve & send" again produces the very same transaction, so it can be paid at most once.', 'bad', JSON.stringify(uncertain));
+          return toast('Not signed: the answer did not match the vault’s key, so nothing was charged and the request is back in the queue.', 'bad', JSON.stringify(failed ?? {}));
         }
         try {
           const h = await eth<string>(d.chain, 'eth_sendRawTransaction', [signed.signed_tx]);

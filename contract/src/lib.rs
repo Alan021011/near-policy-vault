@@ -93,7 +93,7 @@ pub const GAS_FOR_SIGN_CALLBACK: Gas = Gas::from_tgas(20);
 /// outcome uncertain, which wastes a nonce and the charge.
 pub const MIN_PREPAID_GAS_FOR_SIGNING: Gas = Gas::from_tgas(100);
 /// Storage paid at execution for the signed record written later by the callback.
-pub const SIGNED_RECORD_RESERVE_BYTES: u64 = 1000;
+pub const SIGNED_RECORD_RESERVE_BYTES: u64 = 1200;
 /// After this long without an answer the owner may abandon a signature (review S2). Far above
 /// the MPC network's own timeout (about 200 blocks).
 pub const INFLIGHT_TIMEOUT_MS: u64 = 3_600_000;
@@ -1526,6 +1526,12 @@ impl PolicyVault {
         // The owner, or the policy's proposer (agent mode): either way the proposal already
         // waited the delay and the guardian could veto it.
         let caller = self.assert_owner_or_proposer(&token_id);
+        // Review M21 (R21-4): replacing a nonce that was already signed is the owner's call; an
+        // agent could otherwise re-sign the owner's nonces and charge the caps again.
+        require!(
+            replace_nonce.is_none() || caller == self.owner_of(&token_id),
+            "Only the vault owner can replace a signed nonce"
+        );
         self.assert_can_sign(&token_id);
         // M8: a vault on sale only signs cancellations, so the buyer can audit a stable state.
         require!(
@@ -1772,7 +1778,9 @@ impl PolicyVault {
 
     /// Records the signature in flight, settles the storage deposit and calls the signer.
     fn start_signing(&mut self, token_id: &TokenId, f: InFlight, before: u64, sign_deposit: Option<U128>) -> Promise {
-        let deposit = sign_deposit.map(|d| NearToken::from_yoctonear(d.0)).unwrap_or(SIGN_DEPOSIT);
+        // Review M21 (R21-1): a deposit below the minimum makes the signer refuse, which leaves the
+        // nonce uncertain and the cap charged; never forward less than the minimum.
+        let deposit = sign_deposit.map(|d| NearToken::from_yoctonear(d.0)).unwrap_or(SIGN_DEPOSIT).max(SIGN_DEPOSIT);
         // G2: the first signature fixes the vault's chain (its nonce counter belongs to it).
         if self.vault_chain.get(token_id).is_none() {
             self.vault_chain.insert(token_id, &f.tx.chain_id);
@@ -1882,7 +1890,9 @@ impl PolicyVault {
     fn requeue(&mut self, token_id: &TokenId, f: &InFlight, pin: Option<u64>) -> bool {
         let Some(p) = &f.proposal else { return false };
         let Some(mut st) = self.policies.get(token_id) else { return false };
-        if p.owner_epoch != self.owner_epoch(token_id) || st.proposals.len() >= MAX_QUEUED_PROPOSALS {
+        // Review M21 (R21-3): room for one more than the limit, so a full queue (for example filled
+        // by an agent while the signature was in flight) never drops the proposal.
+        if p.owner_epoch != self.owner_epoch(token_id) || st.proposals.len() > MAX_QUEUED_PROPOSALS {
             return false;
         }
         st.proposals.insert(0, p.clone());
@@ -2008,7 +2018,16 @@ impl PolicyVault {
         };
         let tx = p.tx.to_tx(nonce)?;
         let vault = self.vault_address(token_id);
-        let charge = policy::check_with_vault(&st.policy, &st.spend, &tx, now_ms, vault.as_deref())
+        // Review M21 (R21-1): an identical retry of an uncertain nonce is not charged again
+        // (commit_execution), so it is checked against the windows without its own earlier
+        // charge; otherwise a vault more than half way to its cap could never retry.
+        let mut spend = st.spend.clone();
+        if self.is_uncertain(token_id, nonce, &hex0x(&tx.signing_hash())) {
+            if let Ok(own) = policy::check_with_vault(&st.policy, &policy::SpendState::default(), &tx, now_ms, vault.as_deref()) {
+                spend.release(&own);
+            }
+        }
+        let charge = policy::check_with_vault(&st.policy, &spend, &tx, now_ms, vault.as_deref())
             .map_err(|e| format!("Policy now refuses it: {e}"))?;
         Ok(PreparedExecution { tx, charge, from_next })
     }
@@ -4620,5 +4639,124 @@ mod tests {
         ctx_at(alice, ONE_YOCTO, T0_MS);
         c.nft_transfer(accounts(2), "0".into(), None, Some(" Sale: 9999 ".into()));
         assert_eq!(c.nft_token("0".into()).unwrap().owner_id, accounts(2));
+    }
+
+    // ---------- Review M21: the reviewer's tests, turned around to check the fixes ----------
+    fn m21_ptx(value: u128) -> ProposalTx {
+        let mut p = a1_ptx();
+        p.value = U128(value);
+        p
+    }
+
+    fn forwarded_sign_deposit() -> Option<NearToken> {
+        get_created_receipts()
+            .into_iter()
+            .filter(|r| r.receiver_id == signer())
+            .flat_map(|r| r.actions)
+            .find_map(|a| match a {
+                MockAction::FunctionCallWeight { method_name, attached_deposit, .. } if method_name == b"sign" => Some(attached_deposit),
+                _ => None,
+            })
+    }
+
+    /// R21-1 (a): a sign_deposit below the minimum is raised to the minimum, so the signer never
+    /// refuses for lack of deposit.
+    #[test]
+    fn a_zero_sign_deposit_is_raised_to_the_minimum() {
+        let (mut c, _, agent) = a1_with_agent();
+        ctx_at(agent.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), m21_ptx(1));
+        ctx_at(agent, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, None, Some(U128(0)));
+        assert_eq!(forwarded_sign_deposit(), Some(SIGN_DEPOSIT));
+    }
+
+    /// R21-1 (b): after an uncertain outcome, the identical retry is checked without its own
+    /// earlier charge, so a vault more than half way to its cap can still retry (and it is not
+    /// charged twice).
+    #[test]
+    fn an_uncertain_retry_is_not_blocked_by_its_own_charge() {
+        let (mut c, alice, agent) = a1_with_agent();
+        ctx_at(agent.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), m21_ptx(60_000_000_000_000_000)); // 0.06 ETH of a 0.1 ETH cap
+        ctx_at(agent, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert!(!answer(&mut c, near_sdk::PromiseResult::Failed)); // uncertain: nonce and charge kept
+        let spent = c.get_policy("0".into()).spend.eth.spent.0;
+        assert!(spent > 60_000_000_000_000_000);
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 20 + HOUR_MS);
+        let check = c.check_execution("0".into(), id);
+        assert!(check.ready, "the identical retry can run: {:?}", check.reason);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        let f = c.get_inflight("0".into()).expect("retry in flight");
+        assert_eq!((f.nonce, f.charged), (0, false), "same nonce, not charged again");
+        assert_eq!(c.get_policy("0".into()).spend.eth.spent.0, spent);
+    }
+
+    /// R21-3: a proposal put back after a failed signature is kept even if the queue was filled
+    /// while it was in flight.
+    #[test]
+    fn a_full_queue_never_drops_a_proposal_after_a_failed_signature() {
+        let (mut c, alice, agent) = a1_with_agent();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), m21_ptx(50_000_000_000_000_000));
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        for i in 0..MAX_QUEUED_PROPOSALS as u64 {
+            ctx_at(agent.clone(), POLICY_DEPOSIT, T0_MS + 10 + HOUR_MS + 1 + i);
+            c.propose("0".into(), m21_ptx(1));
+        }
+        assert!(!answer(&mut c, near_sdk::PromiseResult::Failed));
+        assert!(c.list_proposals("0".into()).iter().any(|p| p.id == id), "the owner's proposal is back");
+        assert_eq!(c.pinned.get(&id), Some(0), "pinned to its uncertain nonce");
+    }
+
+    /// R21-4: only the owner can re-sign a nonce that was already signed.
+    #[test]
+    #[should_panic(expected = "Only the vault owner can replace a signed nonce")]
+    fn the_agent_cannot_replace_a_signed_nonce() {
+        let (mut c, alice, agent) = a1_with_agent();
+        ctx_at(alice.clone(), POLICY_DEPOSIT, T0_MS + 10);
+        let id = c.propose("0".into(), a1_ptx());
+        ctx_at(alice, EXEC_DEPOSIT, T0_MS + 10 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id, None, None);
+        assert!(answer(&mut c, ok(&a1_response())));
+        ctx_at(agent.clone(), POLICY_DEPOSIT, T0_MS + 30);
+        let id2 = c.propose("0".into(), m21_ptx(2_000_000_000_000_000));
+        ctx_at(agent, EXEC_DEPOSIT, T0_MS + 30 + HOUR_MS);
+        let _ = c.execute_proposal("0".into(), id2, Some(0), None);
+    }
+
+    /// R21-5: the agent cannot also be the guardian.
+    #[test]
+    #[should_panic(expected = "the agent cannot be the guardian")]
+    fn the_agent_cannot_be_the_guardian() {
+        let alice = accounts(1);
+        let mut c = setup_with_vault(alice.clone());
+        let mut p = test_policy(1_000);
+        p.proposer = Some(guardian());
+        ctx_at(alice, POLICY_DEPOSIT, T0_MS);
+        c.set_policy("0".into(), p);
+    }
+
+    /// R21-6: the largest possible ERC-1155 signed record fits the storage reserved for it.
+    #[test]
+    fn the_largest_erc1155_signed_record_fits_the_reserve() {
+        let long_account: AccountId = format!("{}.testnet", "a".repeat(56)).parse().unwrap();
+        // type + list header + chain + nonce + 2 fees + gas + to + value + data (header + 196) + y + r + s
+        let max_raw = 1 + 3 + 9 + 9 + 17 + 17 + 9 + 21 + 17 + 3 + 196 + 1 + 1 + 33 + 33;
+        let record = SignedRecord {
+            token_id: u64::MAX.to_string(),
+            proposal_id: u64::MAX,
+            nonce: u64::MAX,
+            signing_hash: format!("0x{}", "ab".repeat(32)),
+            signed_tx: format!("0x{}", "cd".repeat(max_raw)),
+            tx_hash: format!("0x{}", "ef".repeat(32)),
+            owner: long_account,
+            signed_ms: u64::MAX,
+        };
+        let key = signed_version_key(&record.token_id, record.nonce, u32::MAX);
+        let bytes = near_sdk::borsh::to_vec(&record).unwrap().len() + near_sdk::borsh::to_vec(&key).unwrap().len() + 40 + 1;
+        assert!((bytes as u64) <= SIGNED_RECORD_RESERVE_BYTES, "record needs {bytes} bytes");
     }
 }

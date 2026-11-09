@@ -155,6 +155,10 @@ impl Policy {
         if has_duplicates(&contracts) {
             return Err(InvalidPolicy("duplicate token or NFT contract"));
         }
+        // Review M21 (R21-5): the veto must not depend on the agent it is meant to stop.
+        if self.proposer.is_some() && self.proposer == self.guardian {
+            return Err(InvalidPolicy("the agent cannot be the guardian"));
+        }
         Ok(self)
     }
 

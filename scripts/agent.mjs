@@ -35,6 +35,8 @@ const SIGNER = 'v1.signer-prod.testnet';
 const NEAR_AI = 'https://cloud-api.near.ai/v1/chat/completions';
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const eth = createPublicClient({ chain: sepolia, transport: http('https://ethereum-sepolia-rpc.publicnode.com') });
+// Review M21 (R21-10): the NEAR CLI never needs the NEAR AI key, so it does not inherit it.
+const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'NEAR_AI_API_KEY'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : undefined; };
@@ -52,7 +54,7 @@ async function view(account, method, a) {
 function call(contract, signer, method, a, deposit, gas = '100 Tgas') {
   const p = spawnSync(NEAR, ['contract', 'call-function', 'as-transaction', contract, method,
     'json-args', JSON.stringify(a), 'prepaid-gas', gas, 'attached-deposit', deposit,
-    'sign-as', signer, 'network-config', 'testnet', 'sign-with-keychain', 'send'], { encoding: 'utf8' });
+    'sign-as', signer, 'network-config', 'testnet', 'sign-with-keychain', 'send'], { encoding: 'utf8', env: CHILD_ENV });
   const out = (p.stdout || '') + (p.stderr || '');
   return { out, stdout: (p.stdout || '').trim(), panic: (out.match(/Smart contract panicked: (.*?)(?:"\)|\n|$)/) || [])[1] };
 }
@@ -99,8 +101,15 @@ async function decideByAi(text) {
   const content = j.choices?.[0]?.message?.content ?? '';
   const json = content.match(/\{[\s\S]*\}/)?.[0];
   if (!json) return { pay: false, reason: `unreadable model answer: ${content.slice(0, 80)}` };
-  const d = JSON.parse(json);
-  return { ...d, to: d.to?.toLowerCase(), reason: `${model}: ${d.reason}` };
+  let d;
+  try { d = JSON.parse(json); } catch { return { pay: false, reason: 'unreadable model answer' }; }
+  // Review M21 (R21-10): the model's answer is untrusted input; only a well-formed address and
+  // amount become a proposal (the contract still checks everything).
+  const to = String(d.to ?? '').toLowerCase();
+  const amount = String(d.amount_eth ?? '');
+  if (d.pay && (!/^0x[0-9a-f]{40}$/.test(to) || !/^[0-9]+(.[0-9]{1,18})?$/.test(amount)))
+    return { pay: false, reason: `${model} gave a malformed address or amount` };
+  return { pay: !!d.pay, to, amount_eth: amount, reason: `${model}: ${String(d.reason ?? '').slice(0, 160)}` };
 }
 
 // ---------- subcommands ----------
