@@ -4,7 +4,7 @@
 
 - Each vault is a NEAR NFT that controls an Ethereum account through **NEAR Chain Signatures**. No single party holds that account's private key: it exists only as shares across NEAR's MPC network, and neither the owner nor the agent can sign with it directly.
 - A NEAR contract signs only what the vault's rules allow: a **daily limit**, **approved recipients**, a **waiting time**, and a **human guardian** who can stop any payment. An AI agent can propose and pay; it can never change the rules, sell the vault or move it.
-- Because the account lives in an NFT, it can be **handed over** to a new owner, team or treasurer: the new owner checks in the browser that no old signature can still be used, then pays and receives it in one transaction.
+- **The NFT is the title deed of the account:** whoever holds it holds the Ethereum account and its rules, and handing it over never hands over a key. So the vault can be **handed over** to a new owner, team or treasurer: the new owner checks in the browser that no old signature can still be used, then pays and receives it in one transaction.
 
 **Live demo: https://alan021011.github.io/near-policy-vault/** (NEAR testnet + Sepolia) · Built for the NEAR HACKATHON 2026, track `nfts`.
 

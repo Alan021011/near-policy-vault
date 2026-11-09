@@ -130,7 +130,7 @@ async function homePage(id: number) {
   app.innerHTML = `
     <section class="hero">
       <h1>Give your AI agent an Ethereum account — without giving it the keys.</h1>
-      <p class="lead">Every payment follows rules you set: a daily limit, approved recipients, a waiting time, and a person who can say no. The account lives in an NFT, so you can hand it over.</p>
+      <p class="lead">Every payment follows rules you set: a daily limit, approved recipients, a waiting time, and a person who can say no. The NFT is the title deed of the account: whoever holds it holds the account and its rules, so you can hand it over without ever handing over a key.</p>
       <div class="row" style="margin-top:20px">
         <a class="btn primary big" href="#/vault/78">See the live agent vault →</a>
         ${accountId ? '' : '<button class="btn big" data-home="connect">Connect wallet</button>'}
@@ -436,7 +436,7 @@ function saleSection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
       </form>`
     : '';
   return `<div class="card" id="sale"><header><h2>Handover</h2>${active ? '<span class="badge warn">handover open</span>' : ''}</header><div class="body">
-    <p class="muted">Hand this vault to a new owner, team or treasurer. For at least 10 minutes (or the waiting time, if longer) the vault pays nothing and the guardian can stop the handover. The new owner checks the vault here, then pays and receives it in one step.</p>
+    <p class="muted">This NFT is the title deed of the vault’s Ethereum account: hand it to a new owner, team or treasurer, and the account and its rules go with it, never a key. For at least 10 minutes (or the waiting time, if longer) the vault pays nothing and the guardian can stop the handover. The new owner checks the vault here, then pays and receives it in one step.</p>
     ${info}${form}</div></div>`;
 }
 
@@ -492,6 +492,7 @@ async function vaultPage(id: string, rid: number) {
     <div class="role-banner ${role}">${ROLE[role][1]}</div>
     ${queueSection(d, isOwner, isGuardian, frozen, isAgent)}
     ${vaultCard(d, isOwner, isGuardian)}
+    <div id="inside"></div>
     ${agentSection(d)}
     ${signedHtml}
     ${saleSection(d, isOwner, isGuardian)}
@@ -501,6 +502,88 @@ async function vaultPage(id: string, rid: number) {
 }
 
 const csv = (s: string) => s.split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+
+// ---------- M25: the Ethereum NFTs inside the vault ----------
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const word32 = (hex: string) => hex.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+/** Decodes an ABI-encoded string (name, tokenURI); returns '' when it is not one. */
+function abiString(hex: string): string {
+  try {
+    const h = hex.replace(/^0x/, '');
+    const len = Number(BigInt('0x' + h.slice(64, 128)));
+    if (len > 2000) return '';
+    const bytes = h.slice(128, 128 + len * 2).match(/../g)?.map((b) => parseInt(b, 16)) ?? [];
+    return new TextDecoder().decode(new Uint8Array(bytes));
+  } catch {
+    return '';
+  }
+}
+/** An image URL from a token URI, only for https, ipfs and inline data (never a script). */
+async function nftImage(uri: string): Promise<string> {
+  const http = (u: string) => (u.startsWith('ipfs://') ? 'https://ipfs.io/ipfs/' + u.slice(7) : u);
+  const safe = (u: string) => (/^(https:\/\/|data:image\/(png|jpeg|gif|webp|svg\+xml);)/.test(u) ? u : '');
+  try {
+    let meta: any;
+    if (uri.startsWith('data:application/json;base64,')) meta = JSON.parse(atob(uri.slice(29)));
+    else if (uri.startsWith('data:application/json,')) meta = JSON.parse(decodeURIComponent(uri.slice(22)));
+    else if (/^(https:|ipfs:)/.test(uri)) meta = await fetch(http(uri)).then((r) => r.json());
+    return meta?.image ? safe(http(String(meta.image))) : '';
+  } catch {
+    return '';
+  }
+}
+
+/** The public Sepolia RPC is load-balanced and some nodes answer "pruned history unavailable"
+ *  for logs a few days old; another try usually reaches a node that has them. */
+async function ethRetry<T>(chain: number, method: string, params: unknown[], tries = 6): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await eth<T>(chain, method, params);
+    } catch (e) {
+      if (i >= tries) throw e;
+      await new Promise((r) => setTimeout(r, 250 * i));
+    }
+  }
+}
+
+/** Lists the ERC-721 NFTs the vault holds in the collections its rules allow, from Transfer logs. */
+async function insideSection(d: VaultData, canSign: boolean, rid: number) {
+  const el = document.getElementById('inside');
+  const vault = d.info.evm_address as string | undefined;
+  const rules = (d.policy.has_policy ? d.policy.policy.nfts ?? [] : []) as any[];
+  if (!el || !vault || rules.length === 0) return;
+  try {
+    const token = await view('nft_token', { token_id: d.id });
+    const latest = Number(BigInt(await eth<string>(d.chain, 'eth_blockNumber', [])));
+    const issued = Number(token?.metadata?.issued_at ?? 0);
+    const from = Math.max(0, latest - Math.ceil((Date.now() - issued) / 12_000) - 2000);
+    const items: { contract: string; name: string; id: bigint; image: string; daily: string }[] = [];
+    for (const r of rules) {
+      const ids = new Set<bigint>();
+      for (let f = from; f <= latest; f += 50_000) {
+        const logs = await ethRetry<any[]>(d.chain, 'eth_getLogs', [{ address: r.contract, fromBlock: '0x' + f.toString(16), toBlock: '0x' + Math.min(latest, f + 49_999).toString(16), topics: [TRANSFER_TOPIC, null, '0x' + word32(vault)] }]);
+        for (const l of logs) if (l.topics.length === 4) ids.add(BigInt(l.topics[3]));
+      }
+      const name = abiString(await eth<string>(d.chain, 'eth_call', [{ to: r.contract, data: '0x06fdde03' }, 'latest']).catch(() => '0x')) || short(r.contract, 6, 4);
+      for (const id of ids) {
+        const owner = await eth<string>(d.chain, 'eth_call', [{ to: r.contract, data: '0x6352211e' + word32(id.toString(16)) }, 'latest']).catch(() => '0x');
+        if (owner.length < 66 || '0x' + owner.slice(-40) !== vault.toLowerCase()) continue; // already left the vault
+        const uri = abiString(await eth<string>(d.chain, 'eth_call', [{ to: r.contract, data: '0xc87b56dd' + word32(id.toString(16)) }, 'latest']).catch(() => '0x'));
+        items.push({ contract: r.contract, name, id, image: uri ? await nftImage(uri) : '', daily: String(r.daily_count) });
+      }
+    }
+    if (rid !== renderId || items.length === 0) return;
+    el.innerHTML = `<div class="card"><header><h2>Inside this vault</h2><span class="faint">Ethereum NFTs held by the vault's account; each leaves only under the rules</span></header>
+      <div class="body"><div class="nft-grid">${items.map((n) => `<div class="nft">
+        <div class="nft-img">${n.image ? `<img src="${esc(n.image)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : `<span>#${esc(n.id)}</span>`}</div>
+        <div class="nft-name">${esc(n.name)} #${esc(n.id)}</div>
+        <div class="faint">at most ${esc(n.daily)} a day · <a target="_blank" rel="noreferrer" href="${EXPLORER[d.chain]}/nft/${esc(n.contract)}/${esc(n.id)}">explorer ↗</a></div>
+        ${canSign ? `<button class="btn small" data-action="send-nft" data-nft="${esc(n.contract)}" data-id="${esc(n.id)}">Send…</button>` : ''}
+      </div>`).join('')}</div></div></div>`;
+  } catch {
+    // The section is optional: if the public RPC fails, the page stays as it was.
+  }
+}
 
 function wireVault(d: VaultData) {
   const t = d.id;
@@ -567,6 +650,8 @@ function wireVault(d: VaultData) {
   };
 
   current = d;
+  const canSign = !!accountId && (accountId === d.owner || accountId === d.policy.policy.proposer);
+  insideSection(d, canSign, renderId);
 }
 
 let current: VaultData | null = null;
@@ -581,6 +666,17 @@ app.addEventListener('click', async (e) => {
   const pid = Number(el.dataset.id);
   switch (a) {
     case 'refresh': return route();
+    case 'send-nft': {
+      const form = document.getElementById('propose-form') as HTMLFormElement | null;
+      if (!form) return toast('Connect as the owner or the agent to send it', 'bad');
+      form.closest('details')?.setAttribute('open', '');
+      form.querySelectorAll('details').forEach((x) => x.setAttribute('open', ''));
+      (form.elements.namedItem('nft') as HTMLInputElement).value = el.dataset.nft ?? '';
+      (form.elements.namedItem('nft_id') as HTMLInputElement).value = el.dataset.id ?? '';
+      (form.elements.namedItem('nft_amount') as HTMLInputElement).value = '';
+      form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return toast('Check the recipient, then "Request payment": the rules decide', 'ok');
+    }
     case 'copy':
       await navigator.clipboard.writeText(el.dataset.text ?? '').catch(() => {});
       return toast('Address copied', 'ok');
