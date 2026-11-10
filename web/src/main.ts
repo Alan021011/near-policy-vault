@@ -1,5 +1,5 @@
 import './style.css';
-import { formatEther, parseEther, parseTransaction } from 'viem';
+import { formatEther, formatUnits, parseEther, parseTransaction, parseUnits } from 'viem';
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
 import {
@@ -249,6 +249,11 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
   const spent = BigInt(d.policy.spend?.eth?.spent ?? '0');
   const cap = d.policy.has_policy ? BigInt(p.eth_daily_cap) : 0n;
   const pct = cap > 0n ? Math.min(100, Number((spent * 1000n) / cap) / 10) : 0;
+  // M29: the window opens at the first charge and lasts 24 h; after that the whole limit is back.
+  const windowStart = Number(d.policy.spend?.eth?.start_ms ?? 0);
+  const windowOpen = spent > 0n && Date.now() < windowStart + 86_400_000;
+  const resetAt = windowOpen ? windowStart + 86_400_000 : 0;
+  const available = windowOpen ? (cap > spent ? cap - spent : 0n) : cap;
   const rule = (ok: boolean, text: string) => `<li class="${ok ? 'on' : 'off'}">${text}</li>`;
   const rules = d.policy.has_policy
     ? `<ul class="rules">
@@ -289,20 +294,28 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
         <p class="faint">Stricter rules apply at once. Looser rules (or a new agent) wait the current waiting time, and the guardian can stop them. Replacing the guardian waits max(2 × waiting time, 3 days).</p>
         <form id="policy-form" class="form">
           <label><div class="label">Waiting time (seconds)</div><input name="delay" value="${draft.delay_ms / 1000}" /></label>
-          <label><div class="label">Guardian (NEAR account)</div><input name="guardian" value="${esc(draft.guardian ?? '')}" placeholder="none" /></label>
+          <label><div class="label">Guardian (NEAR account)</div><input name="guardian" value="${esc(draft.guardian ?? '')}" placeholder="e.g. your-friend.testnet" /><div class="help">A person you trust who can stop payments. It cannot be the same account as the agent.</div></label>
           <label><div class="label">Daily limit (ETH)</div><input name="cap" value="${formatEther(BigInt(draft.eth_daily_cap))}" /></label>
           <label><div class="label">Max network fee per payment (ETH)</div><input name="gas" value="${formatEther(BigInt(draft.max_gas_cost))}" /></label>
-          <label class="full"><div class="label">Approved recipients (Ethereum addresses, comma separated)</div><input name="dest" value="${esc(draft.allowed_destinations.join(', '))}" /></label>
-          <label class="full"><div class="label">Agent (NEAR account that may request and send payments, never change the rules)</div><input name="proposer" value="${esc(draft.proposer ?? '')}" placeholder="none" /></label>
+          <label class="full"><div class="label">Approved recipients (Ethereum addresses, separated by commas)</div><input name="dest" value="${esc(draft.allowed_destinations.join(', '))}" /></label>
+          <label class="full"><div class="label">Agent (NEAR account that may request and send payments, never change the rules)</div><input name="proposer" value="${esc(draft.proposer ?? '')}" placeholder="e.g. my-bot.testnet (leave empty for no agent)" /><div class="help">Usually the account your AI agent runs with. Leave empty if you pay yourself.</div></label>
           <details class="full"><summary class="faint">Tokens, NFTs and apps (advanced)</summary>
             <label><div class="label">Apps allowed to use tokens (comma separated)</div><input name="spenders" value="${esc(draft.allowed_spenders.join(', '))}" /></label>
-            <label><div class="label">Tokens (JSON: [{"contract","daily_cap","max_approval"}])</div><textarea name="tokens" rows="2">${esc(JSON.stringify(draft.tokens))}</textarea></label>
-            <label><div class="label">NFT collections (JSON: [{"contract","daily_count"}])</div><textarea name="nfts" rows="2">${esc(JSON.stringify(draft.nfts ?? []))}</textarea></label>
+            <div class="full"><div class="label">Tokens (ERC-20)</div>
+              <div class="rows" id="token-rows">${(draft.tokens as any[]).map(tokenRow).join('')}</div>
+              <button type="button" class="btn small" data-action="add-token-row">+ Add token</button></div>
+            <div class="full"><div class="label">NFT collections (ERC-721 / ERC-1155)</div>
+              <div class="rows" id="nft-rows">${((draft.nfts ?? []) as any[]).map(nftRow).join('')}</div>
+              <button type="button" class="btn small" data-action="add-nft-row">+ Add NFT collection</button></div>
           </details>
           <div class="full"><button class="btn primary">Save rules</button> <span class="faint">0.05 NEAR deposit, the unused part is refunded</span></div>
         </form></details>`
     : '';
+  const empty = isOwner && d.info.evm_address && d.balance === 0n
+    ? `<div class="notice" style="margin-bottom:14px"><b>This vault is empty.</b> To make payments, send it test ETH on Sepolia: copy its address below and ask a faucet, for example <a href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia" target="_blank" rel="noreferrer">Google's Sepolia faucet ↗</a>. Test ETH has no real value.</div>`
+    : '';
   return `<div class="card vault-main"><div class="body">
+      ${empty}
       <div class="vm-top">
         ${d.token?.metadata?.media ? `<figure class="nft-card"><img src="${esc(d.token.metadata.media)}" alt="This vault's NFT card" width="150" height="150" /><figcaption class="faint">This is how this vault looks in any NEAR wallet</figcaption></figure>` : ''}
         <div class="vm-balance"><div class="label">Balance</div><div class="balance">${ethFmt(d.balance)}</div><div class="faint">on ${esc(chainName(d.chain))} · test ETH, no real value</div></div>
@@ -311,9 +324,10 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
           <a class="btn small" target="_blank" rel="noreferrer" href="${EXPLORER[d.chain]}/address/${esc(d.info.evm_address)}">Explorer ↗</a>` : 'address not resolved'}</div>
       </div>
       ${d.policy.has_policy ? `<div class="spent"><div class="row"><span>Spent today <b>${ethFmt(spent)}</b> of ${ethFmt(cap)} <span class="faint">(network fees included)</span></span><span class="spacer"></span><span class="mono faint">${pct}%</span></div>
-        <div class="bar"><div style="width:${pct}%"></div></div></div>` : ''}
+        <div class="bar"><div style="width:${pct}%"></div></div>
+        <div class="faint" style="margin-top:6px">Available now: <b>${ethFmt(available)}</b>${resetAt ? ` · the limit resets in <span data-until="${resetAt}">${inTime(resetAt)}</span>` : ' · full daily limit available'}</div></div>` : ''}
       <div class="label" style="margin-top:16px">Rules</div>
-      ${rules}${pending}${technical}${form}
+      ${rules}${agentBox(d, isOwner)}${pending}${technical}${form}
     </div></div>`;
 }
 
@@ -329,6 +343,49 @@ function describeTx(to: string, value: bigint | string, data: string | undefined
   if (data.startsWith('0xa9059cbb')) return `<b>${esc(num(1))}</b> units of token ${who(to)} → ${who(addr(0))}`;
   if (data.startsWith('0x095ea7b3')) return `Permission for ${who(addr(0))} to use up to ${esc(num(1))} units of token ${who(to)}`;
   return `Call to ${who(to)}`;
+}
+
+function tokenRow(t?: any) {
+  return `<div class="trow" data-kind="token">
+    <input name="t_contract" placeholder="Token contract 0x…" value="${esc(t?.contract ?? '')}" aria-label="Token contract" />
+    <input name="t_daily" placeholder="Daily limit, e.g. 50" data-base="${esc(t?.daily_cap ?? '')}" aria-label="Daily limit in token units" inputmode="decimal" />
+    <input name="t_max" placeholder="Max permission to an app (0 = none)" data-base="${esc(t?.max_approval ?? '0')}" aria-label="Largest permission an app may get, in token units" inputmode="decimal" />
+    <button type="button" class="btn small" data-action="remove-row" aria-label="Remove this token">Remove</button></div>`;
+}
+function nftRow(n?: any) {
+  return `<div class="trow" data-kind="nft">
+    <input name="n_contract" placeholder="NFT collection contract 0x…" value="${esc(n?.contract ?? '')}" aria-label="NFT collection contract" />
+    <input name="n_daily" placeholder="How many may leave per day, e.g. 1" value="${esc(n?.daily_count ?? '')}" aria-label="NFTs per day" inputmode="numeric" />
+    <button type="button" class="btn small" data-action="remove-row" aria-label="Remove this collection">Remove</button></div>`;
+}
+const tokenDecimals = async (chain: number, contract: string) => Number(BigInt(await eth<string>(chain, 'eth_call', [{ to: contract, data: '0x313ce567' }, 'latest'])));
+
+function agentBox(d: VaultData, isOwner: boolean) {
+  const p = d.policy.policy;
+  if (!d.policy.has_policy || !p.proposer) return '';
+  return `<div class="agent-box">
+    <div class="agent-title">What the agent <b class="mono">${esc(p.proposer)}</b> can and cannot do</div>
+    <div class="can-grid">
+      <ul class="can"><li>Request payments within these rules</li><li>Send them after the waiting time</li></ul>
+      <ul class="cannot"><li>Change these rules or remove the guardian</li><li>Sell, hand over or move the vault</li><li>Cancel the owner's payments</li><li>Skip the waiting time or the guardian</li></ul>
+    </div>
+    ${isOwner ? '<button class="btn small" data-action="remove-agent" title="Removing the agent is a stricter rule, so it applies at once">Remove the agent now</button> <span class="faint">applies at once</span>' : ''}
+  </div>`;
+}
+
+/** M29: ask the deployed contract whether a payment would pass right now (read-only). */
+function checkerSection(d: VaultData) {
+  if (!d.policy.has_policy) return '';
+  const to = d.policy.policy.allowed_destinations[0] ?? '';
+  return `<div class="card" id="checker"><header><h2>Would this payment pass?</h2></header><div class="body">
+    <p class="muted">Ask the vault's contract directly. Nothing is signed or queued, and no wallet is needed.</p>
+    <form id="check-form" class="form">
+      <label><div class="label">Amount (ETH)</div><input name="value" value="0.0001" inputmode="decimal" /></label>
+      <label><div class="label">Pay to (Ethereum address)</div><input name="to" value="${esc(to)}" placeholder="0x…" /></label>
+      <div class="full"><button class="btn primary">Ask the contract</button> <span class="faint">Payments already waiting are not counted.</span></div>
+    </form>
+    <div id="check-out" aria-live="polite"></div>
+  </div></div>`;
 }
 
 function queueSection(d: VaultData, isOwner: boolean, isGuardian: boolean, frozen: boolean, isAgent = false) {
@@ -350,7 +407,7 @@ function queueSection(d: VaultData, isOwner: boolean, isGuardian: boolean, froze
       </div></div>`;
   }).join('');
   const form = canSign && d.policy.has_policy
-    ? `<details style="margin-top:12px"><summary class="btn small" style="display:inline-block">New payment request</summary>
+    ? `${d.policy.policy.allowed_destinations[0] ? `<button class="btn small primary" data-action="test-payment" style="margin-top:12px" title="0.0001 ETH to your first approved recipient">Request a test payment</button> ` : ''}<details style="margin-top:12px"><summary class="btn small" style="display:inline-block">New payment request</summary>
         <form id="propose-form" class="form">
           <label><div class="label">Pay to (Ethereum address)</div><input name="to" placeholder="0x…" value="${esc(d.policy.policy.allowed_destinations[0] ?? '')}" /></label>
           <label><div class="label">Amount (ETH)</div><input name="value" value="0.0001" /></label>
@@ -501,7 +558,7 @@ async function vaultPage(id: string, rid: number) {
     agent: ['agent', 'You are this vault’s agent: you can request and send payments. The rules and the guardian decide what goes through.'],
     guardian: ['guardian', 'You are this vault’s guardian. Nothing is paid before the waiting time ends — you can stop any payment.'],
     visitor: ['visitor', 'Anyone can look at this vault and check it. Only its owner, agent and guardian can act.'],
-    none: ['not connected', 'Anyone can look at this vault and check it, no wallet needed.'],
+    none: ['not connected', 'Anyone can look at this vault and check it, no wallet needed. To act on a vault, connect a free test wallet (see "Try it yourself" on the home page).'],
   };
   const role = isOwner ? 'owner' : isAgent ? 'agent' : isGuardian ? 'guardian' : accountId ? 'visitor' : 'none';
   const pills = [
@@ -522,6 +579,7 @@ async function vaultPage(id: string, rid: number) {
     <div class="role-banner ${role}">${ROLE[role][1]}</div>
     ${d.proposals.length ? queue + card : card + queue}
     <div id="inside"></div>
+    ${checkerSection(d)}
     ${agentSection(d)}
     ${signedHtml}
     ${saleSection(d, isOwner, isGuardian)}
@@ -605,7 +663,7 @@ async function insideSection(d: VaultData, canSign: boolean, rid: number) {
     if (rid !== renderId || items.length === 0) return;
     el.innerHTML = `<div class="card"><header><h2>Inside this vault</h2><span class="faint">Ethereum NFTs held by the vault's account; each leaves only under the rules</span></header>
       <div class="body"><div class="nft-grid">${items.map((n) => `<div class="nft">
-        <div class="nft-img">${n.image ? `<img src="${esc(n.image)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : `<span>#${esc(n.id)}</span>`}</div>
+        <div class="nft-img">${n.image ? `<img src="${esc(n.image)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : `<div class="nft-ph" role="img" aria-label="No image published"><svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><b>#${esc(n.id)}</b><span>${esc(n.name)}</span><small>No image published by this collection</small></div>`}</div>
         <div class="nft-name">${esc(n.name)} #${esc(n.id)}</div>
         <div class="faint">at most ${esc(n.daily)} a day · <a target="_blank" rel="noreferrer" href="${EXPLORER[d.chain]}/nft/${esc(n.contract)}/${esc(n.id)}">explorer ↗</a></div>
         ${canSign ? `<button class="btn small" data-action="send-nft" data-nft="${esc(n.contract)}" data-id="${esc(n.id)}">Send…</button>` : ''}
@@ -624,11 +682,35 @@ function noTranslate() {
 function wireVault(d: VaultData) {
   const t = d.id;
   const policyForm = document.getElementById('policy-form') as HTMLFormElement | null;
-  if (policyForm) policyForm.onsubmit = (e) => {
+  if (policyForm) policyForm.onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(policyForm);
-    let tokens, nfts;
-    try { tokens = JSON.parse(String(f.get('tokens') || '[]')); nfts = JSON.parse(String(f.get('nfts') || '[]')); } catch { return toast('Tokens and NFT collections must be JSON', 'bad'); }
+    // M29: tokens and NFT collections come from friendly rows; amounts are typed in token units.
+    let tokens: any[] = [];
+    const nfts: any[] = [];
+    const isAddr = (a: string) => /^0x[0-9a-fA-F]{40}$/.test(a);
+    try {
+      for (const row of policyForm.querySelectorAll<HTMLElement>('.trow[data-kind="token"]')) {
+        const v = (n: string) => (row.querySelector(`[name="${n}"]`) as HTMLInputElement).value.trim();
+        if (!v('t_contract')) continue;
+        if (!isAddr(v('t_contract'))) throw new Error(`"${v('t_contract')}" is not a token contract address`);
+        const dec = await tokenDecimals(d.chain, v('t_contract'));
+        tokens.push({ contract: v('t_contract').toLowerCase(), daily_cap: parseUnits(v('t_daily') || '0', dec).toString(), max_approval: parseUnits(v('t_max') || '0', dec).toString() });
+      }
+      for (const row of policyForm.querySelectorAll<HTMLElement>('.trow[data-kind="nft"]')) {
+        const v = (n: string) => (row.querySelector(`[name="${n}"]`) as HTMLInputElement).value.trim();
+        if (!v('n_contract')) continue;
+        if (!isAddr(v('n_contract'))) throw new Error(`"${v('n_contract')}" is not an NFT collection address`);
+        if (!/^\d+$/.test(v('n_daily'))) throw new Error('NFTs per day must be a whole number');
+        nfts.push({ contract: v('n_contract').toLowerCase(), daily_count: v('n_daily') });
+      }
+      const bad = csv(String(f.get('dest'))).find((a) => !isAddr(a));
+      if (bad) throw new Error(`"${bad}" is not an Ethereum address`);
+      const g = String(f.get('guardian') || '').trim(), a = String(f.get('proposer') || '').trim();
+      if (g && a && g === a) throw new Error('The agent cannot also be the guardian: pick two different accounts');
+    } catch (err: any) {
+      return toast(String(err?.shortMessage ?? err?.message ?? err), 'bad');
+    }
     const policy = {
       chain_id: d.policy.has_policy ? d.policy.policy.chain_id : DEFAULT_CHAIN,
       delay_ms: Math.round(Number(f.get('delay')) * 1000),
@@ -643,6 +725,37 @@ function wireVault(d: VaultData) {
     };
     act('Set policy', () => call('set_policy', { token_id: t, policy }, nearToYocto('0.05')), (r) =>
       toast(r?.value === true ? 'Policy applied at once' : 'Policy queued: it applies after the delay unless the guardian vetoes it', 'ok'));
+  };
+  document.querySelectorAll<HTMLElement>('#token-rows .trow').forEach(async (row) => {
+    const c = (row.querySelector('[name="t_contract"]') as HTMLInputElement).value;
+    try {
+      const dec = await tokenDecimals(d.chain, c);
+      for (const n of ['t_daily', 't_max']) {
+        const i = row.querySelector(`[name="${n}"]`) as HTMLInputElement;
+        if (i.dataset.base) i.value = formatUnits(BigInt(i.dataset.base), dec);
+      }
+    } catch {
+      /* leave empty: the owner types the amounts again */
+    }
+  });
+  const checkForm = document.getElementById('check-form') as HTMLFormElement | null;
+  if (checkForm) checkForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(checkForm);
+    const out = document.getElementById('check-out')!;
+    out.innerHTML = '<p class="faint">Asking the contract…</p>';
+    try {
+      const to = String(f.get('to')).trim().toLowerCase();
+      if (!/^0x[0-9a-f]{40}$/.test(to)) throw new Error('That is not an Ethereum address');
+      const fees = await feeFields(d.chain);
+      const tx = { chain_id: d.chain, nonce: d.next, ...fees, gas_limit: 21000, to, value: parseEther(String(f.get('value'))).toString(), data: '0x' };
+      const r = await view<any>('check_transaction', { token_id: t, tx });
+      out.innerHTML = r.allowed
+        ? `<div class="verdict ok"><div class="big">✓ It would pass</div><div class="muted">The contract would sign this payment now (it would still wait ${esc(d.policy.policy.delay_ms / 1000)} s, and the guardian could stop it).</div></div>`
+        : `<div class="verdict bad"><div class="big">✕ It would be blocked</div><div class="muted">${esc(human(r.reason ?? ''))}</div><div class="faint" style="font-size:12px">The contract said: ${esc(r.reason ?? '')}</div></div>`;
+    } catch (err: any) {
+      out.innerHTML = `<p class="faint">${esc(human(String(err?.shortMessage ?? err?.message ?? err)))}</p>`;
+    }
   };
   const proposeForm = document.getElementById('propose-form') as HTMLFormElement | null;
   if (proposeForm) proposeForm.onsubmit = async (e) => {
@@ -702,6 +815,28 @@ app.addEventListener('click', async (e) => {
   const pid = Number(el.dataset.id);
   switch (a) {
     case 'refresh': return route();
+    case 'add-token-row':
+      document.getElementById('token-rows')!.insertAdjacentHTML('beforeend', tokenRow());
+      return;
+    case 'add-nft-row':
+      document.getElementById('nft-rows')!.insertAdjacentHTML('beforeend', nftRow());
+      return;
+    case 'remove-row':
+      el.closest('.trow')?.remove();
+      return;
+    case 'remove-agent': {
+      // Removing the proposer is a tightening, so the contract applies it at once.
+      const policy = { ...d.policy.policy, proposer: null };
+      return act('Remove the agent', () => call('set_policy', { token_id: t, policy }, nearToYocto('0.05')), (r) =>
+        toast(r?.value === true ? 'The agent was removed: it can no longer request or send payments' : 'Change queued', 'ok'));
+    }
+    case 'test-payment': {
+      const to = d.policy.policy.allowed_destinations[0];
+      const fees = await feeFields(d.chain);
+      const tx = { chain_id: d.chain, ...fees, gas_limit: 21000, to, value: parseEther('0.0001').toString(), data: '0x' };
+      return act('Request a test payment', () => call('propose', { token_id: t, tx }, nearToYocto('0.05')), () =>
+        toast(`Requested 0.0001 ETH to ${short(to, 6, 4)}. It waits ${d.policy.policy.delay_ms / 1000} s; the guardian can stop it meanwhile.`, 'ok'));
+    }
     case 'send-nft': {
       const form = document.getElementById('propose-form') as HTMLFormElement | null;
       if (!form) return toast('Connect as the owner or the agent to send it', 'bad');
