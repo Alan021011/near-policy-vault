@@ -1,5 +1,5 @@
 import './style.css';
-import { formatEther, parseEther } from 'viem';
+import { formatEther, parseEther, parseTransaction } from 'viem';
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
 import {
@@ -137,11 +137,11 @@ async function homePage(id: number) {
       </div>
     </section>
     <div class="features">
-      <div class="feature"><div class="ico">☰</div><h3>Rules</h3><p>A NEAR contract refuses any payment over the daily limit or to an address you did not approve.</p></div>
-      <div class="feature"><div class="ico">◷</div><h3>Waiting time</h3><p>Nothing is paid instantly. Every payment waits before it is signed, so there is time to react.</p></div>
-      <div class="feature"><div class="ico">✋</div><h3>Human veto</h3><p>A guardian can stop any payment while it waits. The agent can never change the rules.</p></div>
+      <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 6h9M11 12h9M11 18h9"/><path d="m3 6 1.5 1.5L7 5"/><path d="m3 12 1.5 1.5L7 11"/><path d="m3 18 1.5 1.5L7 17"/></svg></div><h3>Rules</h3><p>A NEAR contract refuses any payment over the daily limit or to an address you did not approve.</p></div>
+      <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div><h3>Waiting time</h3><p>Nothing is paid instantly. Every payment waits before it is signed, so there is time to react.</p></div>
+      <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z"/><path d="M9 12h6"/></svg></div><h3>Human veto</h3><p>A guardian can stop any payment while it waits. The agent can never change the rules.</p></div>
     </div>
-    <p class="faint small-note">No single party holds the key to the vault's Ethereum account: NEAR Chain Signatures, an MPC network, signs only what the contract checked. Testnet and test funds only.</p>
+    <p class="faint small-note">No single party holds the key to the vault's Ethereum account: NEAR's signing network (Chain Signatures) signs only what the contract checked. This is a demo on test networks: everything uses free test money with no real value.</p>
     <div class="section-head"><h2>Live demo vaults</h2><span class="spacer"></span>
       <form id="open" class="row"><input id="open-id" class="mono" style="max-width:110px" placeholder="vault #" inputmode="numeric" aria-label="Vault number" /><button class="btn small">Open</button></form></div>
     <div class="grid demo-grid">
@@ -159,7 +159,13 @@ async function homePage(id: number) {
   };
   const mine = document.getElementById('mine')!;
   if (!accountId) {
-    mine.innerHTML = `<div class="card"><header><h2>My vaults</h2></header><div class="body muted">Connect a NEAR testnet wallet to create a vault, set its rules and name an agent and a guardian.</div></div>`;
+    mine.innerHTML = `<div class="card"><header><h2>Try it yourself</h2></header><div class="body">
+      <p class="muted">You only need a free test wallet. Nothing here uses real money.</p>
+      <ol class="steps">
+        <li><b>Install a NEAR wallet</b>, for example <a href="https://wallet.meteorwallet.app" target="_blank" rel="noreferrer">Meteor Wallet ↗</a>, and create a <b>testnet</b> account (free).</li>
+        <li><b>Get free test NEAR</b> from a faucet such as <a href="https://near-faucet.io" target="_blank" rel="noreferrer">near-faucet.io ↗</a>, to pay small refundable deposits.</li>
+        <li><b>Press "Connect wallet"</b> at the top, then "Create a vault" and set its rules.</li>
+      </ol></div></div>`;
     return;
   }
   mine.innerHTML = `<div class="card"><header><h2>My vaults</h2><span class="spacer"></span>
@@ -200,7 +206,7 @@ async function homePage(id: number) {
 // ---------- vault page ----------
 interface VaultData {
   id: string; owner: string; info: any; chain: number; policy: any; proposals: any[]; checks: Record<number, any>;
-  signed: any[]; sale: any; inflight: any; uncertain: any[]; next: number; mined: number; balance: bigint; transfer: any;
+  signed: any[]; sale: any; inflight: any; uncertain: any[]; next: number; mined: number; balance: bigint; transfer: any; token: any;
 }
 
 async function loadVault(id: string): Promise<VaultData> {
@@ -224,7 +230,7 @@ async function loadVault(id: string): Promise<VaultData> {
       eth<string>(chain, 'eth_getBalance', [info.evm_address, 'latest']).then((x) => BigInt(x)),
     ]);
   }
-  return { id, owner: token.owner_id, info, chain, policy, proposals, checks, signed, sale, inflight, uncertain, next, mined, balance, transfer };
+  return { id, owner: token.owner_id, info, chain, policy, proposals, checks, signed, sale, inflight, uncertain, next, mined, balance, transfer, token };
 }
 
 async function feeFields(chain: number) {
@@ -298,7 +304,8 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
     : '';
   return `<div class="card vault-main"><div class="body">
       <div class="vm-top">
-        <div><div class="label">Balance</div><div class="balance">${ethFmt(d.balance)}</div><div class="faint">on ${esc(chainName(d.chain))}</div></div>
+        ${d.token?.metadata?.media ? `<figure class="nft-card"><img src="${esc(d.token.metadata.media)}" alt="This vault's NFT card" width="150" height="150" /><figcaption class="faint">This is how this vault looks in any NEAR wallet</figcaption></figure>` : ''}
+        <div class="vm-balance"><div class="label">Balance</div><div class="balance">${ethFmt(d.balance)}</div><div class="faint">on ${esc(chainName(d.chain))} · test ETH, no real value</div></div>
         <div class="addr">${d.info.evm_address ? `<span class="mono">${shortAddr(d.info.evm_address)}</span>
           <button class="btn small" data-action="copy" data-text="${esc(d.info.evm_address)}">Copy address</button>
           <a class="btn small" target="_blank" rel="noreferrer" href="${EXPLORER[d.chain]}/address/${esc(d.info.evm_address)}">Explorer ↗</a>` : 'address not resolved'}</div>
@@ -310,19 +317,32 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
     </div></div>`;
 }
 
+// M27: what a transaction does, in plain words (amount or item, then recipient).
+function describeTx(to: string, value: bigint | string, data: string | undefined): string {
+  const word = (i: number) => (data ?? '').slice(10 + 64 * i, 10 + 64 * (i + 1));
+  const addr = (i: number) => '0x' + word(i).slice(24);
+  const num = (i: number) => BigInt('0x' + (word(i) || '0'));
+  const who = (a: string) => `<span class="mono">${shortAddr(a)}</span>`;
+  if (!data || data === '0x') return `<b>${ethFmt(value)}</b> → ${who(to)}`;
+  if (data.startsWith('0x42842e0e')) return `NFT <b>#${esc(num(2))}</b> from collection ${who(to)} → ${who(addr(1))}`;
+  if (data.startsWith('0xf242432a')) return `<b>${esc(num(3))}×</b> NFT #${esc(num(2))} from collection ${who(to)} → ${who(addr(1))}`;
+  if (data.startsWith('0xa9059cbb')) return `<b>${esc(num(1))}</b> units of token ${who(to)} → ${who(addr(0))}`;
+  if (data.startsWith('0x095ea7b3')) return `Permission for ${who(addr(0))} to use up to ${esc(num(1))} units of token ${who(to)}`;
+  return `Call to ${who(to)}`;
+}
+
 function queueSection(d: VaultData, isOwner: boolean, isGuardian: boolean, frozen: boolean, isAgent = false) {
   const canSign = isOwner || isAgent;
   const rows = d.proposals.map((p) => {
     const c = d.checks[p.id];
     const tx = p.tx;
-    const kind = !tx.data || tx.data === '0x' ? 'eth' : tx.data.startsWith('0x42842e0e') || tx.data.startsWith('0xf242432a') ? 'NFT transfer' : 'Token payment';
-    const what = kind === 'eth' ? `<b>${ethFmt(tx.value)}</b> to <span class="mono">${shortAddr(tx.to)}</span>` : `${kind} on <span class="mono">${shortAddr(tx.to)}</span>`;
+    const what = describeTx(tx.to, tx.value, tx.data);
     const waiting = Date.now() < p.executable_after_ms;
     const status = c?.ready ? '<span class="badge ok">ready to send</span>'
       : waiting ? `<span class="badge warn">◷ <span data-until="${p.executable_after_ms}" data-prefix="pays in ">pays in ${inTime(p.executable_after_ms)}</span>${isGuardian ? ' unless you stop it' : ''}</span>`
       : `<span class="badge bad">blocked</span> <span class="muted">${esc(human(c?.reason ?? ''))}</span>`;
     return `<div class="pay-row">
-      <div class="pay-what"><div>Payment request #${esc(p.id)}: ${what}</div><div style="margin-top:6px">${status}</div></div>
+      <div class="pay-what"><div>${what} <span class="faint">· request #${esc(p.id)}</span></div><div style="margin-top:6px">${status}</div></div>
       <div class="pay-actions">
         ${isGuardian ? `<button class="btn danger big" data-action="veto-proposal" data-id="${p.id}">■ Stop this payment</button>` : ''}
         ${canSign ? `<button class="btn primary" data-action="execute" data-id="${p.id}" ${c?.ready ? '' : 'disabled'}>Approve &amp; send</button>` : ''}
@@ -402,14 +422,22 @@ async function signedSection(d: VaultData, isOwner: boolean) {
     const pill = st === 'mined' ? 'ok' : st === 'not mined' ? 'warn' : st === 'checking' ? '' : 'bad';
     const cancel = r.proposal_id > 1e18;
     const label = cancel && st === 'mined' ? 'cancellation mined' : ({ mined: 'paid', 'not mined': 'not sent yet', checking: 'checking…', replaced: 'replaced', reverted: 'failed on chain' }[st] ?? st);
-    const kind = r.proposal_id > 1e18 ? 'cancellation' : `request #${r.proposal_id}`;
-    return `<tr><td class="mono">${esc(r.nonce)}</td><td>${kind}</td><td>${txLink(d.chain, r.tx_hash)}</td><td><span class="badge ${pill}">${label}</span></td><td class="row">
+    let what = cancel ? 'Cancellation of an earlier payment' : `request #${r.proposal_id}`;
+    let shown = label;
+    try {
+      const tx = parseTransaction(r.signed_tx as `0x${string}`);
+      if (!cancel && tx.to) what = describeTx(tx.to, tx.value ?? 0n, tx.data);
+      if (!cancel && tx.data && tx.data !== '0x' && st === 'mined') shown = 'sent';
+    } catch {
+      /* keep the short label */
+    }
+    return `<tr title="nonce ${esc(r.nonce)}"><td>${what}</td><td><span class="badge ${pill}">${shown}</span></td><td>${txLink(d.chain, r.tx_hash)}</td><td class="row">
       ${st === 'not mined' ? `<button class="btn small" data-action="broadcast" data-raw="${esc(r.signed_tx)}">Send to Ethereum</button>` : ''}
       ${st === 'not mined' && isOwner ? `<button class="btn small" data-action="cancel-nonce" data-id="${r.nonce}" title="Signs a replacement that uses the same nonce, so this payment can never go through">Cancel this payment</button>` : ''}</td></tr>`;
   }).join('');
   const unc = d.uncertain.length ? `<div class="notice" style="margin-top:10px">Signing result unknown (the signer failed or answered something unreadable; the nonce stays used): ${d.uncertain.map((u) => `nonce ${u.nonce}`).join(', ')}. Sign the pinned proposal again or cancel the nonce.</div>` : '';
-  return `<div class="card"><header><h2>Payments signed</h2><span class="faint">anyone can send them to Ethereum; no key needed</span></header><div class="body">
-    ${rows ? `<table class="stack"><tr><th>Nonce</th><th>What</th><th>Receipt</th><th>Status</th><th></th></tr>${rows}</table>` : '<div class="empty">Nothing paid yet.</div>'}${unc}</div></div>`;
+  return `<div class="card"><header><h2>Payment history</h2></header><div class="body">
+    ${rows ? `<table class="stack"><tr><th>Payment</th><th>Status</th><th>Receipt</th><th></th></tr>${rows}</table><p class="faint" style="margin-top:8px;font-size:12px">Signed payments are public: anyone can send one to Ethereum, no key needed.</p>` : '<div class="empty">Nothing paid yet.</div>'}${unc}</div></div>`;
 }
 
 function saleSection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
@@ -481,23 +509,25 @@ async function vaultPage(id: string, rid: number) {
     frozen ? '<span class="badge warn">handover open</span>' : '',
     d.policy.has_policy ? '<span class="badge ok">rules active</span>' : '<span class="badge">no rules yet</span>',
     d.policy.policy.proposer ? '<span class="badge ok">AI agent</span>' : '',
-    `<span class="badge">you: ${ROLE[role][0]}</span>`,
   ].join(' ');
+  const youAre = `<span class="faint">You're viewing as: <b>${ROLE[role][0]}</b></span>`;
+  const queue = queueSection(d, isOwner, isGuardian, frozen, isAgent);
+  const card = vaultCard(d, isOwner, isGuardian);
   const signedHtml = await signedSection(d, isOwner);
   if (rid !== renderId) return;
   app.innerHTML = `
     <p><a href="#/">← Vaults</a></p>
     <div class="row"><h1>Vault #${esc(id)}</h1><span class="spacer"></span><button class="btn small" data-action="refresh">Refresh</button></div>
-    <div class="row" style="margin:6px 0 12px">${pills}</div>
+    <div class="row" style="margin:6px 0 12px">${pills} ${youAre}</div>
     <div class="role-banner ${role}">${ROLE[role][1]}</div>
-    ${queueSection(d, isOwner, isGuardian, frozen, isAgent)}
-    ${vaultCard(d, isOwner, isGuardian)}
+    ${d.proposals.length ? queue + card : card + queue}
     <div id="inside"></div>
     ${agentSection(d)}
     ${signedHtml}
     ${saleSection(d, isOwner, isGuardian)}
     ${auditSection(d)}`;
   wireVault(d);
+  noTranslate();
   if (location.hash.includes('?audit')) document.getElementById('audit')?.scrollIntoView();
 }
 
@@ -580,9 +610,15 @@ async function insideSection(d: VaultData, canSign: boolean, rid: number) {
         <div class="faint">at most ${esc(n.daily)} a day · <a target="_blank" rel="noreferrer" href="${EXPLORER[d.chain]}/nft/${esc(n.contract)}/${esc(n.id)}">explorer ↗</a></div>
         ${canSign ? `<button class="btn small" data-action="send-nft" data-nft="${esc(n.contract)}" data-id="${esc(n.id)}">Send…</button>` : ''}
       </div>`).join('')}</div></div></div>`;
+    noTranslate();
   } catch {
     // The section is optional: if the public RPC fails, the page stays as it was.
   }
+}
+
+/** Browser translators garble account names, addresses and NFT names: mark them as not to translate. */
+function noTranslate() {
+  document.querySelectorAll('.mono, .tl-req, .nft-name, .rules b, .balance, .addr, .vc-title + p .mono').forEach((e) => e.setAttribute('translate', 'no'));
 }
 
 function wireVault(d: VaultData) {
