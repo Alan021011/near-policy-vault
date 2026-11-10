@@ -7,7 +7,7 @@
 - **The vault NFT shows its live rules in any NEAR wallet:** the contract draws each vault as a card (daily limit, waiting time, guardian, agent, status) that changes as soon as the rules change.
 - **The NFT is the title deed of the account:** whoever holds it holds the Ethereum account and its rules, and handing it over never hands over a key. So the vault can be **handed over** to a new owner, team or treasurer: the new owner checks in the browser that no old signature can still be used, then pays and receives it in one transaction.
 
-**Live demo: https://alan021011.github.io/near-policy-vault/** (NEAR testnet + Sepolia) · Built for the NEAR HACKATHON 2026, track `nfts`. · License: [MIT](LICENSE).
+**Live demo: https://alan021011.github.io/near-policy-vault/** (NEAR testnet + Sepolia) · Built for the NEAR HACKATHON 2026. Tracks: **`nfts`** (main), `security`, `agents`. · License: [MIT](LICENSE) · [What was built during the hackathon](#hackathon-contribution).
 
 [![tests](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml/badge.svg)](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml)
 
@@ -39,16 +39,21 @@ The model resisted the injection but still approved an unknown supplier and a du
 2. `cd contract && cargo test` → **225 unit tests** pass.
 3. The [CI](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml) runs the real contract in a local NEAR sandbox: **9 integration tests** and **49/49 attacks blocked**. The sandbox uses a **mock** signer that answers like Chain Signatures (including wrong keys, garbage and timeouts); the **real MPC network** is exercised separately by the live runs on Sepolia linked in this README.
 
-| Claim | Proof |
-|---|---|
-| The agent never holds the vault's key (it only has its own NEAR account) | The vault's address is derived by Chain Signatures from the contract (`vault_info`); the agent only calls `propose` and `execute_proposal` (`scripts/agent.mjs`) |
-| The contract refuses what breaks the rules | Vault 78 above; policy unit tests; attacks labelled `policy` and `agent` in `sandbox-tests/tests/attacks.rs` |
-| The agent cannot change the rules, sell or transfer | Unit tests `the_agent_cannot_*` in `contract/src/lib.rs`; the agent attacks of vault E in `sandbox-tests/tests/attacks.rs` |
-| A human can stop a payment in time | Vault 78: three vetoes by the guardian, from the web page; sandbox test `an_agent_spends_within_the_policy_and_the_guardian_can_veto` |
-| The vault moves Ethereum NFTs under the same rules | Vault 77: an ERC-721 left the vault ([tx 0xd9d9873e…](https://sepolia.etherscan.io/tx/0xd9d9873e806c33a1eb3f51f12be9b8c8be2767857542192f22a3ba48ff5f3f9a)); the second transfer was refused by the daily count |
-| The vault NFT shows its live rules in a wallet | `near contract call-function as-read-only m3.alan-vault-2026.testnet nft_token json-args '{"token_id":"78"}' network-config testnet now`: `metadata.media` is an SVG card drawn from the vault's state, with its `media_hash`; unit test `the_vault_image_follows_its_rules`; shown in a Meteor wallet changing from "NO RULES YET" to "RULES ACTIVE" |
-| Nobody can change the contract | `near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now` prints "Account is locked (no access keys)"; the key was deleted in transaction `AgJL65MQNxGK58Ai1Forvh71YD3HwpiqLMPUL61TwvMd`, and the agent paid an invoice through the locked contract afterwards ([tx 0x1e802e96…](https://sepolia.etherscan.io/tx/0x1e802e96e0b51354f9b8647702fd3ab7962da796e708e681d6c96aa2bb33f3d7)) |
-| A handover cannot leave the seller a way back in | Two-phase sale and the browser audit; vault 75 was bought from the web page by another account, the seller paid in the same transaction (see *Web page* below); `docs/THREAT_MODEL.md`, threat 1 |
+### Every claim, its proof and its code
+
+| Claim | Check it yourself | Code and tests |
+|---|---|---|
+| The deployed code is this repository's code, and nobody can change it | [Verify page](https://alan021011.github.io/near-policy-vault/#/verify) or `node scripts/evidence.mjs`: code hash `0ff14e79…`, 0 access keys, source commit `6a66b51`. The key was deleted in NEAR transaction `AgJL65MQNxGK58Ai1Forvh71YD3HwpiqLMPUL61TwvMd`; the agent paid an invoice through the locked contract afterwards ([tx 0x1e802e96…](https://sepolia.etherscan.io/tx/0x1e802e96e0b51354f9b8647702fd3ab7962da796e708e681d6c96aa2bb33f3d7)) | Reproducible build settings in [`contract/Cargo.toml`](contract/Cargo.toml); rebuild with step 4 of [How to verify](#how-to-verify) |
+| The agent never holds the vault's key (it only has its own NEAR account) | `near contract call-function as-read-only m3.alan-vault-2026.testnet vault_info json-args '{"token_id":"78"}' network-config testnet now`: the address is derived by Chain Signatures from the contract | The agent only calls `propose` and `execute_proposal`: [`scripts/agent.mjs`](scripts/agent.mjs) |
+| The contract signs a correct Ethereum transaction that it built itself | 14 Sepolia receipts re-checked on the [Verify page](https://alan021011.github.io/near-policy-vault/#/verify) | [`contract/src/evm.rs`](contract/src/evm.rs); [`contract/tests/golden_vectors.rs`](contract/tests/golden_vectors.rs) `rust_signing_hash_matches_viem` (19 vectors from viem) |
+| The contract refuses what breaks the rules | [Try to fool the agent](https://alan021011.github.io/near-policy-vault/#/try) asks the live contract; vault 78 above | [`contract/src/policy.rs`](contract/src/policy.rs) (19 unit tests); attacks labelled `policy` and `agent` in [`sandbox-tests/tests/attacks.rs`](sandbox-tests/tests/attacks.rs) |
+| The agent cannot change the rules, sell, transfer, or be its own guardian | Covered by tests, not tried live: vault 78's agent (`recv.alan-vault-2026.testnet`) only ever proposed and signed payments | Unit tests `the_agent_cannot_*` (7 of them, including `the_agent_cannot_be_the_guardian`) in [`contract/src/lib.rs`](contract/src/lib.rs); agent attacks in [`attacks.rs`](sandbox-tests/tests/attacks.rs) |
+| A human can stop a payment in time | Vetoes listed under "Live decisions on NEAR" on the [Verify page](https://alan021011.github.io/near-policy-vault/#/verify) | Sandbox test `an_agent_spends_within_the_policy_and_the_guardian_can_veto` in [`sandbox-tests/tests/sandbox.rs`](sandbox-tests/tests/sandbox.rs) |
+| The guardian is told when a payment is waiting | [Try the guardian alerts yourself](#try-the-guardian-alerts-yourself); veto made from a Telegram alert: NEAR transaction `H1sjwkrYpFZh2Hpn25TYfrVDeopQhiewXiTokoP5D3jc` | [`scripts/guardian-alerts.mjs`](scripts/guardian-alerts.mjs) (reads only, holds no key) |
+| The vault moves Ethereum NFTs under the same rules | Vault 77: an ERC-721 left the vault ([tx 0xd9d9873e…](https://sepolia.etherscan.io/tx/0xd9d9873e806c33a1eb3f51f12be9b8c8be2767857542192f22a3ba48ff5f3f9a)); the second transfer was refused by the daily count | [`scripts/nft-testnet-check.mjs`](scripts/nft-testnet-check.mjs) (10/10 live) |
+| The vault NFT shows its live rules in a wallet | `near contract call-function as-read-only m3.alan-vault-2026.testnet nft_token json-args '{"token_id":"78"}' network-config testnet now`: `metadata.media` is an SVG card drawn from the vault's state, with its `media_hash`; shown in a Meteor wallet changing from "NO RULES YET" to "RULES ACTIVE" | [`contract/src/art.rs`](contract/src/art.rs) (8 unit tests); `the_vault_image_follows_its_rules` in [`contract/src/lib.rs`](contract/src/lib.rs) |
+| A handover cannot leave the seller a way back in | Vault 75 was bought from the web page by another account, the seller paid in the same transaction (see *Web page* below) | Two-phase sale in [`contract/src/lib.rs`](contract/src/lib.rs); buyer's check [`scripts/sale-audit.mjs`](scripts/sale-audit.mjs) and [`web/src/audit.ts`](web/src/audit.ts); [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md), threat 1 |
+| The tests run and pass | `cd contract && cargo test` (225 unit tests); [CI runs](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml): 9 sandbox tests and 49/49 attacks | [`.github/workflows/tests.yml`](.github/workflows/tests.yml) |
 
 > **Status:** testnet only, test funds only. The deployed contract is a **reproducible build** (SHA-256 `0ff14e79…`, rebuild it with step 4) and its account is **locked: 0 access keys**, so nobody, the author included, can change its code ([what happens if a bug is found](docs/MIGRATION.md)). **No independent security audit has been done:** two reviews by another AI model, 225 unit tests and 49 attack tests are evidence, not an audit. Details of every piece below.
 
@@ -166,6 +171,13 @@ A guardian can only stop a payment it knows about. Two ways to be told:
 5. Run it without `--test` and leave it running. Expect a "Watching N vault(s)" message, then an alert, with a link to the vault, each time one of your vaults has a payment, a looser rule change or a handover waiting.
 
 The script only reads the contract: it holds no NEAR key and cannot sign or veto. You stop a payment yourself, with your wallet, from the link. Alerts arrive only while the script (or the browser tab) is running; a hosted service with one shared bot, where a guardian links their Telegram by signing with their NEAR wallet, is future work.
+
+## Hackathon contribution
+
+- **Everything in this repository was written during the hackathon window.** The first commit is `c7c4fd2` on 2026-11-04 (`git log --reverse --format='%ad %h %s' --date=short | head -1`), after the announcement on 2026-10-19, so there is no pre-hackathon baseline and no earlier product. This is the author's only submission.
+- **Libraries:** contract: `near-sdk` and `near-contract-standards` 5.30.0 (NEP-171/177/178/181), `sha3`, `bs58`. Sandbox tests: `near-workspaces` 0.24.0, `k256`, `tokio`, `serde_json`, `anyhow`. Web page: `viem` 2.57.16, `@hot-labs/near-connect` 0.11.4, Vite. Scripts: `viem` and the NEAR CLI. The test ERC-721 (`scripts/nft/TestNFT.sol`) is a minimal contract written here, without OpenZeppelin.
+- **Services:** NEAR Chain Signatures (`v1.signer-prod.testnet`), NEAR AI Cloud (`openai/gpt-5-mini`, only for the agent's optional `--ai` mode), public RPCs (FastNEAR, Tenderly, 1rpc, publicnode), the NearBlocks API (the agent's recorded runs), the Telegram Bot API (alerts) and GitHub Pages (the web page).
+- **AI assistance:** the code and the documentation were written with an AI coding assistant (Claude). The two security reviews (M12, M21) were done by a different model (Sonnet 5.5), read-only. No human security audit has been done.
 
 ## Known limits
 
