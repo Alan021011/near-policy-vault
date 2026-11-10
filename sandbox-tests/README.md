@@ -28,14 +28,15 @@ accounts and 10–15 minutes each. These tests sit in between: anyone can run th
 | `a_sale_is_bought_on_chain` | M8 + H3: guardian veto, sale freeze, 10-minute minimum, reserved buyer, stale `sale_id`, and `buy` paying the seller in the same transaction. |
 | `a_transfer_call_receiver_cannot_act_as_owner` | H1: the receiver tries to set a policy while it owns the vault and is refused; returned, failed and kept paths. |
 | `cancel_nonce_signs_during_a_sale` | Threat 1: during a sale only cancellations sign; the cancellation reuses the nonce of the earlier payment. |
+| `an_agent_spends_within_the_policy_and_the_guardian_can_veto` | Agent mode (threats 24-25): the agent proposes and signs within the policy after the delay, the guardian vetoes one of its proposals, and the agent cannot change the policy. |
 
 Negative control (run once by hand): a contract built with four rules removed (no `transfer_call`
 lock, transfer allowed with a signature in flight, any key accepted, `buy` not paying the seller)
-fails exactly the four matching tests and passes the other four.
+fails exactly the four matching tests and passes the other four (run when there were 8 tests; the agent test was added later).
 
 ## Attack suite (`tests/attacks.rs`, M10)
 
-One sandbox, 44 attacks taken from `docs/THREAT_MODEL.md`, each labelled with its threat number, or `auth` (only the owner or the guardian may act), `policy` (a single transaction outside the policy) or `sale` (sale rules).
+One sandbox, 49 attacks taken from `docs/THREAT_MODEL.md`, each labelled with its threat number, or `auth` (only the owner, its agent or the guardian may act), `policy` (a single transaction outside the policy), `sale` (sale rules) or `agent` (what the agent must never do).
 Each attack must be refused with the contract's own reason (or, for the signer's answers, leave the
 vault unlocked and charged once). It prints one `BLOCKED [threat] attack` line per attack and
 fails if any gets through:
