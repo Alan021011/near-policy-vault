@@ -230,3 +230,10 @@ tr:nth-child(even) td { background: #10131b; }
 .nft-ph small { font-size: 10px; color: var(--faint); }
 @media (max-width: 640px) { .can-grid { grid-template-columns: 1fr; } }
 .agent-title { font-size: 14px; }
+
+/* Verify page and judges box */
+.vrow { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.vrow:last-child { border-bottom: 0; }
+.vrow .small { font-size: 12px; word-break: break-all; }
+ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 8px; font-size: 14px; }
+.judges { border-color: var(--mint-line); }

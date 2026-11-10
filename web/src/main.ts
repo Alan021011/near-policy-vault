@@ -2,8 +2,9 @@ import './style.css';
 import { formatEther, formatUnits, parseEther, parseTransaction, parseUnits } from 'viem';
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
+import { ETH_PROOFS, NEAR_PROOFS } from './evidence';
 import {
-  CONTRACT, DEFAULT_CHAIN, EXPLORER, NEAR_EXPLORER, OVERRIDDEN, accountId, call, connect, disconnect, eth, events,
+  CONTRACT, DEFAULT_CHAIN, EXPECTED_CODE, EXPLORER, NEAR_EXPLORER, OVERRIDDEN, accountId, call, connect, disconnect, eth, events, nearRpc,
   nearToYocto, onAccountChange, view, yoctoToNear,
 } from './near';
 
@@ -97,9 +98,101 @@ let renderId = 0;
 function route() {
   const id = ++renderId;
   const m = location.hash.match(/^#\/vault\/(\d+)/);
-  (m ? vaultPage(m[1], id) : homePage(id)).catch((e) => {
+  (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : homePage(id)).catch((e) => {
     if (id === renderId) app.innerHTML = `<div class="card"><div class="body">Could not load: ${esc(e?.message ?? e)}</div></div>`;
   });
+}
+
+// ---------- Verify: everything a judge can check, without a wallet ----------
+const REPO = 'https://github.com/Alan021011/near-policy-vault';
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const b58hex = (x: string) => { let n = 0n; for (const c of x) n = n * 58n + BigInt(B58.indexOf(c)); return n.toString(16).padStart(64, '0'); };
+const ARCHIVAL = 'https://archival-rpc.testnet.fastnear.com';
+const okBadge = (ok: boolean | null, yes = 'verified', no = 'mismatch') =>
+  ok === null ? '<span class="badge">checking…</span>' : ok ? `<span class="badge ok">✓ ${yes}</span>` : `<span class="badge bad">✕ ${no}</span>`;
+
+async function verifyPage(id: number) {
+  app.innerHTML = `
+    <p><a href="#/">← Home</a></p>
+    <h1>Verify it yourself</h1>
+    <p class="lead">Everything below is checked <b>live, from your browser</b>, against NEAR testnet and Ethereum Sepolia. No wallet needed.</p>
+    <div class="notice" style="margin:14px 0"><b>No independent security audit has been done.</b> Two reviews by another AI model, the unit tests and the attack suite are evidence, not an audit. Testnet only, test funds only.</div>
+    <div class="card"><header><h2>The contract</h2></header><div class="body" id="v-contract"><p class="faint">Reading the contract…</p></div></div>
+    <div class="card"><header><h2>Tests</h2></header><div class="body">
+      <ul class="plain">
+        <li><b>225 unit tests</b> (contract, policy, Ethereum encoding, the NFT card): <span class="mono">cd contract && cargo test</span></li>
+        <li><b>9 integration tests and 49 attack tests</b> run the real contract in a local NEAR sandbox, in CI on every push. The sandbox uses a <b>mock</b> signer (it can also answer with a wrong key, garbage or a timeout); the real signing network is tested by the live transactions below.</li>
+        <li>Threat model with 31 threats and their state: <a href="${REPO}/blob/main/docs/THREAT_MODEL.md" target="_blank" rel="noreferrer">THREAT_MODEL.md ↗</a> · CI: <a href="${REPO}/actions/workflows/tests.yml" target="_blank" rel="noreferrer">latest runs ↗</a></li>
+      </ul></div></div>
+    <div class="card"><header><h2>Live transactions on Ethereum (Sepolia)</h2><span class="spacer"></span><span id="v-eth-sum" class="faint"></span></header><div class="body"><table class="stack" id="v-eth"></table></div></div>
+    <div class="card"><header><h2>Live decisions on NEAR</h2><span class="spacer"></span><span id="v-near-sum" class="faint"></span></header><div class="body">
+      <p class="muted">Refused requests are transactions the contract made fail; vetoes and the key deletion succeeded.</p><table class="stack" id="v-near"></table></div></div>
+    <div class="card"><header><h2>Known limits</h2></header><div class="body"><ul class="plain">
+      <li>Trust in NEAR's signing network (Chain Signatures): the contract checks every signature it receives against the vault's key, but cannot run without the network.</li>
+      <li>The contract is final: a bug cannot be fixed in place. <a href="${REPO}/blob/main/docs/MIGRATION.md" target="_blank" rel="noreferrer">What happens then ↗</a></li>
+      <li>Within the rules, an agent can still spend up to the daily limit on approved recipients; the waiting time and the guardian are the defence there. The guardian must be watching (alerts work while the page or the watcher runs).</li>
+      <li>Daily limits use fixed 24-hour windows: up to twice the limit can be signed across a window boundary.</li>
+      <li>Without a guardian, the limits reset with a handover. The buyer's check reads Ethereum from public RPCs.</li>
+      <li>Full list: <a href="${REPO}#known-limits" target="_blank" rel="noreferrer">README, Known limits ↗</a></li>
+    </ul></div></div>`;
+  // the contract: code hash, keys, source
+  (async () => {
+    const el = document.getElementById('v-contract')!;
+    try {
+      const [acct, keys, meta] = await Promise.all([
+        nearRpc('query', { request_type: 'view_account', finality: 'final', account_id: CONTRACT }),
+        nearRpc('query', { request_type: 'view_access_key_list', finality: 'final', account_id: CONTRACT }),
+        view<any>('contract_source_metadata').catch(() => null),
+      ]);
+      if (id !== renderId) return;
+      const hash = b58hex(acct.code_hash);
+      el.innerHTML = `<div class="vrow"><div><b>Deployed code</b><div class="mono small">${esc(hash)}</div><div class="faint">equals the reproducible build published in the repository (${esc(EXPECTED_CODE.slice(0, 8))}…)</div></div>${okBadge(hash === EXPECTED_CODE, 'same as published')}</div>
+        <div class="vrow"><div><b>Who can change it</b><div class="faint">${keys.keys.length === 0 ? 'The contract account has no access keys: nobody, the author included, can change its code.' : `The account has ${keys.keys.length} access key(s).`}</div></div>${okBadge(keys.keys.length === 0, 'nobody (0 keys)', `${keys.keys.length} key(s)`)}</div>
+        <div class="vrow"><div><b>Where the code comes from</b><div class="faint">${meta?.link ? `<a href="${esc(meta.link)}" target="_blank" rel="noreferrer">${esc(meta.link.replace('https://github.com/', ''))} ↗</a>` : 'not published'} · built in <span class="mono">${esc(meta?.build_info?.build_environment?.split('@')[0] ?? '?')}</span></div>
+        <div class="faint">Rebuild it: <span class="mono">cd contract && cargo near build reproducible-wasm</span> (Docker) and compare the SHA-256.</div></div>${okBadge(!!meta?.link, 'source published', 'unknown')}</div>`;
+    } catch (e: any) {
+      el.innerHTML = `<p class="faint">Could not read the contract: ${esc(e?.message ?? e)}</p>`;
+    }
+  })();
+  // Ethereum receipts (retried: some public nodes answer null)
+  (async () => {
+    const t = document.getElementById('v-eth')!;
+    t.innerHTML = '<tr><th>What it proves</th><th>Status</th><th>Transaction</th></tr>' + ETH_PROOFS.map((p, i) => `<tr><td>${esc(p.what)}</td><td id="ve${i}">${okBadge(null)}</td><td>${txLink(DEFAULT_CHAIN, p.hash)}</td></tr>`).join('');
+    let ok = 0;
+    await Promise.all(ETH_PROOFS.map(async (p, i) => {
+      let rc: any = null;
+      for (let k = 0; k < 6 && !rc; k++) {
+        rc = await eth<any>(DEFAULT_CHAIN, 'eth_getTransactionReceipt', [p.hash]).catch(() => null);
+        if (!rc) await new Promise((r) => setTimeout(r, 400));
+      }
+      const good = rc ? rc.status === '0x1' : null;
+      if (good) ok++;
+      const cell = document.getElementById(`ve${i}`);
+      if (cell) cell.innerHTML = good === null ? '<span class="badge">not reachable, retry</span>' : okBadge(good, 'mined', 'reverted');
+    }));
+    const sum = document.getElementById('v-eth-sum');
+    if (sum) sum.textContent = `${ok} of ${ETH_PROOFS.length} confirmed`;
+  })();
+  // NEAR outcomes from an archival node
+  (async () => {
+    const t = document.getElementById('v-near')!;
+    t.innerHTML = '<tr><th>What it proves</th><th>Outcome</th><th>Transaction</th></tr>' + NEAR_PROOFS.map((p, i) => `<tr><td>${esc(p.what)}</td><td id="vn${i}">${okBadge(null)}</td><td><a class="mono" target="_blank" rel="noreferrer" href="${NEAR_EXPLORER}/txns/${esc(p.hash)}">${esc(short(p.hash, 8, 6))}</a></td></tr>`).join('');
+    let ok = 0;
+    await Promise.all(NEAR_PROOFS.map(async (p, i) => {
+      let outcome: string | null = null;
+      try {
+        const j = await fetch(ARCHIVAL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tx', params: { tx_hash: p.hash, sender_account_id: p.sender, wait_until: 'NONE' } }) }).then((r) => r.json());
+        const st = j.result?.status;
+        outcome = st ? (st.Failure ? 'failure' : 'success') : null;
+      } catch { /* shown as not reachable */ }
+      const good = outcome === null ? null : outcome === p.expect;
+      if (good) ok++;
+      const cell = document.getElementById(`vn${i}`);
+      if (cell) cell.innerHTML = good === null ? '<span class="badge">not reachable, retry</span>' : okBadge(good, p.expect === 'failure' ? 'refused, as claimed' : 'done, as claimed', 'different from the claim');
+    }));
+    const sum = document.getElementById('v-near-sum');
+    if (sum) sum.textContent = `${ok} of ${NEAR_PROOFS.length} as claimed`;
+  })();
 }
 
 // ---------- home ----------
@@ -136,6 +229,11 @@ async function homePage(id: number) {
         ${accountId ? '' : '<button class="btn big" data-home="connect">Connect wallet</button>'}
       </div>
     </section>
+    <div class="card judges"><header><h2>Judges, start here</h2><span class="faint">no wallet needed</span></header><div class="body"><ol class="steps">
+      <li><a href="#/vault/78"><b>Watch the rules stop an AI agent</b></a>: vault 78's agent tried four invoices; see what the contract blocked and what the guardian stopped, each linked to its transaction.</li>
+      <li><a href="#/vault/78"><b>Ask the contract yourself</b></a>: in vault 78, "Would this payment pass?" sends your test payment to the live contract (read-only) and shows its answer.</li>
+      <li><a href="#/verify"><b>Verify everything</b></a>: the deployed code equals the published build, nobody holds a key to change it, and every transaction we cite is checked live.</li>
+    </ol></div></div>
     <div class="features">
       <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 6h9M11 12h9M11 18h9"/><path d="m3 6 1.5 1.5L7 5"/><path d="m3 12 1.5 1.5L7 11"/><path d="m3 18 1.5 1.5L7 17"/></svg></div><h3>Rules</h3><p>A NEAR contract refuses any payment over the daily limit or to an address you did not approve.</p></div>
       <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div><h3>Waiting time</h3><p>Nothing is paid instantly. Every payment waits before it is signed, so there is time to react.</p></div>

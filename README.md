@@ -26,6 +26,11 @@ The model resisted the injection but still approved an unknown supplier and a du
 
 **Why an agent, if a human can veto?** The agent does the routine work: it reads invoices and pays the normal ones without anyone signing. The contract puts a hard ceiling on the worst case (a daily limit and approved recipients, whatever the agent decides), and the guardian only looks at what is unusual during the waiting time. Without the guardian, a fooled agent can still lose at most one day's limit, and only to approved addresses.
 
+## Judges, start here (no wallet needed)
+
+- **[Verify page](https://alan021011.github.io/near-policy-vault/#/verify):** from your browser, it checks that the deployed code equals the published reproducible build, that nobody holds a key to change it, and re-checks every transaction this README cites (Sepolia receipts and the outcome of each NEAR decision: refused requests failed, vetoes succeeded).
+- **[Vault 78](https://alan021011.github.io/near-policy-vault/#/vault/78):** what the AI agent tried and what stopped it; "Would this payment pass?" asks the live contract about a payment you type.
+
 ## 30-second judge check
 
 1. Open [vault 78](https://alan021011.github.io/near-policy-vault/#/vault/78) (no wallet needed): its rules, its agent, its guardian, and its payments marked *paid* on Sepolia.
