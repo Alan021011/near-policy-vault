@@ -7,7 +7,7 @@
 - **The vault NFT shows its live rules in any NEAR wallet:** the contract draws each vault as a card (daily limit, waiting time, guardian, agent, status) that changes as soon as the rules change.
 - **The NFT is the title deed of the account:** whoever holds it holds the Ethereum account and its rules, and handing it over never hands over a key. So the vault can be **handed over** to a new owner, team or treasurer: the new owner checks in the browser that no old signature can still be used, then pays and receives it in one transaction.
 
-**Live demo: https://alan021011.github.io/near-policy-vault/** (NEAR testnet + Sepolia) · Built for the NEAR HACKATHON 2026, track `nfts`.
+**Live demo: https://alan021011.github.io/near-policy-vault/** (NEAR testnet + Sepolia) · Built for the NEAR HACKATHON 2026, track `nfts`. · License: [MIT](LICENSE).
 
 [![tests](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml/badge.svg)](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml)
 
