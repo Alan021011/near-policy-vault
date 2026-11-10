@@ -13,7 +13,8 @@ import { readFileSync } from 'node:fs';
 const data = JSON.parse(readFileSync(new URL('../web/src/evidence.json', import.meta.url), 'utf8'));
 const NEAR_RPC = process.env.NEAR_RPC || 'https://rpc.testnet.fastnear.com';
 const NEAR_ARCHIVAL = process.env.NEAR_ARCHIVAL_RPC || 'https://archival-rpc.testnet.fastnear.com';
-const ETH_RPCS = (process.env.ETH_RPC || 'https://ethereum-sepolia-rpc.publicnode.com,https://sepolia.drpc.org').split(',');
+// Public Sepolia nodes differ: some no longer serve old receipts. These answered every time in tests.
+const ETH_RPCS = (process.env.ETH_RPC || 'https://sepolia.gateway.tenderly.co,https://1rpc.io/sepolia,https://ethereum-sepolia-rpc.publicnode.com').split(',');
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

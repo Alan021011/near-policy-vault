@@ -4,7 +4,7 @@ import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
 import { ETH_PROOFS, NEAR_PROOFS } from './evidence';
 import {
-  CONTRACT, DEFAULT_CHAIN, EXPECTED_CODE, EXPLORER, NEAR_EXPLORER, OVERRIDDEN, accountId, call, connect, disconnect, eth, events, nearRpc,
+  CONTRACT, DEFAULT_CHAIN, EXPECTED_CODE, EXPLORER, NEAR_EXPLORER, OVERRIDDEN, accountId, call, connect, disconnect, eth, ethReceipt, events, nearRpc,
   nearToYocto, onAccountChange, view, yoctoToNear,
 } from './near';
 
@@ -160,11 +160,7 @@ async function verifyPage(id: number) {
     t.innerHTML = '<tr><th>What it proves</th><th>Status</th><th>Transaction</th></tr>' + ETH_PROOFS.map((p, i) => `<tr><td>${esc(p.what)}</td><td id="ve${i}">${okBadge(null)}</td><td>${txLink(DEFAULT_CHAIN, p.hash)}</td></tr>`).join('');
     let ok = 0;
     await Promise.all(ETH_PROOFS.map(async (p, i) => {
-      let rc: any = null;
-      for (let k = 0; k < 6 && !rc; k++) {
-        rc = await eth<any>(DEFAULT_CHAIN, 'eth_getTransactionReceipt', [p.hash]).catch(() => null);
-        if (!rc) await new Promise((r) => setTimeout(r, 400));
-      }
+      const rc = await ethReceipt(DEFAULT_CHAIN, p.hash);
       const good = rc ? rc.status === '0x1' : null;
       if (good) ok++;
       const cell = document.getElementById(`ve${i}`);
@@ -689,14 +685,7 @@ async function signedSection(d: VaultData, isOwner: boolean) {
   // The public Sepolia RPC is load-balanced and some of its nodes answer `null` for a receipt that
   // exists, so a missing receipt is retried and never shown as a failure on its own: a record is
   // "replaced" only when another record with the same nonce is the one that was mined.
-  const receipt = async (h: string) => {
-    for (let i = 0; i < 5; i++) {
-      const rc = await eth<any>(d.chain, 'eth_getTransactionReceipt', [h]).catch(() => null);
-      if (rc) return rc;
-      await new Promise((res) => setTimeout(res, 300));
-    }
-    return null;
-  };
+  const receipt = (h: string) => ethReceipt(d.chain, h);
   const found = await Promise.all(d.signed.map((r) => (r.nonce >= d.mined ? null : receipt(r.tx_hash))));
   const minedNonces = new Set(d.signed.filter((_, i) => found[i]).map((r) => r.nonce));
   const statuses = d.signed.map((r, i) => {

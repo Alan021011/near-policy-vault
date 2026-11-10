@@ -26,6 +26,23 @@ export const ETH_RPC: Record<number, string> = {
   11155111: ethRpcParam ?? 'https://ethereum-sepolia-rpc.publicnode.com',
 };
 export const EXPLORER: Record<number, string> = { 11155111: 'https://sepolia.etherscan.io' };
+/** Nodes for reading receipts: some public Sepolia nodes no longer serve old ones, so several are tried. */
+const RECEIPT_RPCS: Record<number, string[]> = {
+  11155111: ethRpcParam ? [ethRpcParam] : ['https://sepolia.gateway.tenderly.co', 'https://1rpc.io/sepolia', 'https://ethereum-sepolia-rpc.publicnode.com'],
+};
+export async function ethReceipt(chain: number, hash: string): Promise<any | null> {
+  const urls = RECEIPT_RPCS[chain] ?? [];
+  for (let i = 0; i < urls.length * 2; i++) {
+    try {
+      const j = await fetch(urls[i % urls.length], { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [hash] }) }).then((r) => r.json());
+      if (j.result) return j.result;
+    } catch {
+      /* try the next node */
+    }
+  }
+  return null;
+}
 export const NEAR_EXPLORER = 'https://testnet.nearblocks.io';
 export const DEFAULT_CHAIN = 11155111;
 
