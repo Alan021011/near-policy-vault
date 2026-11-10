@@ -134,6 +134,22 @@ Each step follows the pattern "run X, expect Y". Nothing is claimed until it has
    `cd scripts && node broadcast.mjs <vault-contract>.testnet <token_id> <nonce> [--version <n>]`
    Expect: the decoded transaction, then a Sepolia link once mined, or `already mined`, or, for a nonce used by another transaction (e.g. `node broadcast.mjs m3.alan-vault-2026.testnet 29 3 --version 0`, a payment replaced by its cancellation), `this one can never be mined` (exit code 2).
 
+## Try the guardian alerts yourself
+
+A guardian can only stop a payment it knows about. Two ways to be told:
+
+**In the browser (no setup).** Open the [web page](https://alan021011.github.io/near-policy-vault/), connect the NEAR testnet wallet that is a vault's guardian, and in "Vaults I guard" press **Watch my vaults**. While that tab stays open, the browser shows a notification whenever one of those vaults has a payment waiting; clicking it opens the vault with its red "Stop this payment" button.
+
+**On your phone, with Telegram** (`scripts/guardian-alerts.mjs`, Node 18+, no npm packages):
+1. In Telegram, open **@BotFather**, send `/newbot`, choose a name and a username ending in `bot`, and copy the token it gives you. Keep it private.
+2. Store the token in an environment variable, never in a file of the repository. PowerShell: `[Environment]::SetEnvironmentVariable('TELEGRAM_BOT_TOKEN', '<token>', 'User')` (then open a new terminal); bash: `export TELEGRAM_BOT_TOKEN=<token>`.
+3. Open your bot in Telegram and press **Start** (a bot cannot write first; this tells the script which chat to use).
+4. `cd scripts && node guardian-alerts.mjs m3.alan-vault-2026.testnet --guardian <your-account>.testnet --test`
+   Expect: "test message sent", and the message in Telegram.
+5. Run it without `--test` and leave it running. Expect a "Watching N vault(s)" message, then an alert, with a link to the vault, each time one of your vaults has a payment, a looser rule change or a handover waiting.
+
+The script only reads the contract: it holds no NEAR key and cannot sign or veto. You stop a payment yourself, with your wallet, from the link. Alerts arrive only while the script (or the browser tab) is running; a hosted service with one shared bot, where a guardian links their Telegram by signing with their NEAR wallet, is future work.
+
 ## Known limits
 
 See `docs/THREAT_MODEL.md`. Residual risks that this design does not remove: trust in the MPC network. The contract itself can no longer be changed (its account has no keys).

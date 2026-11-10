@@ -183,7 +183,7 @@ async function homePage(id: number) {
   document.getElementById('mine-grid')!.innerHTML = cards.join('') || '<span class="empty">You own no vault yet. Create one, then set its rules.</span>';
 
   const guarded = document.getElementById('guarded')!;
-  guarded.innerHTML = `<div class="card"><header><h2>Vaults I guard</h2><span class="spacer"></span></header>
+  guarded.innerHTML = `<div class="card"><header><h2>Vaults I guard</h2><span class="spacer"></span><span id="watch-ctl"></span></header>
     <div class="body"><div class="grid" id="guard-grid"><span class="faint">Looking for vaults where you are the guardian…</span></div></div></div>`;
   const scan = async () => {
     const grid = document.getElementById('guard-grid')!;
@@ -198,9 +198,61 @@ async function homePage(id: number) {
       }
     }
     if (id !== renderId) return;
-    grid.innerHTML = (await Promise.all(found.map(vaultSummary))).join('') || '<span class="empty">You guard no vault.</span>';
+    grid.innerHTML = (await Promise.all(found.map(vaultSummary))).join('') || '<span class="empty">You guard no vault yet. A guardian is someone a vault owner trusts to stop payments: ask an owner to name your account.</span>';
+    guardedIds = found.map((t) => t.token_id);
+    renderWatchControl();
   };
   scan().catch(() => {});
+}
+
+// ---------- M23 in the browser: watch my vaults ----------
+let guardedIds: string[] = [];
+let watchTimer = 0;
+const watchSeen = new Set<string>();
+function renderWatchControl() {
+  const ctl = document.getElementById('watch-ctl');
+  if (!ctl || guardedIds.length === 0) return;
+  ctl.innerHTML = watchTimer
+    ? `<span class="badge ok">watching ${guardedIds.length} vault(s)</span> <button class="btn small" id="watch-stop">Stop watching</button>`
+    : '<button class="btn small primary" id="watch-start" title="Get a browser notification when a payment is waiting, while this tab is open">Watch my vaults</button>';
+  document.getElementById('watch-start')?.addEventListener('click', startWatching);
+  document.getElementById('watch-stop')?.addEventListener('click', () => {
+    clearInterval(watchTimer);
+    watchTimer = 0;
+    renderWatchControl();
+  });
+}
+async function startWatching() {
+  if (!('Notification' in window)) return toast('This browser cannot show notifications', 'bad');
+  if ((await Notification.requestPermission()) !== 'granted') return toast('Allow notifications for this page to be alerted', 'bad');
+  const tick = async () => {
+    for (const id of guardedIds) {
+      try {
+        const proposals = await view<any[]>('list_proposals', { token_id: id });
+        for (const p of proposals) {
+          const key = `${id}|${p.id}`;
+          if (watchSeen.has(key)) continue;
+          watchSeen.add(key);
+          const what = describeTx(p.tx.to, p.tx.value, p.tx.data).replace(/<[^>]+>/g, '');
+          const n = new Notification(`Vault #${id}: a payment is waiting`, {
+            body: `${what}. ${Date.now() < p.executable_after_ms ? `It can be sent in ${inTime(p.executable_after_ms)}` : 'It can be sent now'} unless you stop it.`,
+            tag: key,
+            icon: 'favicon.svg',
+          });
+          n.onclick = () => {
+            window.focus();
+            location.hash = `#/vault/${id}`;
+          };
+        }
+      } catch {
+        /* the next tick retries */
+      }
+    }
+  };
+  await tick();
+  watchTimer = window.setInterval(tick, 5000);
+  renderWatchControl();
+  toast(`Watching ${guardedIds.length} vault(s): you will get a notification while this tab is open`, 'ok');
 }
 
 // ---------- vault page ----------
