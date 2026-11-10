@@ -30,7 +30,7 @@ The model resisted the injection but still approved an unknown supplier and a du
 
 1. Open [vault 78](https://alan021011.github.io/near-policy-vault/#/vault/78) (no wallet needed): its rules, its agent, its guardian, and its payments marked *paid* on Sepolia.
 2. `cd contract && cargo test` → **225 unit tests** pass.
-3. The [CI](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml) runs the real contract in a local NEAR sandbox: **9 integration tests** and **49/49 attacks blocked**.
+3. The [CI](https://github.com/Alan021011/near-policy-vault/actions/workflows/tests.yml) runs the real contract in a local NEAR sandbox: **9 integration tests** and **49/49 attacks blocked**. The sandbox uses a **mock** signer that answers like Chain Signatures (including wrong keys, garbage and timeouts); the **real MPC network** is exercised separately by the live runs on Sepolia linked in this README.
 
 | Claim | Proof |
 |---|---|
@@ -43,7 +43,17 @@ The model resisted the injection but still approved an unknown supplier and a du
 | Nobody can change the contract | `near account view-account-summary m3.alan-vault-2026.testnet network-config testnet now` prints "Account is locked (no access keys)"; the key was deleted in transaction `AgJL65MQNxGK58Ai1Forvh71YD3HwpiqLMPUL61TwvMd`, and the agent paid an invoice through the locked contract afterwards ([tx 0x1e802e96…](https://sepolia.etherscan.io/tx/0x1e802e96e0b51354f9b8647702fd3ab7962da796e708e681d6c96aa2bb33f3d7)) |
 | A handover cannot leave the seller a way back in | Two-phase sale and the browser audit; vault 75 was bought from the web page by another account, the seller paid in the same transaction (see *Web page* below); `docs/THREAT_MODEL.md`, threat 1 |
 
-> **Status:** testnet only, test funds only. The deployed contract is a **reproducible build** (SHA-256 `0ff14e79…`, rebuild it with step 4) and its account is **locked: 0 access keys**, so nobody, the author included, can change its code. Details of every piece below.
+> **Status:** testnet only, test funds only. The deployed contract is a **reproducible build** (SHA-256 `0ff14e79…`, rebuild it with step 4) and its account is **locked: 0 access keys**, so nobody, the author included, can change its code ([what happens if a bug is found](docs/MIGRATION.md)). **No independent security audit has been done:** two reviews by another AI model, 225 unit tests and 49 attack tests are evidence, not an audit. Details of every piece below.
+
+## How this differs from Safe, smart accounts and custodians
+
+Spending limits for agents already exist elsewhere (Safe modules such as Zodiac Roles or spending limits, ERC-4337/7579 smart-account permissions, policies at Turnkey or Privy). What is different here:
+- **No single party holds the account's key.** Safe and smart accounts are controlled by keys someone holds; custodians hold keys for you. Here the Ethereum account is controlled by NEAR's signing network (Chain Signatures), which only signs what the NEAR contract checked.
+- **The rules live on NEAR, the money can be on any EVM chain.** Each vault picks its EVM chain with its first rules, so the same contract can protect vaults on different EVM chains (only Sepolia has been tested live); the rules cannot be bypassed from the EVM side because there is no EVM-side key.
+- **The account is an NFT.** Handing over the vault is a transfer of one token, with a waiting window, a guardian veto and a browser check that no old signature or token permission is left, instead of moving assets one by one or sharing a key.
+- **The agent has its own identity and no power over the rules,** and a human guardian can stop what the rules allow but is wrong.
+
+What it does **not** do: it is not a general wallet (no DeFi, no arbitrary contract calls), each vault lives on one EVM chain, and it is testnet only.
 
 ## The idea
 
@@ -152,7 +162,9 @@ The script only reads the contract: it holds no NEAR key and cannot sign or veto
 
 ## Known limits
 
-See `docs/THREAT_MODEL.md`. Residual risks that this design does not remove: trust in the MPC network. The contract itself can no longer be changed (its account has no keys).
+See `docs/THREAT_MODEL.md`. Residual risks that this design does not remove: trust in the MPC network. The contract itself can no longer be changed (its account has no keys); `docs/MIGRATION.md` says what happens if a bug is found.
+
+- **No independent audit.** The contract has not been audited by a security firm. The reviews in this README were done by another AI model; the tests and attack suite cover the threats listed in the threat model, not every possible bug.
 
 - **The contract is final (threat 9).** On 2026-11-10 the contract account's only full-access key was deleted (transaction `AgJL65MQNxGK58Ai1Forvh71YD3HwpiqLMPUL61TwvMd`); `view-account-summary` shows "Account is locked (no access keys)". Nobody can change the code any more, so a bug cannot be fixed in place: a fix would be a new contract at a new account, and vaults would stay where they are. The deployed code is the reproducible build of step 4. `migrate` and `migrate_policies` can no longer be called (they were private to the contract account).
 - **Stolen owner key (threat 16).** A transfer needs a sale window that waits max(policy delay, 10 minutes) and that the guardian can veto, so a thief holding the owner's key has to get past the guardian, and an owner who still holds the key can cancel the thief's sale during that wait. What remains: a thief can replace the guardian after max(2 x delay, 3 days) (threat 18), during which the guardian can keep vetoing; and an owner who notices nothing in 10 minutes cannot react.
