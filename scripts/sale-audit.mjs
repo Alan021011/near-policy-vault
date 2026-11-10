@@ -108,6 +108,7 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
   const fullKeys = keys.keys.filter((k) => k.access_key.permission === 'FullAccess').length;
   lines.push(`contract code sha256 ${codeHex}`);
   if (fullKeys > 0) lines.push(`note: the contract still has ${fullKeys} full-access key(s): whoever holds one can change its code (threat 9)`);
+  else if (keys.keys.length === 0) lines.push('ok: the contract account has no access keys: nobody can change its code');
   if (expectCode && expectCode.toLowerCase() !== codeHex) problems.push(`the contract code is not the expected one (${expectCode})`);
 
   if (inflight) problems.push(`a signature is in flight (nonce ${inflight.nonce}); wait for it to finish`);

@@ -153,8 +153,10 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   checks.push(codeHex === EXPECTED_CODE
     ? { state: 'pass', title: 'The contract runs the expected code', detail: `sha256 ${codeHex}, the build published in the repository.` }
     : { state: 'fail', title: 'The contract does not run the expected code', detail: `sha256 ${codeHex}, expected ${EXPECTED_CODE}.` });
-  if (fullKeys > 0)
-    checks.push({ state: 'warn', title: `The contract has ${fullKeys} full-access key(s)`, detail: 'Whoever holds one can change the contract code (threat 9). It will be deleted before submission.' });
+  // The contract account was locked (no access keys at all) on 2026-11-10: nobody can change its code.
+  checks.push(keys.keys.length === 0
+    ? { state: 'pass', title: 'Nobody can change the contract', detail: 'Its account has no access keys, so its code is final.' }
+    : { state: 'warn', title: `The contract account has ${keys.keys.length} access key(s) (${fullKeys} full-access)`, detail: 'Whoever holds a full-access key can change the contract code (threat 9).' });
 
   // Funds: only the vault's own chain can be moved by this vault.
   const bal = BigInt(await eth<string>(chain, 'eth_getBalance', [info.evm_address, 'latest']));
