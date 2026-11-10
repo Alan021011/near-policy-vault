@@ -28,6 +28,7 @@ The model resisted the injection but still approved an unknown supplier and a du
 
 ## Judges, start here (no wallet needed)
 
+- **[Try to fool the agent](https://alan021011.github.io/near-policy-vault/#/try):** write a fake "urgent" invoice or a prompt injection; a deliberately naive agent tries to pay it, and the live contract (read-only `check_transaction`) shows whether it would be blocked and why. Nothing is signed or sent.
 - **[Verify page](https://alan021011.github.io/near-policy-vault/#/verify):** from your browser, it checks that the deployed code equals the published reproducible build, that nobody holds a key to change it, and re-checks every transaction this README cites (Sepolia receipts and the outcome of each NEAR decision: refused requests failed, vetoes succeeded).
 - **[Vault 78](https://alan021011.github.io/near-policy-vault/#/vault/78):** what the AI agent tried and what stopped it; "Would this payment pass?" asks the live contract about a payment you type.
 

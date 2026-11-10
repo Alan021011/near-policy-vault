@@ -237,3 +237,4 @@ tr:nth-child(even) td { background: #10131b; }
 .vrow .small { font-size: 12px; word-break: break-all; }
 ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 8px; font-size: 14px; }
 .judges { border-color: var(--mint-line); }
+.try-step { margin: 10px 0; font-size: 14px; }
