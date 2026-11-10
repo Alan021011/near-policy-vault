@@ -1360,16 +1360,13 @@ impl PolicyVault {
         let id = t.token_id.clone();
         let stored = self.policies.get(&id);
         let address = self.vault_address(&id);
-        let chain_id = self
-            .vault_chain
-            .get(&id)
-            .or_else(|| stored.as_ref().map(|s| s.policy.chain_id))
-            .unwrap_or(11155111);
+        let chain_id = self.vault_chain.get(&id).or_else(|| stored.as_ref().map(|s| s.policy.chain_id));
         let rules = stored.as_ref().map(|s| art::CardRules {
             eth_daily_cap_wei: s.policy.eth_daily_cap.0,
             delay_ms: s.policy.delay_ms,
             guardian: s.policy.guardian.as_ref().map(|g| g.as_str()),
             agent: s.policy.proposer.as_ref().map(|a| a.as_str()),
+            destinations: s.policy.allowed_destinations.len(),
             nft_collections: s.policy.nfts.len(),
             tokens: s.policy.tokens.len(),
         });
@@ -1380,10 +1377,13 @@ impl PolicyVault {
             rules,
             handover_open: self.active_sale(&id).is_some(),
             signing: self.inflight.get(&id).is_some(),
+            change_pending: stored.as_ref().is_some_and(|s| s.pending.is_some()),
         };
         if let Some(m) = t.metadata.as_mut() {
-            m.media = Some(art::vault_media(&card));
-            m.media_hash = None;
+            // Review M26 (R26-3): NEP-177 requires media_hash with media: sha256 of the SVG.
+            let svg = art::vault_svg(&card);
+            m.media_hash = Some(env::sha256(svg.as_bytes()).into());
+            m.media = Some(art::media_uri(&svg));
         }
         t
     }
@@ -2099,6 +2099,13 @@ impl PolicyVault {
     }
 }
 
+/// Enumeration pages: 50 tokens by default and at most 100 (review M26, R26-1).
+pub const ENUMERATION_DEFAULT_LIMIT: u64 = 50;
+pub const ENUMERATION_MAX_LIMIT: u64 = 100;
+fn page_limit(limit: Option<u64>) -> u64 {
+    limit.unwrap_or(ENUMERATION_DEFAULT_LIMIT).min(ENUMERATION_MAX_LIMIT)
+}
+
 fn emit_policy_event(event: &str, token_id: &TokenId, extra: near_sdk::serde_json::Value) {
     let mut data = json!({ "token_id": token_id });
     if let (Some(d), Some(e)) = (data.as_object_mut(), extra.as_object()) {
@@ -2307,7 +2314,9 @@ impl NonFungibleTokenEnumeration for PolicyVault {
     }
 
     fn nft_tokens(&self, from_index: Option<U128>, limit: Option<u64>) -> Vec<Token> {
-        self.tokens.nft_tokens(from_index, limit).into_iter().map(|t| self.with_image(t)).collect()
+        // Review M26 (R26-1): each token now carries its drawn card, so a page is capped (the
+        // library's default is no limit, which would exceed the view gas cap as supply grows).
+        self.tokens.nft_tokens(from_index, Some(page_limit(limit))).into_iter().map(|t| self.with_image(t)).collect()
     }
 
     fn nft_supply_for_owner(&self, account_id: AccountId) -> U128 {
@@ -2320,7 +2329,7 @@ impl NonFungibleTokenEnumeration for PolicyVault {
         from_index: Option<U128>,
         limit: Option<u64>,
     ) -> Vec<Token> {
-        self.tokens.nft_tokens_for_owner(account_id, from_index, limit).into_iter().map(|t| self.with_image(t)).collect()
+        self.tokens.nft_tokens_for_owner(account_id, from_index, Some(page_limit(limit))).into_iter().map(|t| self.with_image(t)).collect()
     }
 }
 
@@ -4831,5 +4840,17 @@ mod tests {
         // the enumeration methods carry the same image
         let listed = c.nft_tokens(None, None)[0].metadata.clone().unwrap().media;
         assert_eq!(listed, c.nft_token("0".into()).unwrap().metadata.unwrap().media);
+        // R26-3: media_hash is the sha256 of the SVG, so NEP-177 validation passes
+        let m = c.nft_token("0".into()).unwrap().metadata.unwrap();
+        m.assert_valid();
+        assert_eq!(m.media_hash.unwrap().0, env::sha256(media_svg(&c).as_bytes()));
+    }
+
+    /// Review M26 (R26-1): enumeration pages are capped.
+    #[test]
+    fn enumeration_pages_are_capped() {
+        assert_eq!(page_limit(None), 50);
+        assert_eq!(page_limit(Some(10)), 10);
+        assert_eq!(page_limit(Some(u64::MAX)), 100);
     }
 }
