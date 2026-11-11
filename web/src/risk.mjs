@@ -65,6 +65,10 @@ const TEXT_SIGNS = [
   { level: 'warn', code: 'repeat-text', re: /\b(sent again|resen[dt]|re-sent|duplicate|second copy|copy of)\b/i, text: 'Says it is a repeat of an earlier invoice' },
 ];
 
+/**
+ * @param {{ tx: any, policy?: any, history?: any[], pending?: any[], text?: string, now?: number }} args
+ * @returns {{ level: 'high' | 'warn' | 'info', code: string, text: string }[]}
+ */
 export function riskSignals({ tx, policy, history = [], pending = [], text, now = Date.now() }) {
   const out = [];
   const add = (level, code, msg) => out.push({ level, code, text: msg });

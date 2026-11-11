@@ -115,3 +115,27 @@ test('decodeSignedTx refuses malformed or absurd input instead of misreading it'
   assert.throws(() => decodeSignedTx('0x02ff' + 'ff'.repeat(8)), /too large/); // 8-byte length of length
   assert.throws(() => decodeSignedTx('0x02f8ff00'), /past the end/); // declared length longer than the input
 });
+
+test('decodeSignedTx matches viem on 300 random transactions (short, long and empty data, access lists, big values)', () => {
+  let seed = 7;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const hexBytes = (n) => '0x' + Array.from({ length: n }, () => Math.floor(rnd() * 256).toString(16).padStart(2, '0')).join('');
+  const sig = { r: '0x' + '11'.repeat(32), s: '0x' + '22'.repeat(32), yParity: 1 };
+  for (let i = 0; i < 300; i++) {
+    const dataLen = [0, 1, 4, 36, 55, 56, 68, 200, 1000, 70000][i % 10];
+    const tx = {
+      type: 'eip1559', chainId: [1, 11155111, 8453][i % 3], nonce: Math.floor(rnd() * 1e9),
+      maxPriorityFeePerGas: BigInt(Math.floor(rnd() * 1e12)), maxFeePerGas: BigInt(Math.floor(rnd() * 1e15)),
+      gas: BigInt(21000 + Math.floor(rnd() * 1e6)), to: hexBytes(20),
+      value: i % 7 === 0 ? 0n : BigInt(hexBytes(1 + (i % 32))),
+      data: dataLen ? hexBytes(dataLen) : '0x',
+      accessList: i % 5 === 0 ? [{ address: hexBytes(20), storageKeys: [hexBytes(32), hexBytes(32)] }] : [],
+    };
+    const d = decodeSignedTx(serializeTransaction(tx, sig));
+    assert.equal(d.chain_id, tx.chainId, `case ${i} chain`);
+    assert.equal(d.nonce, tx.nonce, `case ${i} nonce`);
+    assert.equal(d.to, tx.to, `case ${i} to`);
+    assert.equal(d.value, tx.value.toString(), `case ${i} value`);
+    assert.equal(d.data, tx.data, `case ${i} data`);
+  }
+});

@@ -1,5 +1,5 @@
 # Runs every automated check on a clean Linux machine, so anyone can see them pass without
-# installing anything: unit tests (contract), golden EVM vectors, the guardian's warning signs (Node), and the M9 sandbox tests
+# installing anything: unit tests (contract), golden EVM vectors, the guardian's warning signs and the MCP protocol (Node), the web page's audit and build, and the M9 sandbox tests
 # (the real wasm in a local NEAR sandbox, nearcore 2.14.0).
 name: tests
 
@@ -45,9 +45,13 @@ jobs:
         with:
           node-version: 22
 
-      - name: Guardian warning signs (M35)
+      - name: Guardian warning signs (M35) and MCP protocol (M38)
         working-directory: scripts
-        run: npm ci && npm run test:risk
+        run: npm ci && npm run test:risk && npm run test:mcp
+
+      - name: "Web page - type check, the buyer's audit against fake chains, and the build (M39)"
+        working-directory: web
+        run: npm ci && npm run typecheck && npm test && npm run build
 
       - name: Contract unit tests and golden vectors
         working-directory: contract

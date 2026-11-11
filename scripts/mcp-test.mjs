@@ -2,6 +2,7 @@
 // its answers against the live contract. Read-only by default:
 //
 //   node mcp-test.mjs                      # initialize, list tools, read vault 78, check two payments
+//   node mcp-test.mjs --offline           # protocol only, no network (used in CI)
 //   node mcp-test.mjs --propose <agent>    # also propose one payment the contract refuses (over the
 //                                          # daily limit) and one it accepts; the accepted one then
 //                                          # waits, and the guardian can stop it
@@ -10,6 +11,7 @@ import assert from 'node:assert/strict';
 
 const i = process.argv.indexOf('--propose');
 const agent = i >= 0 ? process.argv[i + 1] : null;
+const offline = process.argv.includes('--offline');
 const VAULT = '78';
 const HOST = '0x881294c1b52d631ab43fa2bd23d691209b548d11';
 
@@ -41,6 +43,23 @@ console.log('      tools:', names.join(', '));
 ok('no tool can sign, send, veto, cancel or change rules', !names.some((n) => /sign|execute|send|veto|cancel|policy|sale|transfer|buy/i.test(n)));
 ok(agent ? 'propose_payment is offered (agent configured)' : 'propose_payment is not offered without an agent', names.includes('propose_payment') === !!agent);
 
+if (offline) {
+  const bad = await call('get_vault', { token_id: 'not-a-number' });
+  ok('bad input is a tool error, not a crash', bad.error && /vault number/.test(bad.text));
+  const bad2 = await call('check_payment', { token_id: '78', to: '0x12', amount_eth: '1' });
+  ok('a malformed address is refused before any network call', bad2.error && /Ethereum address/.test(bad2.text));
+  const nope = await call('sign_transaction', {});
+  ok('an unknown tool is an error', nope.error && /Unknown tool/.test(nope.text));
+  const unknown = await request('no/such/method', {});
+  ok('an unknown method gets a JSON-RPC error', unknown.error?.code === -32601);
+  const pong = await request('ping', {});
+  ok('ping answers', pong.result && typeof pong.result === 'object');
+  const parse = await new Promise((resolve) => { waiting.set(null, resolve); server.stdin.write('this is not json\n'); });
+  ok('a line that is not JSON gets a parse error', parse.error?.code === -32700);
+  console.log(`\n${pass} checks passed (offline)`);
+  server.kill();
+  process.exit(0);
+}
 const v = await call('get_vault', { token_id: VAULT });
 ok('get_vault reads vault 78 (address, daily limit, guardian)', !v.error && /Ethereum account: 0x[0-9a-f]{40}/.test(v.text) && /Daily limit/.test(v.text) && /Guardian/.test(v.text), v.text);
 const b = await call('get_remaining_budget', { token_id: VAULT });
