@@ -8,12 +8,17 @@
 // anything. Alerts are best effort (only while this script runs); the web page is always the
 // source of truth. It checks every few seconds, so it works with short waiting times.
 //
+// Each payment alert carries the warning signs of web/src/risk.mjs (possible duplicate, new or
+// look-alike recipient, unusual amount...), the same ones the web page shows. They only advise.
+//
 // Usage:
 //   TELEGRAM_BOT_TOKEN=... node guardian-alerts.mjs <vault-contract> --guardian <account>
 //   TELEGRAM_BOT_TOKEN=... node guardian-alerts.mjs <vault-contract> --vaults 78,77
 // Optional: TELEGRAM_CHAT_ID (otherwise the chat that last sent /start to the bot), --every 4
 // (seconds), --test (send one test message and exit). The token is read from the environment
 // only and never printed.
+
+import { historyFromSigned, riskSignals } from '../web/src/risk.mjs';
 
 const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : undefined; };
@@ -119,6 +124,22 @@ async function guardedVaults() {
 // ---------- watch ----------
 const seen = new Set();
 const waiting = new Map(); // `${vault}|${proposal}` -> description
+const SIGN_ICON = { high: '🔴', warn: '🟠', info: '⚪' };
+/** The warning signs of one waiting payment, as message lines. */
+async function signsFor(id, p, proposals, policy) {
+  try {
+    const next = await view('get_next_nonce', { token_id: id });
+    const signed = next > 0 ? await view('list_signed', { token_id: id, from_nonce: Math.max(0, next - 20), limit: 100 }) : [];
+    const signs = riskSignals({ tx: p.tx, policy: policy.policy, history: historyFromSigned(signed),
+      pending: proposals.filter((q) => q.id < p.id).map((q) => ({ id: `request #${q.id}`, ...q.tx })) });
+    return signs.length
+      ? `\nWarning signs (advice only, the contract decides):\n${signs.map((x) => `${SIGN_ICON[x.level]} ${x.text}`).join('\n')}`
+      : '\nNo warning signs: a usual amount to a usual recipient.';
+  } catch (e) {
+    return `\n(warning signs unavailable: ${String(e.message).slice(0, 80)})`;
+  }
+}
+
 async function check(id) {
   const [proposals, policy, sale] = await Promise.all([view('list_proposals', { token_id: id }), view('get_policy', { token_id: id }), view('get_sale', { token_id: id })]);
   const now = new Set();
@@ -129,7 +150,7 @@ async function check(id) {
       const what = describe(p.tx);
       waiting.set(key, what);
       const left = p.executable_after_ms > Date.now() ? `It can be sent in ${inTime(p.executable_after_ms)} unless you stop it.` : 'Its waiting time is over: it can be sent now unless you stop it.';
-      await send(`⚠️ Vault #${id}: a payment is waiting\n${what} (request #${p.id})\n${left}\nOpen: ${link(id)}`);
+      await send(`⚠️ Vault #${id}: a payment is waiting\n${what} (request #${p.id})\n${left}${await signsFor(id, p, proposals, policy)}\nOpen: ${link(id)}`);
     }
   }
   for (const [key, what] of waiting) {

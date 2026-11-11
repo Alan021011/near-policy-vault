@@ -1,5 +1,5 @@
 # Runs every automated check on a clean Linux machine, so anyone can see them pass without
-# installing anything: unit tests (contract), golden EVM vectors, and the M9 sandbox tests
+# installing anything: unit tests (contract), golden EVM vectors, the guardian's warning signs (Node), and the M9 sandbox tests
 # (the real wasm in a local NEAR sandbox, nearcore 2.14.0).
 name: tests
 
@@ -40,6 +40,14 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Guardian warning signs (M35)
+        working-directory: scripts
+        run: npm ci && npm run test:risk
 
       - name: Contract unit tests and golden vectors
         working-directory: contract

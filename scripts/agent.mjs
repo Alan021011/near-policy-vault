@@ -17,6 +17,10 @@
 //           read the payment requests and propose one transaction per request. Without --ai the
 //           decisions are fixed rules (anyone can reproduce them). With --ai a model on NEAR AI
 //           Cloud reads each request (env NEAR_AI_API_KEY, optional NEAR_AI_MODEL).
+//           Before each proposal the agent prints the warning signs of ../web/src/risk.mjs (the same
+//           ones the guardian sees: possible duplicate, new or look-alike recipient, unusual amount,
+//           urgent or "ignore the rules" wording). By default it still proposes (the demo agent is
+//           naive on purpose); with --careful it leaves anything with a red sign to a human.
 //   execute <vault-contract> <token_id> <agent> [proposal_id]
 //           sign every proposal (or only the one given) that is ready (delay passed, not vetoed) and broadcast it.
 //
@@ -28,6 +32,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createPublicClient, http, keccak256, parseEther, serializeTransaction, formatEther } from 'viem';
 import { sepolia } from 'viem/chains';
+import { historyFromSigned, riskSignals } from '../web/src/risk.mjs';
 
 const NEAR = process.env.NEAR_CLI || join(homedir(), '.cargo', 'bin', process.platform === 'win32' ? 'near.exe' : 'near');
 const RPC = process.env.NEAR_RPC || 'https://rpc.testnet.fastnear.com';
@@ -41,6 +46,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : undefined; };
 const useAi = args.includes('--ai') ? (args.splice(args.indexOf('--ai'), 1), true) : false;
+const careful = args.includes('--careful') ? (args.splice(args.indexOf('--careful'), 1), true) : false;
 const requestsFile = flag('--requests') ?? new URL('./agent-requests.json', import.meta.url);
 const [cmd, ...rest] = args;
 
@@ -142,18 +148,27 @@ async function setup([owner, vault, agent, guardian]) {
 async function propose([vault, t, agent]) {
   if (!agent) throw new Error('usage: node agent.mjs propose <vault-contract> <token_id> <agent> [--ai] [--requests file]');
   const requests = JSON.parse(readFileSync(requestsFile, 'utf8'));
-  const chain = (await view(vault, 'get_policy', { token_id: t })).policy.chain_id;
-  console.log(`agent ${agent} on vault ${t}, decisions by ${useAi ? 'a model on NEAR AI Cloud' : 'fixed rules (reproducible)'}\n`);
+  const policy = (await view(vault, 'get_policy', { token_id: t })).policy;
+  const chain = policy.chain_id;
+  // What the vault already paid and what is waiting, for the warning signs.
+  const next = await view(vault, 'get_next_nonce', { token_id: t });
+  const history = historyFromSigned(next > 0 ? await view(vault, 'list_signed', { token_id: t, from_nonce: Math.max(0, next - 20), limit: 100 }) : []);
+  const pending = (await view(vault, 'list_proposals', { token_id: t })).map((q) => ({ id: `request #${q.id}`, ...q.tx }));
+  console.log(`agent ${agent} on vault ${t}, decisions by ${useAi ? 'a model on NEAR AI Cloud' : 'fixed rules (reproducible)'}${careful ? ', careful mode' : ''}\n`);
   for (const req of requests) {
     const d = useAi ? await decideByAi(req.text) : decideByRules(req.text);
     console.log(`[${req.id}] "${req.text}"`);
     if (!d.pay) { console.log(`   agent: skip (${d.reason})\n`); continue; }
-    console.log(`   agent: pay ${d.amount_eth} ETH to ${d.to} (${d.reason})`);
     const f = await fees();
     const tx = { chain_id: chain, max_priority_fee_per_gas: String(f.maxPriorityFeePerGas), max_fee_per_gas: String(f.maxFeePerGas),
       gas_limit: 21000, to: d.to, value: parseEther(String(d.amount_eth)).toString(), data: '0x' };
+    const signs = riskSignals({ tx, policy, history, pending, text: req.text });
+    for (const s of signs) console.log(`   ${s.level === 'high' ? 'WARNING' : s.level === 'warn' ? 'check  ' : 'note   '} ${s.text}`);
+    if (careful && signs.some((s) => s.level === 'high')) { console.log('   agent (careful): not proposed, left for a human because of a red warning sign\n'); continue; }
+    console.log(`   agent: pay ${d.amount_eth} ETH to ${d.to} (${d.reason})`);
     const r = call(vault, agent, 'propose', { token_id: t, tx }, '0.05 NEAR');
     const created = events(r.out, 'proposal_created')[0];
+    if (created) pending.push({ id: req.id, ...tx });
     console.log(created
       ? `   contract: queued as proposal #${created.proposal_id}; signable after the delay unless the guardian vetoes it\n`
       : `   contract: REFUSED — ${r.panic}\n`);

@@ -238,3 +238,12 @@ tr:nth-child(even) td { background: #10131b; }
 ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 8px; font-size: 14px; }
 .judges { border-color: var(--mint-line); }
 .try-step { margin: 10px 0; font-size: 14px; }
+
+/* M35: warning signs for the guardian */
+ul.signs { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 13px; }
+ul.signs li { padding: 4px 8px; border-radius: 6px; border-left: 3px solid var(--line); background: var(--surface); }
+ul.signs li.high { border-left-color: #d64545; background: rgba(214, 69, 69, 0.08); }
+ul.signs li.warn { border-left-color: #c98a12; background: rgba(201, 138, 18, 0.08); }
+ul.signs li.info { color: var(--muted); }
+.signs-none { margin-top: 8px; font-size: 13px; }
+.signs-note { font-size: 12px; margin-top: 4px; }
