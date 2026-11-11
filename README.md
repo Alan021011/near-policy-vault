@@ -189,7 +189,7 @@ The script only reads the contract: it holds no NEAR key and cannot sign or veto
 
 ## Known limits
 
-See `docs/THREAT_MODEL.md`. Residual risks that this design does not remove: trust in the MPC network. The contract itself can no longer be changed (its account has no keys); `docs/MIGRATION.md` says what happens if a bug is found.
+See `docs/THREAT_MODEL.md`. Residual risks that this design does not remove: trust in the MPC network. The contract itself can no longer be changed (its account has no keys); `docs/MIGRATION.md` says what happens if a bug is found, and [`docs/V2.md`](docs/V2.md) says how a next contract would remove the limits below that come from the contract (rolling window, spending that survives a handover, one key per vault, an agent always paired with a guardian, unique invoice references, a fee floor for the agent, several chains), with the invariant and the tests each change would need. V2 is a design only: nothing of it is deployed.
 
 - **No independent audit.** The contract has not been audited by a security firm. The reviews in this README were done by another AI model; the tests and attack suite cover the threats listed in the threat model, not every possible bug.
 

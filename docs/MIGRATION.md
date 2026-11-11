@@ -2,6 +2,8 @@
 
 The vault contract (`m3.alan-vault-2026.testnet`) has no access keys: nobody, the author included, can change its code. That is what makes its rules trustworthy, and it also means **a bug cannot be fixed in place**. This page says what happens then. It describes a procedure; it has not been needed or rehearsed end to end.
 
+What a next contract would change is designed in [V2.md](V2.md).
+
 ## What a fix looks like
 1. A corrected contract (v2) is built reproducibly, reviewed and deployed at a **new account**, then locked the same way.
 2. The web page and the README point new vaults to v2, and say clearly which version a vault belongs to.
