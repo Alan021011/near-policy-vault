@@ -12,7 +12,7 @@ What a next contract would change is designed in [V2.md](V2.md).
 ## How an owner moves a vault's assets from v1 to v2
 No migration function is needed: the current rules already allow it, through the normal path.
 1. The owner mints a vault on v2 and copies its new Ethereum address.
-2. On the v1 vault, the owner adds that address to the **approved recipients** (and, for tokens or NFTs, the token or collection). This is a looser rule: it **waits the vault's waiting time, and the guardian can veto it**, which is the protection against a thief using the same path.
+2. On the v1 vault, the owner adds that address to the **approved recipients** (and, for tokens or NFTs, the token or collection). This is a looser rule: it **waits the vault's waiting time, and the guardian can veto it**. That slows a thief who uses the same path, but it is not a permanent protection: a thief holding the owner's key can replace the guardian after max(2 x delay, 3 days) (threat 18), so with a stolen key it is a race of at least that long, not a lock. If the owner's key may be stolen, the owner moves the assets first.
 3. The owner (or the agent) requests payments to the new address: ETH, ERC-20 transfers and NFT transfers, each within the vault's daily limits. A large balance takes several days, or the owner raises the daily limit first (also a looser rule: it waits and can be vetoed).
 4. When the v1 vault is empty, the owner removes the agent and keeps or hands over the v1 NFT; it no longer controls anything of value.
 

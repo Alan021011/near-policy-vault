@@ -116,15 +116,24 @@ export function decodeSignedTx(raw) {
   if (!hex.startsWith('02')) throw new Error('not an EIP-1559 transaction');
   const b = Uint8Array.from(hex.slice(2).match(/../g).map((x) => parseInt(x, 16)));
   const toHex = (u) => '0x' + Array.from(u, (x) => x.toString(16).padStart(2, '0')).join('');
-  const len = (at, n) => { let v = 0; for (let i = 0; i < n; i++) v = v * 256 + b[at + i]; return v; };
+  // A length of length above 6 bytes (more than 2^48 bytes) cannot be real here and would lose
+  // precision as a Number: refuse it. Every item must also fit inside the input.
+  const len = (at, n) => {
+    if (n > 6) throw new Error('RLP length too large');
+    let v = 0;
+    for (let i = 0; i < n; i++) v = v * 256 + b[at + i];
+    return v;
+  };
+  const fits = (end) => { if (end > b.length) throw new Error('RLP item runs past the end'); return end; };
   // returns [item, next position]; lists come back as arrays of byte strings or lists
   const item = (at) => {
     const p = b[at];
+    if (p === undefined) throw new Error('RLP input ended early');
     if (p < 0x80) return [b.subarray(at, at + 1), at + 1];
-    if (p < 0xb8) return [b.subarray(at + 1, at + 1 + p - 0x80), at + 1 + p - 0x80];
-    if (p < 0xc0) { const n = p - 0xb7, l = len(at + 1, n); return [b.subarray(at + 1 + n, at + 1 + n + l), at + 1 + n + l]; }
+    if (p < 0xb8) return [b.subarray(at + 1, fits(at + 1 + p - 0x80)), at + 1 + p - 0x80];
+    if (p < 0xc0) { const n = p - 0xb7, l = len(at + 1, n); return [b.subarray(at + 1 + n, fits(at + 1 + n + l)), at + 1 + n + l]; }
     let start, end;
-    if (p < 0xf8) { start = at + 1; end = start + p - 0xc0; } else { const n = p - 0xf7; start = at + 1 + n; end = start + len(at + 1, n); }
+    if (p < 0xf8) { start = at + 1; end = fits(start + p - 0xc0); } else { const n = p - 0xf7; start = at + 1 + n; end = fits(start + len(at + 1, n)); }
     const list = [];
     for (let i = start; i < end;) { const [x, next] = item(i); list.push(x); i = next; }
     return [list, end];

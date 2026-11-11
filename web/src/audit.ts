@@ -105,11 +105,22 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   else checks.push({ state: 'pass', title: `Sale #${sale.sale_id} is open`, detail: `Until ${new Date(sale.closes_at_ms).toUTCString()}.` });
   if (inflight) checks.push({ state: 'fail', title: `A signature is in flight (nonce ${inflight.nonce})`, detail: 'Wait for it to finish.' });
 
+  // Every Ethereum read below uses one block, a little behind the head (some public nodes are
+  // load-balanced across servers that are not all at the same height), and only if that node is up
+  // to date: otherwise the audit is incomplete, never safe (external review, second round).
+  const head = await eth<any>(chain, 'eth_getBlockByNumber', ['latest', false]);
+  const pinned = Number(BigInt(head.number)) - 2;
+  const tag = '0x' + pinned.toString(16);
+  const headAgeS = Math.round(now / 1000 - Number(BigInt(head.timestamp)));
+  checks.push(headAgeS > 300
+    ? { state: 'incomplete', title: `The Ethereum node is ${headAgeS} s behind`, detail: 'Its newest block is too old to vouch for the current state. Run the check again later.' }
+    : { state: 'pass', title: `Ethereum read at block ${pinned}`, detail: 'Every Ethereum check below reads this same block, from an up-to-date node.' });
+
   // Kept signatures: every nonce the contract signed must already be used on the vault's chain.
   let mined = 0;
   const signed = next > 0 ? await allSigned(tokenId, next) : [];
   if (next > 0) {
-    mined = Number(BigInt(await eth<string>(chain, 'eth_getTransactionCount', [info.evm_address, 'latest'])));
+    mined = Number(BigInt(await eth<string>(chain, 'eth_getTransactionCount', [info.evm_address, tag])));
     if (mined >= next) {
       checks.push({ state: 'pass', title: `Every nonce the contract signed is used on chain ${chain}`, detail: `Contract next nonce ${next}, account nonce ${mined}: no signature the seller kept can still be mined.` });
     } else {
@@ -145,7 +156,7 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   let logsScanned = true;
   if (tokens.size && info.evm_address) {
     try {
-      const latest = Number(BigInt(await eth<string>(chain, 'eth_blockNumber', [])));
+      const latest = pinned;
       const issued = Number(token?.metadata?.issued_at ?? 0);
       const from = Math.max(0, latest - Math.ceil((now - issued) / SEPOLIA_BLOCK_MS) - 2000);
       for (const t of tokens) {
@@ -160,7 +171,7 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   }
   let left = 0;
   for (const { token: t, spender } of pairs.values()) {
-    const amount = BigInt(await eth<string>(chain, 'eth_call', [{ to: t, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, 'latest']));
+    const amount = BigInt(await eth<string>(chain, 'eth_call', [{ to: t, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, tag]));
     if (amount > 0n) {
       left++;
       checks.push({ state: 'fail', title: 'An ERC-20 approval survives the sale', detail: `Token ${t}: ${spender} may still take ${amount} units. The seller cancels the sale, signs approve(${spender}, 0), mines it and starts a new sale.` });
@@ -185,7 +196,7 @@ export async function audit(tokenId: string): Promise<AuditResult> {
     : { state: 'fail', title: `The contract account has ${keys.keys.length} access key(s) (${fullKeys} full-access)`, detail: 'Whoever holds a full-access key can change the contract code (threat 9).' });
 
   // Funds: only the vault's own chain can be moved by this vault.
-  const bal = BigInt(await eth<string>(chain, 'eth_getBalance', [info.evm_address, 'latest']));
+  const bal = BigInt(await eth<string>(chain, 'eth_getBalance', [info.evm_address, tag]));
   checks.push({ state: 'info', title: `Balance on chain ${chain}: ${Number(bal) / 1e18} ETH`, detail: 'Funds at this address on other EVM chains cannot be moved by this vault.' });
 
   const saleAfter = await v('get_sale', { token_id: tokenId });

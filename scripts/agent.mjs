@@ -113,7 +113,7 @@ async function decideByAi(text) {
   // amount become a proposal (the contract still checks everything).
   const to = String(d.to ?? '').toLowerCase();
   const amount = String(d.amount_eth ?? '');
-  if (d.pay && (!/^0x[0-9a-f]{40}$/.test(to) || !/^[0-9]+(.[0-9]{1,18})?$/.test(amount)))
+  if (d.pay && (!/^0x[0-9a-f]{40}$/.test(to) || !/^[0-9]+(\.[0-9]{1,18})?$/.test(amount)))
     return { pay: false, reason: `${model} gave a malformed address or amount` };
   return { pay: !!d.pay, to, amount_eth: amount, reason: `${model}: ${String(d.reason ?? '').slice(0, 160)}` };
 }
@@ -159,9 +159,12 @@ async function propose([vault, t, agent]) {
     const d = useAi ? await decideByAi(req.text) : decideByRules(req.text);
     console.log(`[${req.id}] "${req.text}"`);
     if (!d.pay) { console.log(`   agent: skip (${d.reason})\n`); continue; }
+    // An amount that cannot be read skips this request; it never stops the whole run.
+    let value;
+    try { value = parseEther(String(d.amount_eth)).toString(); } catch { console.log(`   agent: skip (unreadable amount "${d.amount_eth}")\n`); continue; }
     const f = await fees();
     const tx = { chain_id: chain, max_priority_fee_per_gas: String(f.maxPriorityFeePerGas), max_fee_per_gas: String(f.maxFeePerGas),
-      gas_limit: 21000, to: d.to, value: parseEther(String(d.amount_eth)).toString(), data: '0x' };
+      gas_limit: 21000, to: d.to, value, data: '0x' };
     const signs = riskSignals({ tx, policy, history, pending, text: req.text });
     for (const s of signs) console.log(`   ${s.level === 'high' ? 'WARNING' : s.level === 'warn' ? 'check  ' : 'note   '} ${s.text}`);
     if (careful && signs.some((s) => s.level === 'high')) { console.log('   agent (careful): not proposed, left for a human because of a red warning sign\n'); continue; }

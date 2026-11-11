@@ -145,9 +145,21 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
   const outstanding = [];
   const allowances = [];
   const rpc = ethRpc || (chain ? DEFAULT_ETH_RPC[chain] : undefined);
+  // Every Ethereum read uses one block, a little behind the head, from an up-to-date node; a node more
+  // than 5 minutes behind makes the audit INCOMPLETE (external review, second round).
+  let tag = 'latest';
+  let pinned = null;
+  if (rpc) {
+    const head = await eth(rpc, 'eth_getBlockByNumber', ['latest', false]);
+    pinned = Number(BigInt(head.number)) - 2;
+    tag = '0x' + pinned.toString(16);
+    const age = Math.round(Date.now() / 1000 - Number(BigInt(head.timestamp)));
+    if (age > 300) problems.push(`INCOMPLETE: the Ethereum node's newest block is ${age} s old; run the audit again or use another --eth-rpc`);
+    else lines.push(`Ethereum read at block ${pinned} (node up to date)`);
+  }
   if (next > 0) {
     if (!rpc) throw new Error(`no RPC known for chain ${chain}; pass --eth-rpc`);
-    mined = Number(BigInt(await eth(rpc, 'eth_getTransactionCount', [info.evm_address, 'latest'])));
+    mined = Number(BigInt(await eth(rpc, 'eth_getTransactionCount', [info.evm_address, tag])));
     const pending = Number(BigInt(await eth(rpc, 'eth_getTransactionCount', [info.evm_address, 'pending'])));
     lines.push(`nonces: contract next = ${next}, mined on chain = ${mined}, pending in mempool = ${pending}`);
     for (let n = mined; n < next; n++) {
@@ -172,7 +184,7 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
       }
     }
     try {
-      const latest = Number(BigInt(await eth(rpc, 'eth_blockNumber', [])));
+      const latest = pinned;
       const from = Math.max(0, latest - Math.ceil((Date.now() - Number(token?.metadata?.issued_at ?? 0)) / 12000) - 2000);
       for (const t of tokens) {
         for (let f = from; f <= latest; f += LOG_RANGE) {
@@ -186,7 +198,7 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
       problems.push(`INCOMPLETE: Approval events could not be scanned (${e.message}); run the audit again, or with --eth-rpc pointing at another node`);
     }
     for (const { token, spender } of pairs.values()) {
-      const left = BigInt(await eth(rpc, 'eth_call', [{ to: token, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, 'latest']));
+      const left = BigInt(await eth(rpc, 'eth_call', [{ to: token, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, tag]));
       allowances.push({ token, spender, allowance: left.toString() });
       if (left > 0n) {
         problems.push(`token ${token}: ${spender} may still take ${left} units (an approval survives the sale) — before selling, the seller cancels the sale, signs approve(${spender}, 0), mines it and starts a new sale`);
@@ -197,7 +209,7 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
     lines.push('the vault never signed anything');
   }
   if (rpc && info.evm_address) {
-    const bal = BigInt(await eth(rpc, 'eth_getBalance', [info.evm_address, 'latest']));
+    const bal = BigInt(await eth(rpc, 'eth_getBalance', [info.evm_address, tag]));
     lines.push(`balance on chain ${chain ?? '(the policy chain)'}: ${bal} wei; funds at this address on other EVM chains cannot be moved by this vault`);
   }
   // Review M12 (R12-6): an uncertain nonce below the mined nonce means something the contract

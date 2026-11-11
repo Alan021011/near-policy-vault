@@ -536,7 +536,7 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
     ? `<details style="margin-top:12px"><summary class="btn small" style="display:inline-block">${d.policy.has_policy ? 'Change the rules' : 'Set the rules'}</summary>
         <p class="faint">Stricter rules apply at once. Looser rules (or a new agent) wait the current waiting time, and the guardian can stop them. Replacing the guardian waits max(2 × waiting time, 3 days).</p>
         <form id="policy-form" class="form">
-          <label><div class="label">Waiting time (seconds)</div><input name="delay" value="${draft.delay_ms / 1000}" /></label>
+          <label><div class="label">Waiting time (seconds)</div><input name="delay" value="${draft.delay_ms / 1000}" /><div class="help">The guardian can only stop a payment during this time. With a person as guardian, use hours (e.g. 3600), not seconds; 0 means nobody can stop a payment. The demo vaults use 60 s only so you can watch it.</div></label>
           <label><div class="label">Guardian (NEAR account)</div><input name="guardian" value="${esc(draft.guardian ?? '')}" placeholder="e.g. your-friend.testnet" /><div class="help">A person you trust who can stop payments. It cannot be the same account as the agent.</div></label>
           <label><div class="label">Daily limit (ETH)</div><input name="cap" value="${formatEther(BigInt(draft.eth_daily_cap))}" /></label>
           <label><div class="label">Max network fee per payment (ETH)</div><input name="gas" value="${formatEther(BigInt(draft.max_gas_cost))}" /></label>

@@ -108,3 +108,10 @@ test('history: one entry per nonce, nothing for a cancelled nonce', () => {
   ]);
   assert.deepEqual(h.map((x) => x.value), ['2']);
 });
+
+test('decodeSignedTx refuses malformed or absurd input instead of misreading it', () => {
+  assert.throws(() => decodeSignedTx('0x01c0'), /EIP-1559/);
+  assert.throws(() => decodeSignedTx('0x02c5'), /ended early|past the end/); // list says 5 bytes, none follow
+  assert.throws(() => decodeSignedTx('0x02ff' + 'ff'.repeat(8)), /too large/); // 8-byte length of length
+  assert.throws(() => decodeSignedTx('0x02f8ff00'), /past the end/); // declared length longer than the input
+});
