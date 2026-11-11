@@ -20,7 +20,7 @@
 // and every version of every nonce (list_signed pages by record count).
 //
 // Usage: node sale-audit.mjs <vault-contract> <token_id> [--eth-rpc <url>] [--expect-code <hex>]
-// Exit code 0 = SAFE, 2 = NOT SAFE.
+// Exit code 0 = SAFE, 2 = NOT SAFE or INCOMPLETE (a check could not be completed: never treated as safe).
 import { fileURLToPath } from 'node:url';
 import { parseTransaction } from 'viem';
 
@@ -69,6 +69,24 @@ const word = (addr) => addr.toLowerCase().replace(/^0x/, '').padStart(64, '0');
 
 const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
 const LOG_RANGE = 50_000; // the public RPC's largest eth_getLogs range
+// Old Approval events: some public nodes answer "pruned history unavailable"; ask nodes that keep the
+// history in turn (an --eth-rpc given by the user is tried first), a few times each.
+const LOG_RPCS = ['https://sepolia.gateway.tenderly.co', 'https://ethereum-sepolia-rpc.publicnode.com'];
+async function getLogs(first, filter) {
+  const urls = [...new Set([first, ...LOG_RPCS].filter(Boolean))];
+  let last;
+  for (let i = 0; i < urls.length * 3; i++) {
+    try {
+      const r = await eth(urls[i % urls.length], 'eth_getLogs', [filter]);
+      if (Array.isArray(r)) return r;
+      throw new Error('no result');
+    } catch (e) {
+      last = e;
+      await new Promise((ok) => setTimeout(ok, 300));
+    }
+  }
+  throw last;
+}
 
 /** Every signed record of a vault, all versions. list_signed pages by record count, so a full
  *  page is continued from its last nonce and duplicates are dropped (review M12, R12-8). */
@@ -158,12 +176,14 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
       const from = Math.max(0, latest - Math.ceil((Date.now() - Number(token?.metadata?.issued_at ?? 0)) / 12000) - 2000);
       for (const t of tokens) {
         for (let f = from; f <= latest; f += LOG_RANGE) {
-          const logs = await eth(rpc, 'eth_getLogs', [{ address: t, fromBlock: '0x' + f.toString(16), toBlock: '0x' + Math.min(latest, f + LOG_RANGE - 1).toString(16), topics: [APPROVAL_TOPIC, '0x' + word(info.evm_address)] }]);
+          const logs = await getLogs(rpc, { address: t, fromBlock: '0x' + f.toString(16), toBlock: '0x' + Math.min(latest, f + LOG_RANGE - 1).toString(16), topics: [APPROVAL_TOPIC, '0x' + word(info.evm_address)] });
           for (const l of logs) pairs.set(`${t}|0x${l.topics[2].slice(26)}`, { token: t, spender: '0x' + l.topics[2].slice(26) });
         }
       }
     } catch (e) {
-      lines.push(`note: Approval events could not be scanned (${e.message}); only approvals in the signed history were checked`);
+      // Fail closed: a check that could not run is not a pass (the approvals in the signed history are
+      // still checked below, but the audit cannot say SAFE without the event scan).
+      problems.push(`INCOMPLETE: Approval events could not be scanned (${e.message}); run the audit again, or with --eth-rpc pointing at another node`);
     }
     for (const { token, spender } of pairs.values()) {
       const left = BigInt(await eth(rpc, 'eth_call', [{ to: token, data: SEL_ALLOWANCE + word(info.evm_address) + word(spender) }, 'latest']));
@@ -202,6 +222,7 @@ if (isMain) {
   for (const p of r.problems) console.log('  ! ' + p);
   console.log(r.safe
     ? `SAFE for sale ${r.sale.sale_id}: no signature the seller holds can still be mined and no ERC-20 approval is left. ${r.sale.price ? `Buy with sale_id ${r.sale.sale_id}.` : `Pay only through a transfer bound to "sale:${r.sale.sale_id}".`}`
-    : 'NOT SAFE: see the points above');
+    : r.problems.every((p) => p.startsWith('INCOMPLETE')) ? 'INCOMPLETE: a check could not be completed; do not buy until the audit says SAFE' : 'NOT SAFE: see the points above');
+  if (r.safe && Date.now() < r.sale.opens_at_ms) console.log(`(the sale opens in ${Math.ceil((r.sale.opens_at_ms - Date.now()) / 1000)} s: the contract refuses a purchase before that; run the audit again then)`);
   process.exit(r.safe ? 0 : 2);
 }

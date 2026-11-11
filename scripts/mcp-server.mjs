@@ -2,11 +2,12 @@
 // a vault, ask the live contract whether a payment would pass, see what is waiting and, when an agent
 // account is configured, propose a payment. Nothing else.
 //
-// What it can NEVER do: sign, send, change the rules, veto, cancel, sell or move a vault. There is no
-// such tool, and the only write it can make is `propose`, as the vault policy's agent, which the
-// contract checks against the rules; the payment then waits the vault's waiting time and the guardian
-// can stop it. It holds no key: proposing goes through the NEAR CLI, which signs with the agent's key
-// from the system keychain.
+// Its only write: when POLICY_VAULT_AGENT is set, `propose_payment` signs and sends ONE kind of NEAR
+// transaction, a call to the contract's `propose` as the vault's agent (through the NEAR CLI, with the
+// agent's key from the system keychain; the server itself holds no key). The contract checks the
+// proposal against the rules; the payment then waits the vault's waiting time and the guardian can
+// stop it. What it can NEVER do: sign or broadcast the vault's Ethereum transaction (it has no
+// `execute_proposal`), veto, cancel, change the rules, sell or move a vault. There is no such tool.
 //
 // Transport: MCP over stdio (JSON-RPC 2.0, one message per line), written by hand so the server has
 // no dependency beyond what scripts/ already uses (viem).
@@ -177,7 +178,7 @@ const TOOLS = [
 // Proposing is the only write, and only when an agent account is configured.
 if (AGENT) TOOLS.push({
   name: 'propose_payment',
-  description: `Propose an ETH payment from the vault, as its agent (${AGENT}). The contract checks it against the vault's rules; if accepted, it waits the vault's waiting time and the guardian can stop it. This tool cannot sign, send or change anything else. Costs a 0.05 NEAR deposit, refunded when the proposal ends. Check the warning signs with check_payment first.`,
+  description: `Propose an ETH payment from the vault, as its agent (${AGENT}). The contract checks it against the vault's rules; if accepted, it waits the vault's waiting time and the guardian can stop it. It signs and sends only that NEAR proposal transaction (with the agent's key); it cannot sign or broadcast the vault's Ethereum transaction, veto or change rules. Costs a 0.05 NEAR deposit, refunded when the proposal ends. Check the warning signs with check_payment first.`,
   inputSchema: { type: 'object', properties: { ...PAYMENT, invoice_text: { type: 'string', description: 'Optional: the invoice text, checked for warning signs' } }, required: ['token_id', 'to', 'amount_eth'] },
   async run(a) {
     const id = idOf(a);
@@ -214,7 +215,7 @@ async function handle(m) {
           protocolVersion: m.params?.protocolVersion ?? '2025-06-18',
           capabilities: { tools: {} },
           serverInfo: SERVER,
-          instructions: `Policy Vault on NEAR testnet (${CONTRACT}). Each vault is an NFT that controls an Ethereum account; the contract signs only what the vault's rules allow. These tools read vaults and check payments${AGENT ? `, and propose payments as the agent ${AGENT}` : ''}. Nothing here can sign, send, veto or change rules.`,
+          instructions: `Policy Vault on NEAR testnet (${CONTRACT}). Each vault is an NFT that controls an Ethereum account; the contract signs only what the vault's rules allow. These tools read vaults and check payments${AGENT ? `, and propose payments as the agent ${AGENT}` : ''}. No tool can sign or broadcast the vault's Ethereum transactions, veto or change rules; proposing sends a NEAR transaction as the agent.`,
         };
         break;
       case 'ping': result = {}; break;

@@ -779,12 +779,20 @@ function auditSection(d: VaultData) {
 
 function renderAudit(d: VaultData, r: AuditResult) {
   const out = document.getElementById('audit-out')!;
-  const icon = { pass: '✓', fail: '✕', warn: '!', info: 'i' } as const;
+  const icon = { pass: '✓', fail: '✕', warn: '!', info: 'i', incomplete: '?', waiting: '◷' } as const;
+  // Only a complete, passing audit allows a purchase (fail closed): an unanswered RPC or a handover
+  // that has not opened yet is never shown as safe.
   const canBuy = r.safe && r.sale?.price && accountId && accountId !== d.owner && (!r.sale.buyer || r.sale.buyer === accountId) && Date.now() >= r.sale.opens_at_ms;
+  const head = {
+    safe: [`Safe to take over (handover #${esc(r.sale?.sale_id)})`, 'Every check completed: no payment the previous owner signed can still go through, and no token permission is left.'],
+    unsafe: ['Not safe yet', 'See the failed checks below.'],
+    incomplete: ['Check incomplete: do not take over yet', 'A check could not be completed (a public RPC did not answer). Run it again; taking over stays disabled until every check completes.'],
+    waiting: ['Not open yet', 'The handover has not opened. Run the check again when it opens; taking over is possible only then.'],
+  }[r.verdict];
   out.innerHTML = `
-    <div class="verdict ${r.safe ? 'ok' : 'bad'}"><div class="big">${r.safe ? `Safe to take over (handover #${esc(r.sale.sale_id)})` : 'Not safe yet'}</div>
-      <div class="muted">${r.safe ? 'No payment the previous owner signed can still go through, and no token permission is left.' : 'See the failed checks below.'}</div></div>
-    ${r.checks.map((c) => `<div class="check ${c.state}"><div class="icon">${icon[c.state]}</div><div><div>${esc(c.title)}</div>${c.detail ? `<div class="detail">${esc(c.detail)}</div>` : ''}</div></div>`).join('')}
+    <div class="verdict ${r.safe ? 'ok' : 'bad'}"><div class="big">${head[0]}</div>
+      <div class="muted">${head[1]}</div></div>
+    ${r.checks.map((c) => `<div class="check ${c.state === 'incomplete' || c.state === 'waiting' ? 'warn' : c.state}"><div class="icon">${icon[c.state]}</div><div><div>${esc(c.title)}</div>${c.detail ? `<div class="detail">${esc(c.detail)}</div>` : ''}</div></div>`).join('')}
     ${r.safe && r.sale?.price ? `<div class="row" style="margin-top:14px">
       <button class="btn primary" data-action="buy" data-sale="${esc(r.sale.sale_id)}" data-price="${esc(r.sale.price)}" ${canBuy ? '' : 'disabled'}>Take over for ${yoctoToNear(r.sale.price)} NEAR (handover #${esc(r.sale.sale_id)})</button>
       <span class="faint">${!accountId ? 'Connect a wallet to take over.' : accountId === d.owner ? 'You own this vault.' : r.sale.buyer && r.sale.buyer !== accountId ? `Reserved for ${esc(r.sale.buyer)}.` : Date.now() < r.sale.opens_at_ms ? 'The handover has not opened yet.' : 'If the owner restarts the handover, this fails and your NEAR comes back.'}</span></div>`

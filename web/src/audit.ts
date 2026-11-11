@@ -4,14 +4,19 @@
 import { parseTransaction } from 'viem';
 import { CONTRACT, DEFAULT_CHAIN, EXPECTED_CODE, OVERRIDDEN, eth, nearRpc, view } from './near';
 
-export type CheckState = 'pass' | 'fail' | 'warn' | 'info';
+// 'incomplete': a required check could not be completed (e.g. an RPC did not answer); 'waiting':
+// the handover has not opened yet. Either one keeps the verdict from being SAFE (fail closed).
+export type CheckState = 'pass' | 'fail' | 'warn' | 'info' | 'incomplete' | 'waiting';
+export type Verdict = 'safe' | 'unsafe' | 'incomplete' | 'waiting';
 export interface Check {
   state: CheckState;
   title: string;
   detail?: string;
 }
 export interface AuditResult {
+  /** True only when every required check passed: the only verdict that allows a purchase. */
   safe: boolean;
+  verdict: Verdict;
   checks: Check[];
   sale: any;
   codeHex: string;
@@ -30,6 +35,27 @@ const SEL_ALLOWANCE = '0xdd62ed3e';
 const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
 const LOG_RANGE = 50_000; // the public RPC's largest eth_getLogs range
 const SEPOLIA_BLOCK_MS = 12_000;
+// Approval events of old blocks: some public nodes answer "pruned history unavailable", so each range
+// is asked to nodes that keep the history, in turn, a few times. Only if all of them fail is the
+// check reported incomplete (and the audit is then not SAFE).
+const LOG_RPCS: Record<number, string[]> = { 11155111: ['https://sepolia.gateway.tenderly.co', 'https://ethereum-sepolia-rpc.publicnode.com'] };
+async function getLogs(chain: number, filter: object): Promise<any[]> {
+  const urls = LOG_RPCS[chain];
+  if (!urls) return eth<any[]>(chain, 'eth_getLogs', [filter]);
+  let last: unknown;
+  for (let i = 0; i < urls.length * 3; i++) {
+    try {
+      const j = await fetch(urls[i % urls.length], { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getLogs', params: [filter] }) }).then((r) => r.json());
+      if (j.error) throw new Error(j.error.message);
+      if (Array.isArray(j.result)) return j.result;
+      throw new Error('no result');
+    } catch (e) {
+      last = e;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+  throw last;
+}
 
 /** Every signed record of a vault, every version. `list_signed` pages by record count, so a page
  *  that ends inside a nonce is continued from that nonce (review M12, R12-8). */
@@ -74,7 +100,7 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   const now = Date.now();
   if (!sale) checks.push({ state: 'fail', title: 'No sale is active', detail: 'The owner must call start_sale first.' });
   else if (now < sale.opens_at_ms)
-    checks.push({ state: 'warn', title: `Sale #${sale.sale_id} opens in ${Math.ceil((sale.opens_at_ms - now) / 1000)} s`, detail: 'Until then nobody can buy, and the guardian can still veto it.' });
+    checks.push({ state: 'waiting', title: `Sale #${sale.sale_id} opens in ${Math.ceil((sale.opens_at_ms - now) / 1000)} s`, detail: 'Until then nobody can buy, and the guardian can still veto it.' });
   else if (now >= sale.closes_at_ms) checks.push({ state: 'fail', title: 'The sale window has closed' });
   else checks.push({ state: 'pass', title: `Sale #${sale.sale_id} is open`, detail: `Until ${new Date(sale.closes_at_ms).toUTCString()}.` });
   if (inflight) checks.push({ state: 'fail', title: `A signature is in flight (nonce ${inflight.nonce})`, detail: 'Wait for it to finish.' });
@@ -124,7 +150,7 @@ export async function audit(tokenId: string): Promise<AuditResult> {
       const from = Math.max(0, latest - Math.ceil((now - issued) / SEPOLIA_BLOCK_MS) - 2000);
       for (const t of tokens) {
         for (let f = from; f <= latest; f += LOG_RANGE) {
-          const logs = await eth<any[]>(chain, 'eth_getLogs', [{ address: t, fromBlock: '0x' + f.toString(16), toBlock: '0x' + Math.min(latest, f + LOG_RANGE - 1).toString(16), topics: [APPROVAL_TOPIC, '0x' + word(info.evm_address)] }]);
+          const logs = await getLogs(chain, { address: t, fromBlock: '0x' + f.toString(16), toBlock: '0x' + Math.min(latest, f + LOG_RANGE - 1).toString(16), topics: [APPROVAL_TOPIC, '0x' + word(info.evm_address)] });
           for (const l of logs) pairs.set(`${t}|0x${l.topics[2].slice(26)}`, { token: t, spender: '0x' + l.topics[2].slice(26) });
         }
       }
@@ -143,7 +169,7 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   if (left === 0)
     checks.push({ state: 'pass', title: 'No ERC-20 approval is left', detail: `${pairs.size} approval(s) found (signed history and Approval events of ${tokens.size} token(s)), none with an allowance left.` });
   if (!logsScanned)
-    checks.push({ state: 'warn', title: 'Approval events could not be scanned', detail: 'Only the approvals in the signed history were checked.' });
+    checks.push({ state: 'incomplete', title: 'Approval events could not be scanned', detail: 'A public RPC did not answer the Approval-event search, so this check is not complete (the approvals in the signed history were checked). Run the check again before taking over.' });
 
   // The contract itself (threat 9; review M12, R12-2: a different code hash is a failure).
   const acct = await nearRpc('query', { request_type: 'view_account', finality: 'final', account_id: CONTRACT });
@@ -156,7 +182,7 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   // The contract account was locked (no access keys at all) on 2026-11-10: nobody can change its code.
   checks.push(keys.keys.length === 0
     ? { state: 'pass', title: 'Nobody can change the contract', detail: 'Its account has no access keys, so its code is final.' }
-    : { state: 'warn', title: `The contract account has ${keys.keys.length} access key(s) (${fullKeys} full-access)`, detail: 'Whoever holds a full-access key can change the contract code (threat 9).' });
+    : { state: 'fail', title: `The contract account has ${keys.keys.length} access key(s) (${fullKeys} full-access)`, detail: 'Whoever holds a full-access key can change the contract code (threat 9).' });
 
   // Funds: only the vault's own chain can be moved by this vault.
   const bal = BigInt(await eth<string>(chain, 'eth_getBalance', [info.evm_address, 'latest']));
@@ -166,6 +192,8 @@ export async function audit(tokenId: string): Promise<AuditResult> {
   if (JSON.stringify(saleAfter) !== JSON.stringify(saleBefore))
     checks.push({ state: 'fail', title: 'The sale changed while auditing', detail: 'Run the audit again.' });
 
-  const safe = !checks.some((c) => c.state === 'fail');
-  return { safe, checks, sale, codeHex, fullKeys };
+  const verdict: Verdict = checks.some((c) => c.state === 'fail') ? 'unsafe'
+    : checks.some((c) => c.state === 'incomplete') ? 'incomplete'
+    : checks.some((c) => c.state === 'waiting') ? 'waiting' : 'safe';
+  return { safe: verdict === 'safe', verdict, checks, sale, codeHex, fullKeys };
 }
