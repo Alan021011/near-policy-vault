@@ -56,6 +56,7 @@ const WHAT_YOU_SIGN: Record<string, string> = {
   'Cancel nonce': 'Signs a 0-value transfer from the vault to itself with the same nonce: once it is on Ethereum, the earlier payment signed with that nonce can never go through. It costs a little ETH in gas, counted in the daily limit. Deposit: 0.02 NEAR for the signer.',
   'Cancel sale': 'Closes the handover window: the vault stays yours and can pay again. 1 yoctoNEAR, to confirm it is you.',
   'Veto sale': 'As the guardian, you stop this handover: the vault cannot change owner through it. 1 yoctoNEAR, to confirm it is you.',
+  'Revoke approvals': 'Removes every account approved to move this vault NFT (nft_approve); only a handover through buy, or your own transfer, can move it after that. The storage deposits of those approvals come back to you. 1 yoctoNEAR, to confirm it is you.',
   'Buy': 'Pays the price and receives the vault NFT in the same step, bound to the handover you checked. If the seller restarted the handover, the purchase fails and your NEAR comes back.',
 };
 const signNote = document.createElement('div');
@@ -803,9 +804,15 @@ function saleSection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
         <div class="full"><button class="btn primary">Start handover</button> <span class="faint">0.01 NEAR deposit</span></div>
       </form>`
     : '';
+  // External review (round 3, H1): approved accounts can move the NFT during a handover window
+  // without paying through buy; the owner can revoke them here.
+  const approved = Object.keys(d.token?.approved_account_ids ?? {});
+  const approvals = approved.length
+    ? `<div class="notice" style="margin:10px 0"><b>${approved.length === 1 ? `${esc(approved[0])} is approved` : `${approved.length} accounts are approved`} to move this vault NFT.</b> During a handover window an approved account can move the vault without paying the price through <span class="mono">buy</span>.${isOwner ? ' <button class="btn small" data-action="revoke-all">Revoke all approvals</button>' : ''}</div>`
+    : '';
   return `<div class="card" id="sale"><header><h2>Handover</h2>${active ? '<span class="badge warn">handover open</span>' : ''}</header><div class="body">
     <p class="muted">This NFT is the title deed of the vault’s Ethereum account: hand it to a new owner, team or treasurer, and the account and its rules go with it, never a key. For at least 10 minutes (or the waiting time, if longer) the vault pays nothing and the guardian can stop the handover. The new owner checks the vault here, then pays and receives it in one step.</p>
-    ${info}${form}</div></div>`;
+    ${approvals}${info}${form}</div></div>`;
 }
 
 function auditSection(d: VaultData) {
@@ -853,6 +860,7 @@ function safetySection(d: VaultData) {
   const items = safetyChecks(d.policy.has_policy ? d.policy.policy : null, {
     hasRules: d.policy.has_policy, unsent, uncertain: d.uncertain.length, signing: !!d.inflight,
     handoverOpen: !!d.sale && Date.now() < d.sale.closes_at_ms, looserChangeWaiting: !!d.policy.pending,
+    approved: Object.keys(d.token?.approved_account_ids ?? {}), pricedSale: !!d.sale && !!(d.sale.price || d.sale.buyer),
   });
   const icon = { ok: '✓', warn: '!', bad: '✕' } as const;
   const cls = { ok: 'pass', warn: 'warn', bad: 'fail' } as const;
@@ -1242,6 +1250,7 @@ app.addEventListener('click', async (e) => {
       }
       return;
     case 'cancel-sale': return act('Cancel sale', () => call('cancel_sale', { token_id: t }, ONE_YOCTO));
+    case 'revoke-all': return act('Revoke approvals', () => call('nft_revoke_all', { token_id: t }, ONE_YOCTO));
     case 'veto-sale': return act('Veto sale', () => call('veto_sale', { token_id: t }, ONE_YOCTO));
     case 'audit': {
       const out = document.getElementById('audit-out')!;

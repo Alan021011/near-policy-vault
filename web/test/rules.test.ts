@@ -82,6 +82,13 @@ test('safety check: a sound vault is all ok, a weak one is flagged', () => {
   assert.ok(weak.some((x) => x.state === 'bad' && /no guardian watching/.test(x.text)));
   assert.ok(weak.some((x) => x.state === 'warn' && /not on Ethereum yet/.test(x.text)));
   assert.ok(weak.some((x) => x.state === 'warn' && /handover is open/.test(x.text)));
-  assert.deepEqual(safetyChecks(null, { ...quiet, hasRules: false }).map((x) => x.state), ['ok', 'bad']);
+  assert.deepEqual(safetyChecks(null, { ...quiet, hasRules: false }).map((x) => x.state), ['ok', 'ok', 'bad']);
+  assert.ok(safetyChecks(null, { ...quiet, hasRules: false, approved: ['market.testnet'] }).some((x) => /market.testnet is approved/.test(x.text)));
   assert.ok(safetyChecks({ ...base, delay_ms: 60_000 }, quiet).some((x) => x.state === 'warn' && /only 1 minute/.test(x.text)));
+});
+test('safety check: an account approved to move the vault NFT (round 3, H1)', () => {
+  const quiet = { hasRules: true, unsent: 0, uncertain: 0, handoverOpen: false, looserChangeWaiting: false, signing: false };
+  assert.ok(safetyChecks(base, { ...quiet, approved: [] }).some((x) => x.state === 'ok' && /No other account is approved/.test(x.text)));
+  assert.ok(safetyChecks(base, { ...quiet, approved: ['market.testnet'] }).some((x) => x.state === 'warn' && /market.testnet is approved/.test(x.text)));
+  assert.ok(safetyChecks(base, { ...quiet, approved: ['market.testnet'], handoverOpen: true, pricedSale: true }).some((x) => x.state === 'bad' && /without paying the price/.test(x.text)));
 });

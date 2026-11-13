@@ -94,13 +94,26 @@ export function changeOf(old: FullRules | null, neu: FullRules): ChangeSummary {
 export const describeWait = wait;
 
 // ---------- M30: the vault's safety check, a list of controls (no score) ----------
-export interface VaultState { hasRules: boolean; unsent: number; uncertain: number; handoverOpen: boolean; looserChangeWaiting: boolean; signing: boolean }
+export interface VaultState {
+  hasRules: boolean; unsent: number; uncertain: number; handoverOpen: boolean; looserChangeWaiting: boolean; signing: boolean;
+  /** Accounts approved with nft_approve to move the vault NFT. */
+  approved?: string[];
+  /** The open handover has a price or a reserved buyer. */
+  pricedSale?: boolean;
+}
 export interface SafetyItem { state: 'ok' | 'warn' | 'bad'; text: string }
 
 export function safetyChecks(p: RulesDraft | null, s: VaultState): SafetyItem[] {
   const out: SafetyItem[] = [];
   const add = (state: SafetyItem['state'], text: string) => out.push({ state, text });
   add('ok', 'Nobody can change the contract: its account has no keys (see Verify).');
+  // External review (round 3, H1): a price or a reserved buyer binds only `buy`; an account approved
+  // with nft_approve can still move the vault NFT during a handover window, without paying it.
+  const approved = s.approved ?? [];
+  if (approved.length) {
+    const who = approved.length === 1 ? `${approved[0]} is approved` : `${approved.length} accounts are approved (${approved.join(', ')})`;
+    add(s.handoverOpen && s.pricedSale ? 'bad' : 'warn', `${who} to move the vault NFT: during a handover window it can move the vault without paying the price through buy. If that is not intended, the owner revokes the approval.`);
+  } else add('ok', 'No other account is approved to move the vault NFT.');
   if (!s.hasRules || !p) {
     add('bad', 'No rules yet: the vault cannot pay anything until its owner sets them.');
     return out;
