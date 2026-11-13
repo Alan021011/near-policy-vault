@@ -531,16 +531,17 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
   const windowOpen = spent > 0n && Date.now() < windowStart + 86_400_000;
   const resetAt = windowOpen ? windowStart + 86_400_000 : 0;
   const available = windowOpen ? (cap > spent ? cap - spent : 0n) : cap;
-  const rule = (ok: boolean, text: string) => `<li class="${ok ? 'on' : 'off'}">${text}</li>`;
+  // Visual refresh: each rule is a small card with its own label (guided by the Stitch mockups).
+  const rule = (ok: boolean, text: string, label = '') => `<li class="${ok ? 'on' : 'off'}">${label ? `<span class="rule-label">${label}</span>` : ''}<span>${text}</span></li>`;
   const rules = d.policy.has_policy
     ? `<ul class="rules">
-        ${rule(true, p.allowed_destinations.length ? `Can only pay ${p.allowed_destinations.map((a: string) => `<span class="mono">${shortAddr(a)}</span>`).join(', ')}` : 'Cannot pay any address yet (no approved recipient)')}
-        ${rule(true, `Spends at most <b>${ethFmt(p.eth_daily_cap)}</b> a day, network fees included`)}
-        ${rule(p.delay_ms > 0, p.delay_ms > 0 ? `Waits <b>${p.delay_ms / 1000} s</b> before paying` : 'Pays without a waiting time')}
-        ${rule(!!p.guardian, p.guardian ? `<b>${esc(p.guardian)}</b> can stop any payment` : 'No guardian: nobody can stop a payment or a handover')}
-        ${p.proposer ? rule(true, `Agent <b>${esc(p.proposer)}</b> can request and send payments, never change these rules`) : ''}
-        ${p.tokens.length ? rule(true, `${p.tokens.length} token(s) allowed, each with its own daily limit`) : ''}
-        ${(p.nfts ?? []).length ? rule(true, (p.nfts as any[]).map((n) => `At most ${esc(n.daily_count)} NFT(s) a day from <span class="mono">${shortAddr(n.contract)}</span>`).join('; ')) : ''}
+        ${rule(true, p.allowed_destinations.length ? `Can only pay ${p.allowed_destinations.map((a: string) => `<span class="mono">${shortAddr(a)}</span>`).join(', ')}` : 'Cannot pay any address yet (no approved recipient)', 'Approved recipients')}
+        ${rule(true, `Spends at most <b>${ethFmt(p.eth_daily_cap)}</b> a day, network fees included`, 'Daily limit')}
+        ${rule(p.delay_ms > 0, p.delay_ms > 0 ? `Waits <b>${p.delay_ms / 1000} s</b> before paying` : 'Pays without a waiting time', 'Waiting time')}
+        ${rule(!!p.guardian, p.guardian ? `<b>${esc(p.guardian)}</b> can stop any payment` : 'No guardian: nobody can stop a payment or a handover', 'Guardian')}
+        ${rule(true, p.proposer ? `Agent <b>${esc(p.proposer)}</b> can request and send payments, never change these rules` : 'No agent: only the owner can request payments', 'Agent')}
+        ${p.tokens.length ? rule(true, `${p.tokens.length} token(s) allowed, each with its own daily limit`, 'Tokens') : ''}
+        ${(p.nfts ?? []).length ? rule(true, (p.nfts as any[]).map((n) => `At most ${esc(n.daily_count)} NFT(s) a day from <span class="mono">${shortAddr(n.contract)}</span>`).join('; '), 'Ethereum NFTs') : ''}
       </ul>`
     : `<p class="muted">This vault has no rules yet, so it cannot pay anything. ${isOwner ? 'Set its rules below; the first rules apply at once.' : ''}</p>`;
   const pending = pend
@@ -595,10 +596,10 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
   const empty = isOwner && d.info.evm_address && d.balance === 0n
     ? `<div class="notice" style="margin-bottom:14px"><b>This vault is empty.</b> To make payments, send it test ETH on Sepolia: copy its address below and ask a faucet, for example <a href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia" target="_blank" rel="noreferrer">Google's Sepolia faucet ↗</a>. Test ETH has no real value.</div>`
     : '';
-  return `<div class="card vault-main"><div class="body">
+  return `<div class="card vault-main with-art"><div class="body">
       ${empty}
       <div class="vm-top">
-        ${d.token?.metadata?.media ? `<figure class="nft-card"><img src="${esc(d.token.metadata.media)}" alt="This vault's NFT card" width="150" height="150" /><figcaption class="faint">This is how this vault looks in any NEAR wallet</figcaption></figure>` : ''}
+        ${d.token?.metadata?.media ? `<figure class="nft-card"><span class="nft-frame"><img src="${esc(d.token.metadata.media)}" alt="This vault's NFT card" width="280" height="280" /></span><figcaption class="faint">This is how this vault looks in any NEAR wallet</figcaption></figure>` : ''}
         <div class="vm-balance"><div class="label">Balance</div><div class="balance">${ethFmt(d.balance)}</div><div class="faint">on ${esc(chainName(d.chain))} · test ETH, no real value</div></div>
         <div class="addr">${d.info.evm_address ? `<span class="mono">${shortAddr(d.info.evm_address)}</span>
           <button class="btn small" data-action="copy" data-text="${esc(d.info.evm_address)}">Copy address</button>
@@ -607,7 +608,7 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
       ${d.policy.has_policy ? `<div class="spent"><div class="row"><span>Spent today <b>${ethFmt(spent)}</b> of ${ethFmt(cap)} <span class="faint">(network fees included)</span></span><span class="spacer"></span><span class="mono faint">${pct}%</span></div>
         <div class="bar"><div style="width:${pct}%"></div></div>
         <div class="faint" style="margin-top:6px">Available now: <b>${ethFmt(available)}</b>${resetAt ? ` · the limit resets in <span data-until="${resetAt}">${inTime(resetAt)}</span>` : ' · full daily limit available'}</div></div>` : ''}
-      <div class="label" style="margin-top:16px">Rules</div>
+      <div class="rules-head"><div class="label">Rules enforced by the contract</div><div class="faint">Checked on NEAR before every signature. The agent cannot change them.</div></div>
       ${rules}${agentBox(d, isOwner)}${pending}${technical}${form}
     </div></div>`;
 }
@@ -901,7 +902,7 @@ async function vaultPage(id: string, rid: number) {
     <div class="row" style="margin:6px 0 12px">${pills} ${youAre}</div>
     <div class="role-banner ${role}">${ROLE[role][1]}</div>
     <nav class="section-menu" aria-label="Sections of this vault">${[
-      ['s-pay', 'Waiting payments'], ['s-card', 'The vault and its rules'], ['s-safety', 'Safety check'], ['inside', 'Inside'],
+      ['s-pay', `Waiting payments <span class="tab-count${d.proposals.length ? ' on' : ''}">${d.proposals.length}</span>`], ['s-card', 'The vault and its rules'], ['s-safety', 'Safety check'], ['inside', 'Inside'],
       ['s-check', 'Would it pass?'], ...(agentSection(d) ? [['s-agent', 'The agent']] : []), ['s-history', 'Payment history'], ['s-handover', 'Handover'], ['audit', 'Check before you take over'],
     ].map(([a, l]) => `<a href="#/vault/${esc(id)}" data-jump="${a}">${l}</a>`).join('')}</nav>
     ${d.proposals.length ? `<div id="s-pay">${queue}</div><div id="s-card">${card}</div>` : `<div id="s-card">${card}</div><div id="s-pay">${queue}</div>`}
@@ -914,6 +915,16 @@ async function vaultPage(id: string, rid: number) {
     ${auditSection(d)}`;
   // Only sections that have something to show get a link.
   app.querySelectorAll<HTMLAnchorElement>('[data-jump]').forEach((a) => { if (!document.getElementById(a.dataset.jump!)?.textContent?.trim()) a.remove(); });
+  // Visual refresh: the tab of the section in view is marked as active.
+  const tabs = [...app.querySelectorAll<HTMLAnchorElement>('[data-jump]')];
+  const markTab = (id: string) => tabs.forEach((t) => t.classList.toggle('active', t.dataset.jump === id));
+  if ('IntersectionObserver' in window) {
+    const spy = new IntersectionObserver((entries) => {
+      const seen = entries.filter((e) => e.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+      if (seen) markTab((seen.target as HTMLElement).id);
+    }, { rootMargin: '-120px 0px -60% 0px' });
+    tabs.forEach((t) => { const el = document.getElementById(t.dataset.jump!); if (el) spy.observe(el); });
+  }
   app.querySelectorAll<HTMLAnchorElement>('[data-jump]').forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); document.getElementById(a.dataset.jump!)?.scrollIntoView({ block: 'start' }); }));
   wireVault(d);
   noTranslate();

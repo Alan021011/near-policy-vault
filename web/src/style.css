@@ -263,3 +263,63 @@ ul.signs li.info { color: var(--muted); }
 .sign-note { position: fixed; left: 50%; transform: translateX(-50%); bottom: 76px; width: min(560px, 92vw); z-index: 60; background: var(--surface); border: 1px solid var(--mint-line, var(--line-2)); border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.45; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); }
 .sign-note b { display: block; margin-bottom: 4px; }
 @media (max-width: 640px) { .sign-note { bottom: 84px; } }
+
+/* ---------- Visual refresh (guided by the Stitch mockups; same content, clearer controls) ---------- */
+.btn { background: var(--surface-3); border-color: #56637f; color: var(--text); transition: border-color .12s, background .12s, box-shadow .12s; }
+.btn:hover:not(:disabled) { background: var(--surface-2); border-color: var(--mint); color: var(--text); }
+.btn.small { font-size: 12.5px; padding: 5px 12px; }
+.btn.primary { box-shadow: 0 0 14px rgba(0, 236, 151, 0.22); }
+.btn.primary:hover:not(:disabled) { background: #10f0a0; border-color: #10f0a0; color: var(--bg); box-shadow: 0 0 18px rgba(0, 236, 151, 0.35); }
+.btn.danger { box-shadow: 0 0 14px rgba(220, 38, 38, 0.25); }
+.btn.danger:hover:not(:disabled) { border-color: #b91c1c; color: #fff; }
+.btn:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--mint); outline-offset: 2px; }
+details > summary.btn { list-style: none; }
+
+/* Section menu as tabs */
+.section-menu { gap: 2px; border-bottom: 1px solid var(--line-2); padding: 0; }
+.section-menu a { border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 10px 12px; font-size: 13px; color: var(--muted); margin-bottom: -1px; }
+.section-menu a:hover { color: var(--text); border-bottom-color: var(--line-2); text-decoration: none; }
+.section-menu a.active { color: var(--mint); border-bottom-color: var(--mint); }
+.tab-count { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 4px; background: var(--surface-3); border: 1px solid var(--line-2); color: var(--muted); font: 600 11px/16px var(--mono); text-align: center; }
+
+/* The vault's NFT card, larger */
+.nft-card { max-width: 300px; }
+.nft-card img { width: 280px; height: 280px; border-color: var(--mint-line); box-shadow: 0 0 22px rgba(0, 236, 151, 0.12); }
+@media (max-width: 640px) { .nft-card { max-width: 100%; } .nft-card img { width: 260px; height: 260px; } }
+
+/* Rules as labelled cards */
+.rules-head { margin-top: 18px; }
+.rules-head .faint { font-size: 12px; margin-top: 2px; }
+.rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.rules li { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px 12px 38px; border-color: var(--line-2); }
+.rules li .rule-label { font: 600 10.5px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.rules li.on { border-color: rgba(0, 236, 151, 0.22); }
+.rules li::before { top: 12px; width: 18px; height: 18px; line-height: 18px; text-align: center; border-radius: 4px; background: var(--mint-dim); left: 12px; font-size: 12px; }
+.rules li.off::before { background: var(--amber-dim); }
+.tab-count.on { background: var(--amber-dim); border-color: var(--amber-line); color: var(--amber); }
+
+/* Expandable sections look expandable: a bordered row, a chevron that turns, Show / Hide */
+details > summary:not(.btn) { list-style: none; display: flex; align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; transition: border-color .12s, background .12s; }
+details > summary:not(.btn)::-webkit-details-marker { display: none; }
+details > summary:not(.btn)::before { content: ''; flex: none; width: 7px; height: 7px; border-right: 2px solid var(--mint); border-bottom: 2px solid var(--mint); transform: rotate(-45deg); transition: transform .15s; margin: 0 2px; }
+details[open] > summary:not(.btn)::before { transform: rotate(45deg); }
+details > summary:not(.btn)::after { content: 'Show'; margin-left: auto; font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+details[open] > summary:not(.btn)::after { content: 'Hide'; }
+details > summary:not(.btn):hover { border-color: var(--mint-line); background: var(--surface-3); }
+details[open] > summary:not(.btn) { margin-bottom: 10px; border-color: var(--mint-line); }
+details > summary.btn::after { content: ''; display: inline-block; width: 6px; height: 6px; margin-left: 8px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform .15s; }
+details[open] > summary.btn::after { transform: translateY(1px) rotate(-135deg); }
+
+/* Brand: the logo in the top bar (its black background blends into the dark bar) */
+.brand img { border-radius: 6px; mix-blend-mode: screen; }
+
+/* The vault drawing as a soft background behind the vault card (image and rules) */
+.vault-main.with-art { position: relative; overflow: hidden; }
+.vault-main.with-art::before { content: ''; position: absolute; inset: 0; background: url('/vault-art.jpg') right -40px top -20px / 70% auto no-repeat; opacity: 0.28; mix-blend-mode: screen; pointer-events: none;
+  -webkit-mask-image: linear-gradient(to left, #000 35%, transparent 95%); mask-image: linear-gradient(to left, #000 35%, transparent 95%); }
+.vault-main.with-art > .body { position: relative; z-index: 1; }
+@media (max-width: 640px) { .vault-main.with-art::before { background-size: 160% auto; background-position: center top; opacity: 0.2; -webkit-mask-image: linear-gradient(to bottom, #000 10%, transparent 55%); mask-image: linear-gradient(to bottom, #000 10%, transparent 55%); } }
+
+/* The vault drawing also inside the NFT card image, in the web page only (the card itself is drawn by the locked contract) */
+.nft-frame { position: relative; display: inline-block; line-height: 0; border-radius: 8px; }
+.nft-frame::after { content: ''; position: absolute; inset: 1px; border-radius: 8px; background: url('/vault-art.jpg') center / cover no-repeat; opacity: 0.2; mix-blend-mode: screen; pointer-events: none; }
