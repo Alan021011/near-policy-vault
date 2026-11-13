@@ -251,3 +251,10 @@ ul.signs li.info { color: var(--muted); }
 /* M42: long links and code lines wrap on phones (Verify page at 375 px) */
 .vrow > div { min-width: 0; }
 .vrow a, .vrow .faint, .vrow .mono { overflow-wrap: anywhere; }
+
+/* M30: section menu on the vault page */
+.section-menu { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; position: sticky; top: 56px; z-index: 4; background: var(--bg); padding: 6px 0; }
+.section-menu a { font-size: 12px; padding: 4px 10px; border: 1px solid var(--line-2); border-radius: 999px; text-decoration: none; color: var(--muted); }
+.section-menu a:hover { color: var(--text, inherit); border-color: var(--mint-line, var(--line-2)); }
+#s-pay, #s-card, #s-safety, #s-check, #s-agent, #s-history, #s-handover, #audit, #inside { scroll-margin-top: 110px; }
+@media (max-width: 720px) { .section-menu { position: static; } }

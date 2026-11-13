@@ -16,7 +16,8 @@ export interface RuleWarning { level: 'high' | 'warn' | 'info'; text: string }
 
 const HOUR_MS = 3_600_000;
 const eth = (wei: string) => `${Number(formatEther(BigInt(wei))).toLocaleString('en', { maximumFractionDigits: 6 })} ETH`;
-const wait = (ms: number) => (ms === 0 ? 'no waiting time' : ms % HOUR_MS === 0 ? `${ms / HOUR_MS} hour${ms === HOUR_MS ? '' : 's'}` : ms >= 60_000 && ms % 60_000 === 0 ? `${ms / 60_000} minute${ms === 60_000 ? '' : 's'}` : `${ms / 1000} seconds`);
+const DAY_MS = 24 * HOUR_MS;
+const wait = (ms: number) => (ms === 0 ? 'no waiting time' : ms % DAY_MS === 0 ? `${ms / DAY_MS} day${ms === DAY_MS ? '' : 's'}` : ms % HOUR_MS === 0 ? `${ms / HOUR_MS} hour${ms === HOUR_MS ? '' : 's'}` : ms >= 60_000 && ms % 60_000 === 0 ? `${ms / 60_000} minute${ms === 60_000 ? '' : 's'}` : `${ms / 1000} seconds`);
 
 /** The rules as a person would say them, one sentence each. */
 export function summarize(r: RulesDraft): string[] {
@@ -49,3 +50,70 @@ export const TEMPLATES = {
   handover: { label: 'A vault I will hand over', delaySeconds: 600, keepProposer: false, note: 'No agent (a handover removes it anyway). Add a guardian: it can stop a handover you did not start.' },
 } as const;
 export type TemplateKey = keyof typeof TEMPLATES;
+
+// ---------- M30: before / after, mirroring the contract's own rule (policy.rs, is_not_looser) ----------
+export interface FullRules extends RulesDraft {
+  chain_id: number;
+  allowed_spenders: string[];
+  tokens: { contract: string; daily_cap: string; max_approval: string }[];
+  nfts: { contract: string; daily_count: string }[];
+}
+export interface RuleChange { what: string; before: string; after: string; looser: boolean }
+export interface ChangeSummary { changes: RuleChange[]; appliesAtOnce: boolean; waitMs: number; replacesGuardian: boolean }
+
+const THREE_DAYS_MS = 3 * 24 * HOUR_MS;
+const list = (xs: string[]) => (xs.length ? xs.join(', ') : 'none');
+const subset = (a: string[], b: string[]) => a.every((x) => b.includes(x));
+
+/** What changes from the rules in force to the new ones, and when the change applies. A first set of
+ *  rules applies at once. Otherwise, exactly as the contract decides: not looser in every dimension:
+ *  at once; looser: after the current waiting time (the guardian can stop it); replacing or removing
+ *  a guardian: after max(2 x waiting time, 3 days), and that guardian cannot stop it. */
+export function changeOf(old: FullRules | null, neu: FullRules): ChangeSummary {
+  if (!old) return { changes: [], appliesAtOnce: true, waitMs: 0, replacesGuardian: false };
+  const c: RuleChange[] = [];
+  const add = (what: string, before: string, after: string, looser: boolean) => { if (before !== after) c.push({ what, before, after, looser }); };
+  add('Daily limit', eth(old.eth_daily_cap), eth(neu.eth_daily_cap), BigInt(neu.eth_daily_cap) > BigInt(old.eth_daily_cap));
+  add('Max network fee per payment', eth(old.max_gas_cost), eth(neu.max_gas_cost), BigInt(neu.max_gas_cost) > BigInt(old.max_gas_cost));
+  add('Waiting time', wait(old.delay_ms), wait(neu.delay_ms), neu.delay_ms < old.delay_ms);
+  add('Guardian', old.guardian ?? 'none', neu.guardian ?? 'none', !!old.guardian && neu.guardian !== old.guardian);
+  add('Agent', old.proposer ?? 'none', neu.proposer ?? 'none', !!neu.proposer && neu.proposer !== old.proposer);
+  add('Approved recipients', list(old.allowed_destinations), list(neu.allowed_destinations), !subset(neu.allowed_destinations, old.allowed_destinations));
+  add('Apps allowed to use tokens', list(old.allowed_spenders), list(neu.allowed_spenders), !subset(neu.allowed_spenders, old.allowed_spenders));
+  const tokenLooser = !neu.tokens.every((t) => { const o = old.tokens.find((x) => x.contract === t.contract); return !!o && BigInt(t.daily_cap) <= BigInt(o.daily_cap) && BigInt(t.max_approval) <= BigInt(o.max_approval); });
+  add('Tokens', `${old.tokens.length} token rule(s)`, `${neu.tokens.length} token rule(s)`, tokenLooser);
+  if (JSON.stringify(old.tokens) !== JSON.stringify(neu.tokens) && old.tokens.length === neu.tokens.length) c.push({ what: 'Token limits', before: 'as before', after: 'changed', looser: tokenLooser });
+  const nftLooser = !neu.nfts.every((n) => { const o = old.nfts.find((x) => x.contract === n.contract); return !!o && BigInt(n.daily_count) <= BigInt(o.daily_count); });
+  add('NFT collections', `${old.nfts.length} collection(s)`, `${neu.nfts.length} collection(s)`, nftLooser);
+  if (JSON.stringify(old.nfts) !== JSON.stringify(neu.nfts) && old.nfts.length === neu.nfts.length) c.push({ what: 'NFT daily counts', before: 'as before', after: 'changed', looser: nftLooser });
+  if (neu.chain_id !== old.chain_id) c.push({ what: 'Chain', before: String(old.chain_id), after: String(neu.chain_id), looser: true });
+  const replacesGuardian = !!old.guardian && neu.guardian !== old.guardian;
+  const looser = c.some((x) => x.looser);
+  return { changes: c, appliesAtOnce: !looser, waitMs: !looser ? 0 : replacesGuardian ? Math.max(2 * old.delay_ms, THREE_DAYS_MS) : old.delay_ms, replacesGuardian };
+}
+export const describeWait = wait;
+
+// ---------- M30: the vault's safety check, a list of controls (no score) ----------
+export interface VaultState { hasRules: boolean; unsent: number; uncertain: number; handoverOpen: boolean; looserChangeWaiting: boolean; signing: boolean }
+export interface SafetyItem { state: 'ok' | 'warn' | 'bad'; text: string }
+
+export function safetyChecks(p: RulesDraft | null, s: VaultState): SafetyItem[] {
+  const out: SafetyItem[] = [];
+  const add = (state: SafetyItem['state'], text: string) => out.push({ state, text });
+  add('ok', 'Nobody can change the contract: its account has no keys (see Verify).');
+  if (!s.hasRules || !p) {
+    add('bad', 'No rules yet: the vault cannot pay anything until its owner sets them.');
+    return out;
+  }
+  const n = p.allowed_destinations.length;
+  add(n ? 'ok' : 'warn', n ? `Pays only ${n} approved address${n === 1 ? '' : 'es'}, at most ${eth(p.eth_daily_cap)} a day.` : 'No approved address: nothing can be paid.');
+  add(p.guardian ? 'ok' : 'warn', p.guardian ? `A guardian (${p.guardian}) can stop any payment while it waits.` : 'No guardian: nobody can stop a payment that fits the rules.');
+  if (p.guardian) add(p.delay_ms >= HOUR_MS ? 'ok' : p.delay_ms > 0 ? 'warn' : 'bad', p.delay_ms >= HOUR_MS ? `Payments wait ${wait(p.delay_ms)}: time for a person to react.` : p.delay_ms > 0 ? `Payments wait only ${wait(p.delay_ms)}: enough for a demo, short for a person.` : 'No waiting time: the guardian never gets a chance to stop a payment.');
+  if (p.proposer) add(p.guardian ? 'ok' : 'bad', p.guardian ? `The agent (${p.proposer}) is watched by a guardian and can never change the rules.` : `The agent (${p.proposer}) has no guardian watching it.`);
+  add(s.signing ? 'warn' : 'ok', s.signing ? 'A signature is in progress right now.' : 'No signature in progress.');
+  add(s.unsent ? 'warn' : 'ok', s.unsent ? `${s.unsent} signed payment${s.unsent === 1 ? ' is' : 's are'} not on Ethereum yet (anyone can send it; the owner can cancel it).` : 'Every signed payment is already on Ethereum.');
+  if (s.uncertain) add('warn', `${s.uncertain} signature${s.uncertain === 1 ? '' : 's'} with an unknown outcome: sign again or cancel the nonce.`);
+  if (s.looserChangeWaiting) add('warn', 'A looser rule change is waiting: it applies when its time ends, unless the guardian stops it.');
+  if (s.handoverOpen) add('warn', 'A handover is open: the vault may change owner, and pays nothing meanwhile.');
+  return out;
+}

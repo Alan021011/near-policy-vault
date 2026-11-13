@@ -3,7 +3,7 @@ import { formatEther, formatUnits, parseEther, parseTransaction, parseUnits } fr
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
 import { ETH_PROOFS, NEAR_PROOFS, SOURCE_COMMIT } from './evidence';
-import { TEMPLATES, ruleWarnings, summarize, type TemplateKey } from './rules';
+import { TEMPLATES, changeOf, describeWait, ruleWarnings, safetyChecks, summarize, type TemplateKey } from './rules';
 // @ts-ignore plain JavaScript shared with the scripts
 import { historyFromSigned, riskSignals } from './risk.mjs';
 import {
@@ -804,6 +804,30 @@ function renderAudit(d: VaultData, r: AuditResult) {
       : r.safe ? `<p class="muted">No on-chain price: pay only through a transfer bound with memo <span class="mono">sale:${esc(r.sale.sale_id)}</span>.</p>` : ''}`;
 }
 
+// M30: what a rule change does, and when it applies (the contract's own rule, see rules.ts).
+function changeHtml(old: any, neu: any) {
+  if (!old) return '<p class="faint" style="margin:0 0 8px">These are the first rules of this vault: they apply at once.</p>';
+  const ch = changeOf({ ...old, nfts: old.nfts ?? [], tokens: old.tokens ?? [] }, neu);
+  if (!ch.changes.length) return '<p class="faint" style="margin:0 0 8px">Nothing changes compared with the rules in force.</p>';
+  const when = ch.appliesAtOnce ? '<b>Every change is stricter: it applies at once.</b>'
+    : ch.replacesGuardian ? `<b>It replaces or removes the guardian: it applies after ${esc(describeWait(ch.waitMs))}, and that guardian cannot stop it.</b>`
+    : `<b>Something is looser: it applies after ${esc(describeWait(ch.waitMs))}, and the guardian can stop it meanwhile.</b>`;
+  return `<b>What changes:</b><table class="stack" style="margin:6px 0"><tr><th>Rule</th><th>Now</th><th>After</th><th></th></tr>${ch.changes.map((c) => `<tr><td>${esc(c.what)}</td><td>${esc(c.before)}</td><td>${esc(c.after)}</td><td>${c.looser ? '<span class="badge warn">looser</span>' : '<span class="badge ok">stricter</span>'}</td></tr>`).join('')}</table><p style="margin:0 0 10px">${when}</p>`;
+}
+
+// M30: the vault's safety check: a list of controls, no score, for anyone who opens the vault.
+function safetySection(d: VaultData) {
+  const unsent = new Set(d.signed.filter((r) => r.nonce >= d.mined).map((r) => r.nonce)).size;
+  const items = safetyChecks(d.policy.has_policy ? d.policy.policy : null, {
+    hasRules: d.policy.has_policy, unsent, uncertain: d.uncertain.length, signing: !!d.inflight,
+    handoverOpen: !!d.sale && Date.now() < d.sale.closes_at_ms, looserChangeWaiting: !!d.policy.pending,
+  });
+  const icon = { ok: '✓', warn: '!', bad: '✕' } as const;
+  const cls = { ok: 'pass', warn: 'warn', bad: 'fail' } as const;
+  return `<div class="card" id="s-safety"><header><h2>Safety check</h2><span class="spacer"></span><span class="faint">a list of controls, not a score</span></header><div class="body">
+    ${items.map((x) => `<div class="check ${cls[x.state]}"><div class="icon">${icon[x.state]}</div><div>${esc(x.text)}</div></div>`).join('')}</div></div>`;
+}
+
 async function vaultPage(id: string, rid: number) {
   app.innerHTML = '<p class="faint">Loading vault…</p>';
   const d = await loadVault(id);
@@ -836,13 +860,21 @@ async function vaultPage(id: string, rid: number) {
     <div class="row"><h1>Vault #${esc(id)}</h1><span class="spacer"></span><button class="btn small" data-action="refresh">Refresh</button></div>
     <div class="row" style="margin:6px 0 12px">${pills} ${youAre}</div>
     <div class="role-banner ${role}">${ROLE[role][1]}</div>
-    ${d.proposals.length ? queue + card : card + queue}
+    <nav class="section-menu" aria-label="Sections of this vault">${[
+      ['s-pay', 'Waiting payments'], ['s-card', 'The vault and its rules'], ['s-safety', 'Safety check'], ['inside', 'Inside'],
+      ['s-check', 'Would it pass?'], ...(agentSection(d) ? [['s-agent', 'The agent']] : []), ['s-history', 'Payment history'], ['s-handover', 'Handover'], ['audit', 'Check before you take over'],
+    ].map(([a, l]) => `<a href="#/vault/${esc(id)}" data-jump="${a}">${l}</a>`).join('')}</nav>
+    ${d.proposals.length ? `<div id="s-pay">${queue}</div><div id="s-card">${card}</div>` : `<div id="s-card">${card}</div><div id="s-pay">${queue}</div>`}
+    ${safetySection(d)}
     <div id="inside"></div>
-    ${checkerSection(d)}
-    ${agentSection(d)}
-    ${signedHtml}
-    ${saleSection(d, isOwner, isGuardian)}
+    <div id="s-check">${checkerSection(d)}</div>
+    <div id="s-agent">${agentSection(d)}</div>
+    <div id="s-history">${signedHtml}</div>
+    <div id="s-handover">${saleSection(d, isOwner, isGuardian)}</div>
     ${auditSection(d)}`;
+  // Only sections that have something to show get a link.
+  app.querySelectorAll<HTMLAnchorElement>('[data-jump]').forEach((a) => { if (!document.getElementById(a.dataset.jump!)?.textContent?.trim()) a.remove(); });
+  app.querySelectorAll<HTMLAnchorElement>('[data-jump]').forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); document.getElementById(a.dataset.jump!)?.scrollIntoView({ block: 'start' }); }));
   wireVault(d);
   noTranslate();
   if (location.hash.includes('?audit')) document.getElementById('audit')?.scrollIntoView();
@@ -989,6 +1021,7 @@ function wireVault(d: VaultData) {
       const warns = ruleWarnings(policy);
       const label = { high: 'Warning', warn: 'Check', info: 'Note' } as Record<string, string>;
       document.getElementById('rules-review')!.innerHTML = `<div class="card" style="margin:0"><div class="body">
+        ${changeHtml(d.policy.has_policy ? d.policy.policy : null, policy)}
         <b>These rules say:</b><ul class="plain">${summarize(policy).map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
         ${warns.length ? `<ul class="signs">${warns.map((w) => `<li class="${w.level}"><b>${label[w.level]}:</b> ${esc(w.text)}</li>`).join('')}</ul>` : '<div class="signs-none">No weak spot found in these rules.</div>'}
         <div class="faint" style="margin-top:6px">Warnings are advice from this page; the contract accepts any valid rules. Change a field to review again, or confirm.</div></div></div>`;
