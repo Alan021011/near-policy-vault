@@ -2,6 +2,8 @@ import './style.css';
 import { formatEther, formatUnits, parseEther, parseTransaction, parseUnits } from 'viem';
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
+import { judgesPage } from './judges';
+import { checkSignature, proofJson } from './proof';
 import { ETH_PROOFS, NEAR_PROOFS, SOURCE_COMMIT } from './evidence';
 import { TEMPLATES, changeOf, describeWait, ruleWarnings, safetyChecks, summarize, type TemplateKey } from './rules';
 // @ts-ignore plain JavaScript shared with the scripts
@@ -110,6 +112,7 @@ const connectBtn = document.getElementById('connect') as HTMLButtonElement;
 const accountEl = document.getElementById('account')!;
 function renderAccount() {
   accountEl.textContent = accountId ?? '';
+  accountEl.title = accountId ?? '';
   connectBtn.textContent = accountId ? 'Disconnect' : 'Connect wallet';
   connectBtn.className = accountId ? 'btn' : 'btn primary';
 }
@@ -134,7 +137,7 @@ let renderId = 0;
 function route() {
   const id = ++renderId;
   const m = location.hash.match(/^#\/vault\/(\d+)/);
-  (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : location.hash.startsWith('#/try') ? tryPage(id) : homePage(id)).catch((e) => {
+  (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : location.hash.startsWith('#/try') ? tryPage(id) : location.hash.startsWith('#/judges') ? judgesPage(app, () => id === renderId) : homePage(id)).catch((e) => {
     if (id === renderId) app.innerHTML = `<div class="card"><div class="body">Could not load: ${esc(e?.message ?? e)}</div></div>`;
   });
 }
@@ -425,7 +428,7 @@ async function homePage(id: number) {
       <div class="finder-status mono"><span><i class="dot"></i>NEAR testnet ↔ Ethereum Sepolia</span><span id="vault-count">Vaults: …</span>
         <span>Contract: <a target="_blank" rel="noreferrer" href="${NEAR_EXPLORER}/address/${encodeURIComponent(CONTRACT)}">${esc(CONTRACT)} ↗</a></span><a href="#/verify">0 keys · code verified →</a></div>
     </div>
-    <div class="section-head col"><div class="eyebrow amber">Judges and evaluators</div><h2 class="big-h">Start here <span class="faint">· no wallet needed</span></h2></div>
+    <div class="section-head"><div><div class="eyebrow amber">Judges and evaluators</div><h2 class="big-h">Start here <span class="faint">· no wallet needed</span></h2></div><span class="spacer"></span><a class="btn primary" href="#/judges">Full judges' guide (5 steps) →</a></div>
     <div class="judge-grid">
       ${judge(ICON.chat, 'Try to fool the agent', 'Write a fake "urgent" invoice. A deliberately naive agent tries to pay it and the live contract decides.', '#/try', 'Try it')}
       ${judge(ICON.stop, 'Watch the rules stop an agent', "Vault 78's agent tried four invoices: see what the contract blocked and what the guardian stopped, each linked to its transaction.", '#/vault/78', 'Open vault 78')}
@@ -841,6 +844,7 @@ function agentSection(d: VaultData) {
     </div></div>`;
 }
 
+let proofCache: { i: number; json: string } | null = null;
 async function signedSection(d: VaultData, isOwner: boolean) {
   // The public Sepolia RPC is load-balanced and some of its nodes answer `null` for a receipt that
   // exists, so a missing receipt is retried and never shown as a failure on its own: a record is
@@ -869,12 +873,13 @@ async function signedSection(d: VaultData, isOwner: boolean) {
       /* keep the short label */
     }
     return `<tr title="nonce ${esc(r.nonce)}"><td>${what}</td><td><span class="badge ${pill}">${shown}</span></td><td>${txLink(d.chain, r.tx_hash)}</td><td class="row">
+      <button class="btn small" data-action="proof" data-i="${i}" aria-expanded="false" title="Checks in your browser that the vault's own key signed this exact transaction and that it is the one on Ethereum">Check this signature</button>
       ${st === 'not mined' ? `<button class="btn small" data-action="broadcast" data-raw="${esc(r.signed_tx)}">Send to Ethereum</button>` : ''}
       ${st === 'not mined' && isOwner ? `<button class="btn small" data-action="cancel-nonce" data-id="${r.nonce}" title="Signs a replacement that uses the same nonce, so this payment can never go through">Cancel this payment</button>` : ''}</td></tr>`;
   }).join('');
   const unc = d.uncertain.length ? `<div class="notice" style="margin-top:10px">Signing result unknown (the signer failed or answered something unreadable; the nonce stays used): ${d.uncertain.map((u) => `nonce ${u.nonce}`).join(', ')}. Sign the pinned proposal again or cancel the nonce.</div>` : '';
   return `<div class="card"><header><h2>Payment history</h2></header><div class="body">
-    ${rows ? `<table class="stack"><tr><th>Payment</th><th>Status</th><th>Receipt</th><th></th></tr>${rows}</table><p class="faint" style="margin-top:8px;font-size:12px">Signed payments are public: anyone can send one to Ethereum, no key needed.</p>` : '<div class="empty">Nothing paid yet.</div>'}${unc}</div></div>`;
+    ${rows ? `<table class="stack"><tr><th>Payment</th><th>Status</th><th>Receipt</th><th></th></tr>${rows}</table><div id="proof-out" aria-live="polite"></div><p class="faint" style="margin-top:8px;font-size:12px">Signed payments are public: anyone can send one to Ethereum, no key needed.</p>` : '<div class="empty">Nothing paid yet.</div>'}${unc}</div></div>`;
 }
 
 function saleSection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
@@ -1025,6 +1030,7 @@ async function vaultPage(id: string, rid: number) {
   noTranslate();
   if (location.hash.includes('?audit')) document.getElementById('audit')?.scrollIntoView();
   if (location.hash.includes('?check')) document.getElementById('checker')?.scrollIntoView();
+  if (location.hash.includes('?history')) document.getElementById('proof-out')?.closest('.card')?.scrollIntoView();
 }
 
 const csv = (s: string) => s.split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
@@ -1315,6 +1321,47 @@ app.addEventListener('click', async (e) => {
       (form.elements.namedItem('nft_amount') as HTMLInputElement).value = '';
       form.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return toast('Check the recipient, then "Request payment": the rules decide', 'ok');
+    }
+    case 'proof': {
+      const i = Number(el.dataset.i);
+      const rec = d.signed[i];
+      const out = document.getElementById('proof-out');
+      if (!rec || !out) return;
+      document.querySelectorAll('[data-action="proof"]').forEach((b) => b.setAttribute('aria-expanded', String(b === el)));
+      out.innerHTML = '<div class="proof"><p class="faint">Checking the signature in your browser…</p></div>';
+      const vault = { id: d.id, address: d.info.evm_address, chain: d.chain, contract: CONTRACT };
+      const p = await checkSignature(rec, vault, (h) => ethReceipt(d.chain, h));
+      const icon = (ok: boolean | null) => (ok === true ? '<span class="pc ok">✓</span>' : ok === false ? '<span class="pc bad">✕</span>' : '<span class="pc warn">?</span>');
+      const failed = p.checks.some((c) => c.ok === false);
+      const decoded = p.tx.to ? describeTx(p.tx.to, BigInt(p.tx.value), p.tx.data) : 'unreadable';
+      out.innerHTML = `<div class="proof ${p.ok ? 'ok' : 'bad'}">
+        <header class="row"><h3>Signature check · nonce ${esc(rec.nonce)}</h3><span class="spacer"></span>
+          <span class="badge ${p.ok ? 'ok' : failed ? 'bad' : 'warn'}">${p.ok ? 'all checks passed' : failed ? 'a check failed' : 'not complete'}</span></header>
+        <div class="proof-grid">
+          <div><div class="label">1 · What the contract recorded</div><dl class="proof-dl">
+            <div><dt>Payment</dt><dd>${decoded}</dd></div>
+            <div><dt>Request</dt><dd class="mono">${rec.proposal_id > 1e18 ? 'cancellation' : '#' + esc(rec.proposal_id)}</dd></div>
+            <div><dt>Signed</dt><dd>${esc(new Date(rec.signed_ms).toLocaleString())}</dd></div></dl></div>
+          <div><div class="label">2 · The signature from the NEAR signing network</div><dl class="proof-dl mono">
+            <div><dt>r</dt><dd>${esc(short(p.tx.r ?? '', 10, 8))}</dd></div><div><dt>s</dt><dd>${esc(short(p.tx.s ?? '', 10, 8))}</dd></div>
+            <div><dt>v (y parity)</dt><dd>${esc(p.tx.yParity ?? '')}</dd></div></dl></div>
+        </div>
+        <div class="label" style="margin-top:12px">3–4 · Checked in your browser (viem), not taken on trust</div>
+        <ul class="proof-checks">${p.checks.map((c) => `<li>${icon(c.ok)}<div><b>${esc(c.label)}</b><div class="mono faint">${esc(c.detail)}</div></div></li>`).join('')}</ul>
+        <div class="row" style="margin-top:12px"><button class="btn primary small" data-action="proof-download" data-i="${i}">Download proof (.json)</button>
+          <span class="faint" style="font-size:12px">The file says how to re-check it with any Ethereum library.</span></div>
+      </div>`;
+      proofCache = { i, json: proofJson(rec, vault, p) };
+      out.scrollIntoView({ block: 'start' });
+      return;
+    }
+    case 'proof-download': {
+      const rec = d.signed[Number(el.dataset.i)];
+      if (!proofCache || proofCache.i !== Number(el.dataset.i) || !rec) return;
+      const url = URL.createObjectURL(new Blob([proofCache.json], { type: 'application/json' }));
+      Object.assign(document.createElement('a'), { href: url, download: `vault-${d.id}-nonce-${rec.nonce}-proof.json` }).click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return;
     }
     case 'copy':
       await navigator.clipboard.writeText(el.dataset.text ?? '').catch(() => {});

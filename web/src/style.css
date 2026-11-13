@@ -393,3 +393,101 @@ details[open] > summary.btn::after { transform: translateY(1px) rotate(-135deg);
 .finder-status { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--faint); }
 .finder-status a { color: var(--muted); }
 .finder-status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--mint); margin-right: 6px; vertical-align: middle; }
+
+/* ---------- Judges' guide (#/judges) ---------- */
+.jhero { display: flex; gap: 24px; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; margin: 8px 0 20px; }
+.jhero > div:first-child { max-width: 680px; }
+.jhero h1 { font-size: 36px; letter-spacing: -0.03em; margin: 0 0 10px; }
+.jhero-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.jinv-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 22px; }
+.jinv-title { margin: 0 0 8px; font-size: 17px; }
+.jfacts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 14px; }
+.jfacts div { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.jfacts span { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.04em; }
+.jfacts b { color: var(--mint); font-size: 14px; overflow-wrap: anywhere; }
+.jpath { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; display: flex; flex-direction: column; gap: 4px; }
+.jpath-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--faint); margin-bottom: 4px; }
+.jnode { border: 1px solid var(--line-2); border-radius: var(--radius); padding: 8px 10px; display: flex; flex-direction: column; }
+.jnode span { font-size: 12px; color: var(--muted); }
+.jnode.ok { border-color: var(--mint-line); background: var(--mint-dim); }
+.jnode.warn { border-color: var(--amber-line); background: var(--amber-dim); }
+.jarrow { font-size: 11px; color: var(--faint); padding-left: 10px; font-family: var(--mono); }
+.jstep { margin-top: 18px; }
+.jstep-head { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.jstep-head h2 { margin: 0; font-size: 18px; }
+.jstep-head p { margin: 2px 0 0; font-size: 13px; }
+.jstep-n { color: var(--mint); border: 1px solid var(--mint-line); background: var(--mint-dim); border-radius: var(--radius); padding: 2px 8px; font-size: 13px; }
+.jsplit { display: grid; grid-template-columns: 1fr 1.2fr; gap: 18px; align-items: start; }
+.jspecs { margin: 0; display: grid; gap: 6px; font-size: 13px; }
+.jspecs div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px dashed var(--line); padding-bottom: 6px; }
+.jspecs dt { color: var(--faint); }
+.jspecs dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+.jspecs-note { font-size: 12px; margin: 8px 0 0; }
+.term { background: #06070b; border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 12px; min-width: 0; }
+.term-head { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.term-dots { display: inline-flex; gap: 4px; }
+.term-dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--line-2); }
+.term pre { margin: 0; padding: 10px 12px; font-size: 12px; color: var(--text); white-space: pre-wrap; word-break: break-all; max-height: 320px; overflow: auto; }
+.term-note { padding: 8px 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.run-list { list-style: none; padding: 0; margin: 0 0 12px; display: grid; gap: 10px; }
+.run-line { display: flex; gap: 12px; border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; font-size: 13.5px; }
+.run-line.bad { border-color: var(--red-line); background: var(--red-dim); }
+.run-line.warn { border-color: var(--amber-line); }
+.run-ico { font-weight: 700; color: var(--red); }
+.run-req { font-family: var(--mono); font-size: 12.5px; margin-bottom: 4px; }
+.run-links { margin-top: 4px; font-size: 12.5px; }
+.capbar { position: relative; height: 14px; border-radius: 3px; background: var(--surface-3); overflow: hidden; margin: 6px 0; display: flex; }
+.capbar .cap-used { background: var(--mint); height: 100%; }
+.capbar-legend { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; margin-bottom: 12px; }
+.jtimeline { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.jtimeline li { display: flex; gap: 10px; border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; background: var(--bg); }
+.jtimeline li > span { color: var(--mint); border: 1px solid var(--mint-line); border-radius: 50%; width: 24px; height: 24px; display: grid; place-items: center; flex: none; font-size: 12px; }
+.jtimeline li.bad { border-color: var(--red-line); }
+.jtimeline li.bad > span { color: var(--red); border-color: var(--red-line); }
+.jtimeline li.ok { border-color: var(--mint-line); }
+.jtimeline p { margin: 4px 0 0; font-size: 12.5px; color: var(--muted); }
+.jdeck { margin: 24px 0; }
+.jdeck-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 10px; }
+.jchecklist ul { margin: 0; padding: 10px 12px 10px 28px; display: grid; gap: 6px; font-size: 13px; }
+@media (max-width: 960px) {
+  .jinv-grid, .jsplit, .jdeck-grid { grid-template-columns: 1fr; }
+  .jtimeline { grid-template-columns: 1fr 1fr; }
+  .jfacts { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 560px) { .jtimeline { grid-template-columns: 1fr; } .jhero h1 { font-size: 28px; } }
+
+/* Signature check (proof.ts) */
+.proof { margin-top: 14px; border: 1px solid var(--line-2); border-radius: var(--radius); padding: 14px; background: var(--bg); }
+.proof.ok { border-color: var(--mint-line); }
+.proof.bad { border-color: var(--amber-line); }
+.proof h3 { margin: 0; font-size: 15px; }
+.proof-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 10px; }
+.proof-dl { margin: 6px 0 0; display: grid; gap: 5px; font-size: 12.5px; }
+.proof-dl div { display: flex; justify-content: space-between; gap: 10px; border-bottom: 1px dashed var(--line); padding-bottom: 4px; }
+.proof-dl dt { color: var(--faint); }
+.proof-dl dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+.proof-checks { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 8px; font-size: 13px; }
+.proof-checks li { display: flex; gap: 10px; align-items: flex-start; }
+.proof-checks .mono { font-size: 11.5px; overflow-wrap: anywhere; }
+.pc { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; flex: none; font-size: 12px; font-weight: 700; }
+.pc.ok { color: var(--mint); border: 1px solid var(--mint-line); }
+.pc.bad { color: var(--red); border: 1px solid var(--red-line); }
+.pc.warn { color: var(--amber); border: 1px solid var(--amber-line); }
+@media (max-width: 640px) { .proof-grid { grid-template-columns: 1fr; } }
+#proof-out { scroll-margin-top: 110px; }
+
+/* Judges' guide: link to the signature check */
+.jproof-cta { display: flex; gap: 14px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--mint-line); background: var(--mint-dim); border-radius: var(--radius); font-size: 13.5px; }
+.jproof-cta > div { display: flex; flex-direction: column; gap: 2px; max-width: 720px; }
+
+/* Readability: secondary text a little lighter (about 5.6:1 on the page background, was about 4:1) */
+:root { --faint: #7f8ba1; }
+
+/* Mobile: keep the top bar on one line */
+@media (max-width: 640px) {
+  .topbar { flex-wrap: nowrap; gap: 8px; }
+  .topbar .badge { display: none; }
+  .topbar #account { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+  .topbar #connect { font-size: 12.5px; padding: 6px 12px; white-space: nowrap; }
+  .brand { font-size: 13px; white-space: nowrap; }
+}
