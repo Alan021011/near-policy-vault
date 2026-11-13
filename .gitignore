@@ -11,3 +11,6 @@ node_modules/
 # Local data
 *.log
 scripts/a1-tx.json
+
+# The agent remembers the invoices it proposed (M43); local only
+scripts/.agent-memory.json
