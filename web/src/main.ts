@@ -3,6 +3,7 @@ import { formatEther, formatUnits, parseEther, parseTransaction, parseUnits } fr
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
 import { ETH_PROOFS, NEAR_PROOFS, SOURCE_COMMIT } from './evidence';
+import { TEMPLATES, ruleWarnings, summarize, type TemplateKey } from './rules';
 // @ts-ignore plain JavaScript shared with the scripts
 import { historyFromSigned, riskSignals } from './risk.mjs';
 import {
@@ -536,6 +537,9 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
     ? `<details style="margin-top:12px"><summary class="btn small" style="display:inline-block">${d.policy.has_policy ? 'Change the rules' : 'Set the rules'}</summary>
         <p class="faint">Stricter rules apply at once. Looser rules (or a new agent) wait the current waiting time, and the guardian can stop them. Replacing the guardian waits max(2 × waiting time, 3 days).</p>
         <form id="policy-form" class="form">
+          <div class="full"><div class="label">Start from a template (you review every field before signing)</div>
+            <div class="row">${(Object.keys(TEMPLATES) as TemplateKey[]).map((k) => `<button type="button" class="btn small" data-template="${k}">${esc(TEMPLATES[k].label)}</button>`).join('')}</div>
+            <div class="help" id="template-note"></div></div>
           <label><div class="label">Waiting time (seconds)</div><input name="delay" value="${draft.delay_ms / 1000}" /><div class="help">The guardian can only stop a payment during this time. With a person as guardian, use hours (e.g. 3600), not seconds; 0 means nobody can stop a payment. The demo vaults use 60 s only so you can watch it.</div></label>
           <label><div class="label">Guardian (NEAR account)</div><input name="guardian" value="${esc(draft.guardian ?? '')}" placeholder="e.g. your-friend.testnet" /><div class="help">A person you trust who can stop payments. It cannot be the same account as the agent.</div></label>
           <label><div class="label">Daily limit (ETH)</div><input name="cap" value="${formatEther(BigInt(draft.eth_daily_cap))}" /></label>
@@ -551,7 +555,8 @@ function vaultCard(d: VaultData, isOwner: boolean, isGuardian: boolean) {
               <div class="rows" id="nft-rows">${((draft.nfts ?? []) as any[]).map(nftRow).join('')}</div>
               <button type="button" class="btn small" data-action="add-nft-row">+ Add NFT collection</button></div>
           </details>
-          <div class="full"><button class="btn primary">Save rules</button> <span class="faint">0.05 NEAR deposit, the unused part is refunded</span></div>
+          <div class="full" id="rules-review" aria-live="polite"></div>
+          <div class="full"><button class="btn primary" id="rules-submit">Review the rules</button> <span class="faint">0.05 NEAR deposit, the unused part is refunded</span></div>
         </form></details>`
     : '';
   const empty = isOwner && d.info.evm_address && d.balance === 0n
@@ -977,9 +982,38 @@ function wireVault(d: VaultData) {
       nfts,
       proposer: String(f.get('proposer') || '').trim() || null,
     };
+    // M42: first show the rules in plain words and what is weak about them; sign only on the second click.
+    const key = JSON.stringify(policy);
+    if (policyForm.dataset.reviewed !== key) {
+      policyForm.dataset.reviewed = key;
+      const warns = ruleWarnings(policy);
+      const label = { high: 'Warning', warn: 'Check', info: 'Note' } as Record<string, string>;
+      document.getElementById('rules-review')!.innerHTML = `<div class="card" style="margin:0"><div class="body">
+        <b>These rules say:</b><ul class="plain">${summarize(policy).map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
+        ${warns.length ? `<ul class="signs">${warns.map((w) => `<li class="${w.level}"><b>${label[w.level]}:</b> ${esc(w.text)}</li>`).join('')}</ul>` : '<div class="signs-none">No weak spot found in these rules.</div>'}
+        <div class="faint" style="margin-top:6px">Warnings are advice from this page; the contract accepts any valid rules. Change a field to review again, or confirm.</div></div></div>`;
+      document.getElementById('rules-submit')!.textContent = warns.some((w) => w.level === 'high') ? 'Confirm anyway and sign' : 'Confirm and sign';
+      return;
+    }
     act('Set policy', () => call('set_policy', { token_id: t, policy }, nearToYocto('0.05')), (r) =>
       toast(r?.value === true ? 'Policy applied at once' : 'Policy queued: it applies after the delay unless the guardian vetoes it', 'ok'));
   };
+  if (policyForm) {
+    const resetReview = () => {
+      if (!policyForm.dataset.reviewed) return;
+      delete policyForm.dataset.reviewed;
+      document.getElementById('rules-review')!.innerHTML = '';
+      document.getElementById('rules-submit')!.textContent = 'Review the rules';
+    };
+    policyForm.addEventListener('input', resetReview);
+    policyForm.querySelectorAll<HTMLButtonElement>('[data-template]').forEach((b) => b.addEventListener('click', () => {
+      const tpl = TEMPLATES[b.dataset.template as TemplateKey];
+      (policyForm.elements.namedItem('delay') as HTMLInputElement).value = String(tpl.delaySeconds);
+      if (!tpl.keepProposer) (policyForm.elements.namedItem('proposer') as HTMLInputElement).value = '';
+      document.getElementById('template-note')!.textContent = tpl.note;
+      resetReview();
+    }));
+  }
   document.querySelectorAll<HTMLElement>('#token-rows .trow').forEach(async (row) => {
     const c = (row.querySelector('[name="t_contract"]') as HTMLInputElement).value;
     try {

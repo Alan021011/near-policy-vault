@@ -247,3 +247,7 @@ ul.signs li.warn { border-left-color: #c98a12; background: rgba(201, 138, 18, 0.
 ul.signs li.info { color: var(--muted); }
 .signs-none { margin-top: 8px; font-size: 13px; }
 .signs-note { font-size: 12px; margin-top: 4px; }
+
+/* M42: long links and code lines wrap on phones (Verify page at 375 px) */
+.vrow > div { min-width: 0; }
+.vrow a, .vrow .faint, .vrow .mono { overflow-wrap: anywhere; }

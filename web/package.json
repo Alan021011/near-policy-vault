@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --no-warnings --test test/audit.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test test/audit.test.ts test/rules.test.ts",
     "typecheck": "tsc -p ."
   },
   "dependencies": {
