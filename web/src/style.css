@@ -323,3 +323,73 @@ details[open] > summary.btn::after { transform: translateY(1px) rotate(-135deg);
 /* The vault drawing also inside the NFT card image, in the web page only (the card itself is drawn by the locked contract) */
 .nft-frame { position: relative; display: inline-block; line-height: 0; border-radius: 8px; }
 .nft-frame::after { content: ''; position: absolute; inset: 1px; border-radius: 8px; background: url('/vault-art.jpg') center / cover no-repeat; opacity: 0.2; mix-blend-mode: screen; pointer-events: none; }
+
+/* ---------- Home page (landing, M45 from the Stitch mock-ups, real data only) ---------- */
+.topnav { display: flex; gap: 18px; margin-right: 12px; font-size: 13px; }
+.topnav a { color: var(--muted); }
+.topnav a:hover { color: var(--mint); text-decoration: none; }
+.eyebrow-tag { display: inline-block; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--mint); border: 1px solid var(--mint-line); background: var(--mint-dim); padding: 4px 10px; border-radius: var(--radius); margin-bottom: 16px; }
+.hero .hl { color: var(--mint); text-decoration: underline; text-decoration-thickness: 3px; text-underline-offset: 6px; }
+.link-quiet { font-size: 13px; color: var(--muted); }
+.eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mint); }
+.eyebrow.amber, .pillar.amber .eyebrow { color: var(--amber); }
+.pillar.red .eyebrow { color: var(--red); }
+.section-head.col { flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 34px; }
+.section-head .big-h, .big-h { font-size: 24px; margin: 2px 0 4px; letter-spacing: -0.02em; }
+.big-h .faint { font-size: 15px; font-weight: 400; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 4px 0 8px; }
+.stat { display: flex; gap: 12px; align-items: flex-start; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; color: var(--text); }
+.stat:hover { text-decoration: none; border-color: var(--mint-line); }
+.stat b { display: block; font-size: 17px; margin-bottom: 3px; }
+.stat span { color: var(--muted); font-size: 13px; }
+.stat-ico { color: var(--mint); flex: none; margin-top: 2px; }
+.stat.amber .stat-ico { color: var(--amber); }
+.judge-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.jcard, .pillar { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; display: flex; flex-direction: column; gap: 8px; }
+.jcard h3, .pillar h3 { margin: 0; font-size: 16px; }
+.jcard p, .pillar p { margin: 0; color: var(--muted); font-size: 13.5px; flex: 1; }
+.jcard .btn { align-self: stretch; justify-content: space-between; margin-top: 6px; }
+.jcard .ico, .pillar .ico, .trust-note .ico { width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--mint-line); background: var(--mint-dim); color: var(--mint); border-radius: var(--radius); flex: none; }
+.pillar.amber .ico { color: var(--amber); border-color: var(--amber-line); background: var(--amber-dim); }
+.pillar.red .ico { color: var(--red); border-color: var(--red-line); background: var(--red-dim); }
+.pillars { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 30px; }
+.pillar-foot { display: flex; justify-content: space-between; gap: 8px; border-top: 1px solid var(--line); padding-top: 10px; margin-top: 6px; font-size: 12px; color: var(--faint); }
+.pillar-foot .mono { color: var(--mint); }
+.pillar.amber .pillar-foot .mono { color: var(--amber); }
+.pillar.red .pillar-foot .mono { color: var(--red); }
+.vault-card.demo { display: flex; flex-direction: column; gap: 4px; }
+.vault-card.featured { border-color: var(--mint-line); box-shadow: 0 0 0 1px var(--mint-line), 0 0 24px rgba(0, 236, 151, 0.08); }
+.vc-live { margin: 8px 0 10px; display: grid; gap: 6px; font-size: 12.5px; flex: 1; }
+.vc-live div { display: flex; justify-content: space-between; gap: 10px; border-bottom: 1px dashed var(--line); padding-bottom: 5px; }
+.vc-live dt { color: var(--faint); }
+.vc-live dd { margin: 0; color: var(--text); text-align: right; overflow-wrap: anywhere; }
+.vc-cta { justify-content: center; }
+.trust-note { display: flex; gap: 16px; align-items: flex-start; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; margin: 24px 0; }
+.trust-note h3 { margin: 0 0 6px; font-size: 17px; }
+.trust-note p { margin: 0; font-size: 13.5px; }
+@media (max-width: 960px) {
+  .judge-grid { grid-template-columns: repeat(2, 1fr); }
+  .topnav { display: none; }
+}
+@media (max-width: 640px) {
+  .stats, .judge-grid, .pillars { grid-template-columns: 1fr; }
+  .trust-note { flex-direction: column; }
+}
+.demo-grid { grid-template-columns: repeat(3, 1fr); }
+.step-n { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--mint-line); color: var(--mint); border-radius: var(--radius); font-weight: 600; }
+@media (max-width: 860px) { .demo-grid { grid-template-columns: 1fr; } }
+
+/* Vault finder on the home page */
+.finder { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin: 6px 0 4px; }
+.finder-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.finder-input { flex: 1 1 340px; display: flex; align-items: center; gap: 8px; background: var(--bg); border: 1px solid var(--line-2); border-radius: var(--radius); padding: 0 12px; color: var(--faint); }
+.finder-input:focus-within { border-color: var(--mint); }
+.finder-input input { border: 0; background: transparent; padding: 11px 0; width: 100%; outline: none; font-size: 13px; color: var(--text); }
+.finder-chips { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.chip { display: inline-block; font-size: 12px; padding: 3px 8px; border: 1px solid var(--mint-line); background: var(--mint-dim); color: var(--mint); border-radius: var(--radius); }
+.chip:hover { text-decoration: none; border-color: var(--mint); }
+.finder-result { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.bad-text { color: var(--red); }
+.finder-status { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--faint); }
+.finder-status a { color: var(--muted); }
+.finder-status .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--mint); margin-right: 6px; vertical-align: middle; }

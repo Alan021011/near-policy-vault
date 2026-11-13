@@ -345,52 +345,147 @@ async function vaultSummary(t: any) {
   </a>`;
 }
 
+// ---------- open a vault by number, NEAR owner or Ethereum address ----------
+function showFind(html: string) {
+  const el = document.getElementById('open-result');
+  if (el) { el.hidden = !html; el.innerHTML = html; }
+}
+const vaultLinks = (ids: string[]) => ids.map((t) => `<a class="chip mono" href="#/vault/${esc(t)}">Vault #${esc(t)}</a>`).join(' ');
+async function findVault(q: string, rid: number) {
+  if (!q) return showFind('');
+  const n = q.replace(/^#/, '');
+  if (/^\d+$/.test(n)) { location.hash = `#/vault/${n}`; return; }
+  if (/^0x[0-9a-fA-F]{40}$/.test(q)) {
+    showFind('<span class="faint">Looking for the vault that controls this Ethereum address…</span>');
+    const total = Number(await view<string>('nft_total_supply'));
+    const want = q.toLowerCase();
+    for (let from = 0; from < total; from += 50) {
+      const page = await view<any[]>('nft_tokens', { from_index: String(from), limit: 50 });
+      for (let i = 0; i < page.length; i += 8) {
+        const batch = page.slice(i, i + 8);
+        const infos = await Promise.all(batch.map((t) => view('vault_info', { token_id: t.token_id }).catch(() => null)));
+        if (rid !== renderId) return;
+        const k = infos.findIndex((x: any) => x?.evm_address?.toLowerCase() === want);
+        if (k >= 0) { location.hash = `#/vault/${batch[k].token_id}`; return; }
+      }
+    }
+    return showFind(`No vault of this contract controls ${esc(short(q, 10, 8))}.`);
+  }
+  if (/^[a-z0-9._-]+\.(testnet|near)$/.test(q.toLowerCase()) || /^[0-9a-f]{64}$/.test(q)) {
+    const tokens = await view<any[]>('nft_tokens_for_owner', { account_id: q.toLowerCase(), from_index: '0', limit: 50 });
+    if (rid !== renderId) return;
+    if (tokens.length === 1) { location.hash = `#/vault/${tokens[0].token_id}`; return; }
+    return showFind(tokens.length ? `${esc(q)} owns ${tokens.length} vaults: ${vaultLinks(tokens.map((t) => t.token_id))}` : `${esc(q)} owns no vault.`);
+  }
+  showFind('Type a vault number (78), a NEAR account (name.testnet) or an Ethereum address (0x… 40 hex characters).');
+}
+
 async function homePage(id: number) {
+  const ico = (d: string) => `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+  const ICON = {
+    chat: ico('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'),
+    stop: ico('<circle cx="12" cy="12" r="9"/><path d="m6 6 12 12"/>'),
+    ask: ico('<path d="M4 17 10 11 4 5"/><path d="M12 19h8"/>'),
+    check: ico('<path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z"/><path d="m9 12 2 2 4-4"/>'),
+    rules: ico('<path d="M11 6h9M11 12h9M11 18h9"/><path d="m3 6 1.5 1.5L7 5"/><path d="m3 12 1.5 1.5L7 11"/><path d="m3 18 1.5 1.5L7 17"/>'),
+    clock: ico('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
+    shield: ico('<path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z"/><path d="M9 12h6"/>'),
+    key: ico('<circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 9.2-9.2M17 6l3 3"/><path d="m3 3 18 18"/>'),
+  };
+  const judge = (icon: string, title: string, text: string, href: string, cta: string, ext = false) =>
+    `<div class="jcard"><div class="ico">${icon}</div><h3>${title}</h3><p>${text}</p>
+      <a class="btn small" href="${href}"${ext ? ' target="_blank" rel="noreferrer"' : ''}>${cta} ${ext ? '↗' : '→'}</a></div>`;
+  const pillar = (n: string, tone: string, icon: string, title: string, text: string, k: string, v: string) =>
+    `<div class="pillar ${tone}"><div class="ico">${icon}</div><div class="eyebrow">Pillar ${n}</div><h3>${title}</h3><p>${text}</p>
+      <div class="pillar-foot"><span>${k}</span><span class="mono">${v}</span></div></div>`;
   app.innerHTML = `
     <section class="hero">
-      <h1>Give your AI agent an Ethereum account — without giving it the keys.</h1>
+      <div class="eyebrow-tag mono">NEAR Chain Signatures · policy firewall for AI agents</div>
+      <h1>Give your AI agent an Ethereum account — <span class="hl">without giving it the keys.</span></h1>
       <p class="lead">Every payment follows rules you set: a daily limit, approved recipients, a waiting time, and a person who can say no. The NFT is the title deed of the account: whoever holds it holds the account and its rules, so you can hand it over without ever handing over a key.</p>
       <div class="row" style="margin-top:20px">
-        <a class="btn primary big" href="#/vault/78">See the live agent vault →</a>
+        <a class="btn primary big" href="#/vault/78">See the live agent vault (#78) →</a>
         ${accountId ? '' : '<button class="btn big" data-home="connect">Connect wallet</button>'}
+        <a class="link-quiet" href="${REPO}/blob/main/docs/THREAT_MODEL.md" target="_blank" rel="noreferrer">Read the threat model ↗</a>
       </div>
     </section>
-    <div class="card judges"><header><h2>Judges, start here</h2><span class="faint">no wallet needed</span></header><div class="body"><ol class="steps">
-      <li><a href="#/try"><b>Try to fool the agent</b></a>: write a fake "urgent" invoice; a deliberately naive agent tries to pay it and the live contract decides.</li>
-      <li><a href="#/vault/78"><b>Watch the rules stop an AI agent</b></a>: vault 78's agent tried four invoices; see what the contract blocked and what the guardian stopped, each linked to its transaction.</li>
-      <li><a href="#/vault/78"><b>Ask the contract yourself</b></a>: in vault 78, "Would this payment pass?" sends your test payment to the live contract (read-only) and shows its answer.</li>
-      <li><a href="#/verify"><b>Verify everything</b></a>: the deployed code equals the published build, nobody holds a key to change it, and every transaction we cite is checked live.</li>
-    </ol></div></div>
-    <div class="features">
-      <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 6h9M11 12h9M11 18h9"/><path d="m3 6 1.5 1.5L7 5"/><path d="m3 12 1.5 1.5L7 11"/><path d="m3 18 1.5 1.5L7 17"/></svg></div><h3>Rules</h3><p>A NEAR contract refuses any payment over the daily limit or to an address you did not approve.</p></div>
-      <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></div><h3>Waiting time</h3><p>Nothing is paid instantly. Every payment waits before it is signed, so there is time to react.</p></div>
-      <div class="feature"><div class="ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z"/><path d="M9 12h6"/></svg></div><h3>Human veto</h3><p>A guardian can stop any payment while it waits. The agent can never change the rules.</p></div>
+    <div class="stats">
+      <a class="stat" href="${REPO}/actions/workflows/tests.yml" target="_blank" rel="noreferrer"><div class="stat-ico">${ICON.shield}</div><div><b>49 / 49 attacks blocked</b><span>threat-model attacks against the real contract in a local sandbox (CI)</span></div></a>
+      <a class="stat amber" href="${REPO}/blob/main/scripts/bench/results-external.md" target="_blank" rel="noreferrer"><div class="stat-ico">${ICON.stop}</div><div><b>99.65 % of the ETH kept</b><span>91 attack invoices written by other AIs: 73 blocked, 18 inside the rules</span></div></a>
+      <a class="stat" href="#/verify"><div class="stat-ico">${ICON.key}</div><div><b>0 keys on the contract</b><span>locked, reproducible build: nobody, the author included, can change its code</span></div></a>
     </div>
-    <p class="faint small-note">No single party holds the key to the vault's Ethereum account: NEAR's signing network (Chain Signatures) signs only what the contract checked. This is a demo on test networks: everything uses free test money with no real value.</p>
-    <div class="section-head"><h2>Live demo vaults</h2><span class="spacer"></span>
-      <form id="open" class="row"><input id="open-id" class="mono" style="max-width:110px" placeholder="vault #" inputmode="numeric" aria-label="Vault number" /><button class="btn small">Open</button></form></div>
+    <div class="finder">
+      <form id="open" class="finder-row" role="search">
+        <label class="finder-input"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+          <input id="open-id" class="mono" autocomplete="off" spellcheck="false" placeholder="Vault number (e.g. 78), NEAR account or Ethereum address" aria-label="Vault number, NEAR account or Ethereum address" /></label>
+        <button class="btn primary">Open vault</button>
+        <div class="finder-chips"><span class="faint">Demo vaults:</span>${DEMO_VAULTS.map((v) => `<a class="chip mono" href="#/vault/${v.id}">#${v.id}</a>`).join('')}</div>
+      </form>
+      <div id="open-result" class="finder-result" hidden></div>
+      <div class="finder-status mono"><span><i class="dot"></i>NEAR testnet ↔ Ethereum Sepolia</span><span id="vault-count">Vaults: …</span>
+        <span>Contract: <a target="_blank" rel="noreferrer" href="${NEAR_EXPLORER}/address/${encodeURIComponent(CONTRACT)}">${esc(CONTRACT)} ↗</a></span><a href="#/verify">0 keys · code verified →</a></div>
+    </div>
+    <div class="section-head col"><div class="eyebrow amber">Judges and evaluators</div><h2 class="big-h">Start here <span class="faint">· no wallet needed</span></h2></div>
+    <div class="judge-grid">
+      ${judge(ICON.chat, 'Try to fool the agent', 'Write a fake "urgent" invoice. A deliberately naive agent tries to pay it and the live contract decides.', '#/try', 'Try it')}
+      ${judge(ICON.stop, 'Watch the rules stop an agent', "Vault 78's agent tried four invoices: see what the contract blocked and what the guardian stopped, each linked to its transaction.", '#/vault/78', 'Open vault 78')}
+      ${judge(ICON.ask, 'Ask the contract yourself', 'In vault 78, "Would this payment pass?" sends your test payment to the live contract (read-only) and shows its answer.', '#/vault/78?check', 'Ask the contract')}
+      ${judge(ICON.check, 'Verify everything', 'The deployed code equals the published build, nobody holds a key to change it, and every transaction we cite is checked live.', '#/verify', 'Verify')}
+    </div>
+    <div class="section-head col"><div class="eyebrow">How it protects the money</div><h2 class="big-h">Three checks before any payment</h2>
+      <p class="muted" style="margin:0">The agent never holds a key. A payment is signed only if it passes the rules, waits out the waiting time and nobody stops it.</p></div>
+    <div class="pillars">
+      ${pillar('01', '', ICON.rules, 'Rules in the contract', 'A NEAR contract refuses any payment over the daily limit or to an address you did not approve. The agent can never change the rules.', 'Checked by', 'the NEAR contract')}
+      ${pillar('02', 'amber', ICON.clock, 'Waiting time', 'A payment waits in public before it is signed (the owner sets how long), so there is time to react.', 'Vault 78 waits', '60 seconds')}
+      ${pillar('03', 'red', ICON.shield, 'Human veto', 'A guardian can stop any payment while it waits. Alerts by Telegram or an open browser tab are optional.', 'Guardian can', 'stop, not spend')}
+    </div>
+    <div class="section-head"><div><div class="eyebrow">Live on testnet</div><h2 class="big-h">Demo vaults</h2></div></div>
     <div class="grid demo-grid">
-      ${DEMO_VAULTS.map((v) => `<a class="card vault-card" href="#/vault/${v.id}">
+      ${DEMO_VAULTS.map((v, i) => `<a class="card vault-card demo${i === 0 ? ' featured' : ''}" href="#/vault/${v.id}">
         <div class="row"><h2>Vault #${v.id}</h2><span class="spacer"></span><span class="badge ${v.tone}">${v.badge}</span></div>
-        <div class="vc-title">${v.title}</div><p class="muted">${v.text}</p></a>`).join('')}
+        <div class="vc-title">${v.title}</div><p class="muted">${v.text}</p>
+        <dl class="vc-live" id="live-${v.id}"><div><dt>Reading the contract…</dt><dd></dd></div></dl>
+        <span class="btn ${i === 0 ? 'primary' : ''} vc-cta">Open vault #${v.id} →</span></a>`).join('')}
     </div>
     <div id="mine"></div>
-    <div id="guarded"></div>`;
+    <div id="guarded"></div>
+    <div class="trust-note"><div class="ico">${ICON.key}</div><div><h3>No single party holds the key to the vault's Ethereum account.</h3>
+      <p class="muted">NEAR's signing network (Chain Signatures, a group of independent nodes) signs only what the contract checked. You still trust that network, and no independent human audit has been done yet: the <a href="${REPO}/blob/main/docs/DETAILS.md" target="_blank" rel="noreferrer">known limits ↗</a> are listed. This is a demo on test networks with free test money.</p></div></div>`;
+  for (const v of DEMO_VAULTS) {
+    const id = String(v.id);
+    Promise.all([view('get_policy', { token_id: id }), view('vault_info', { token_id: id }), view('get_vault_chain', { token_id: id }), view('nft_token', { token_id: id })])
+      .then(async ([policy, info, chainRaw, token]) => {
+        const p = policy.has_policy ? policy.policy : null;
+        const chain = chainRaw ?? p?.chain_id ?? DEFAULT_CHAIN;
+        const bal = info.evm_address && EXPLORER[chain] ? await eth<string>(chain, 'eth_getBalance', [info.evm_address, 'latest']).then((x) => BigInt(x)).catch(() => null) : null;
+        const rows: [string, string][] = [
+          ['Balance', bal === null ? '—' : ethFmt(bal)],
+          ['Daily limit', p ? `${ethFmt(p.eth_daily_cap)} / day` : 'no rules yet'],
+          ['Waiting time', p ? describeWait(p.delay_ms) : '—'],
+          ['Guardian', p?.guardian ? esc(short(p.guardian, 14, 8)) : 'none'],
+          ['Owner', esc(short(token?.owner_id ?? '', 14, 8))],
+        ];
+        const el = document.getElementById(`live-${id}`);
+        if (el) el.innerHTML = rows.map(([k, val]) => `<div><dt>${k}</dt><dd class="mono" translate="no">${val}</dd></div>`).join('');
+      })
+      .catch(() => { const el = document.getElementById(`live-${id}`); if (el) el.innerHTML = '<div><dt>Could not read the contract right now</dt><dd></dd></div>'; });
+  }
   app.querySelector('[data-home="connect"]')?.addEventListener('click', () => connect().catch((e) => toast(String(e?.message ?? e), 'bad')));
+  view<string>('nft_total_supply').then((n) => { const el = document.getElementById('vault-count'); if (el) el.textContent = `Vaults: ${n}`; }).catch(() => {});
   (document.getElementById('open') as HTMLFormElement).onsubmit = (e) => {
     e.preventDefault();
-    const v = (document.getElementById('open-id') as HTMLInputElement).value.trim();
-    if (/^\d+$/.test(v)) location.hash = `#/vault/${v}`;
+    findVault((document.getElementById('open-id') as HTMLInputElement).value.trim(), id).catch((err) => showFind(`<span class="bad-text">Could not search right now: ${esc(err?.message ?? err)}</span>`));
   };
   const mine = document.getElementById('mine')!;
   if (!accountId) {
-    mine.innerHTML = `<div class="card"><header><h2>Try it yourself</h2></header><div class="body">
-      <p class="muted">You only need a free test wallet. Nothing here uses real money.</p>
-      <ol class="steps">
-        <li><b>Install a NEAR wallet</b>, for example <a href="https://wallet.meteorwallet.app" target="_blank" rel="noreferrer">Meteor Wallet ↗</a>, and create a <b>testnet</b> account (free).</li>
-        <li><b>Get free test NEAR</b> from a faucet such as <a href="https://near-faucet.io" target="_blank" rel="noreferrer">near-faucet.io ↗</a>, to pay small refundable deposits.</li>
-        <li><b>Press "Connect wallet"</b> at the top, then "Create a vault" and set its rules.</li>
-      </ol></div></div>`;
+    const step = (n: number, title: string, text: string) => `<div class="jcard step"><div class="step-n mono">${n}</div><h3>${title}</h3><p>${text}</p></div>`;
+    mine.innerHTML = `<div class="section-head col"><div class="eyebrow">Your own vault</div><h2 class="big-h">Try it yourself in 3 steps</h2>
+      <p class="muted" style="margin:0">You only need a free test wallet. Nothing here uses real money.</p></div>
+      <div class="pillars">
+        ${step(1, 'Install a NEAR wallet', 'For example <a href="https://wallet.meteorwallet.app" target="_blank" rel="noreferrer">Meteor Wallet ↗</a>, and create a <b>testnet</b> account (free).')}
+        ${step(2, 'Get free test NEAR', 'From a faucet such as <a href="https://near-faucet.io" target="_blank" rel="noreferrer">near-faucet.io ↗</a>, to pay small refundable deposits.')}
+        ${step(3, 'Connect and create a vault', 'Press "Connect wallet" at the top, then "Create a vault" and set its rules: limit, approved addresses, waiting time, guardian.')}
+      </div>`;
     return;
   }
   mine.innerHTML = `<div class="card"><header><h2>My vaults</h2><span class="spacer"></span>
@@ -929,6 +1024,7 @@ async function vaultPage(id: string, rid: number) {
   wireVault(d);
   noTranslate();
   if (location.hash.includes('?audit')) document.getElementById('audit')?.scrollIntoView();
+  if (location.hash.includes('?check')) document.getElementById('checker')?.scrollIntoView();
 }
 
 const csv = (s: string) => s.split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
