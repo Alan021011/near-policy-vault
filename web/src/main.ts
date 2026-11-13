@@ -2,7 +2,7 @@ import './style.css';
 import { formatEther, formatUnits, parseEther, parseTransaction, parseUnits } from 'viem';
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
-import { ETH_PROOFS, NEAR_PROOFS } from './evidence';
+import { ETH_PROOFS, NEAR_PROOFS, SOURCE_COMMIT } from './evidence';
 // @ts-ignore plain JavaScript shared with the scripts
 import { historyFromSigned, riskSignals } from './risk.mjs';
 import {
@@ -151,7 +151,7 @@ async function verifyPage(id: number) {
       el.innerHTML = `<div class="vrow"><div><b>Deployed code</b><div class="mono small">${esc(hash)}</div><div class="faint">equals the reproducible build published in the repository (${esc(EXPECTED_CODE.slice(0, 8))}…)</div></div>${okBadge(hash === EXPECTED_CODE, 'same as published')}</div>
         <div class="vrow"><div><b>Who can change it</b><div class="faint">${keys.keys.length === 0 ? 'The contract account has no access keys: nobody, the author included, can change its code.' : `The account has ${keys.keys.length} access key(s).`}</div></div>${okBadge(keys.keys.length === 0, 'nobody (0 keys)', `${keys.keys.length} key(s)`)}</div>
         <div class="vrow"><div><b>Where the code comes from</b><div class="faint">${meta?.link ? `<a href="${esc(meta.link)}" target="_blank" rel="noreferrer">${esc(meta.link.replace('https://github.com/', ''))} ↗</a>` : 'not published'} · built in <span class="mono">${esc(meta?.build_info?.build_environment?.split('@')[0] ?? '?')}</span></div>
-        <div class="faint">Rebuild it: <span class="mono">cd contract && cargo near build reproducible-wasm</span> (Docker) and compare the SHA-256.</div></div>${okBadge(!!meta?.link, 'source published', 'unknown')}</div>`;
+        <div class="faint">Rebuild it: <span class="mono">cd contract && cargo near build reproducible-wasm</span> (Docker) and compare the SHA-256.</div></div>${okBadge(!!meta?.link && meta.link.includes(SOURCE_COMMIT), `commit ${SOURCE_COMMIT}`, 'other commit')}</div>`;
     } catch (e: any) {
       el.innerHTML = `<p class="faint">Could not read the contract: ${esc(e?.message ?? e)}</p>`;
     }
@@ -620,7 +620,7 @@ function agentBox(d: VaultData, isOwner: boolean) {
       <ul class="can"><li>Request payments within these rules</li><li>Send them after the waiting time</li></ul>
       <ul class="cannot"><li>Change these rules or remove the guardian</li><li>Sell, hand over or move the vault</li><li>Cancel the owner's payments</li><li>Skip the waiting time or the guardian</li></ul>
     </div>
-    ${isOwner ? '<button class="btn small" data-action="remove-agent" title="Removing the agent is a stricter rule, so it applies at once">Remove the agent now</button> <span class="faint">applies at once</span>' : ''}
+    ${isOwner ? '<button class="btn small" data-action="remove-agent" title="Removing the agent is a stricter rule, so it applies at once">Remove the agent now</button> <span class="faint">applies at once; a payment the agent is already signing is not stopped (cancel its nonce in the payment history if needed)</span>' : ''}
   </div>`;
 }
 

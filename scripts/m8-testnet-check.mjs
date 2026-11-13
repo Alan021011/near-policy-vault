@@ -103,7 +103,7 @@ r = call(SELLER, 'execute_proposal', { token_id: T, proposal_id: q }, '0.02 NEAR
 check('while on sale the vault signs no new payment', r.panic === 'The vault is frozen for a sale; only cancel_nonce can sign until the sale ends', r.panic);
 
 // ---------- 3. the buyer's audit, the cancellation, the audit again ----------
-let a = await audit(VAULT, T);
+let a = await audit(VAULT, T, undefined, undefined, { allowKeys: true });
 check('the buyer\'s audit says NOT SAFE: one kept signature', !a.safe && a.outstanding.length === 1 && a.outstanding[0].nonce === kept.nonce, a.problems.join(' | '));
 r = call(SELLER, 'cancel_nonce', { token_id: T, nonce: kept.nonce, max_fee_per_gas: String(fee * 2n), max_priority_fee_per_gas: '2000000000' }, '0.02 NEAR');
 check('the seller cancels that nonce during the sale', r.stdout === 'true', r.panic ?? r.stdout);
@@ -112,7 +112,7 @@ const sent = await broadcast(versions[versions.length - 1].signed_tx);
 const rc = sent.hash ? await eth.waitForTransactionReceipt({ hash: sent.hash, timeout: 180_000 }) : null;
 check('the cancellation is mined from the vault', rc && rc.status === 'success', sent.hash ? `https://sepolia.etherscan.io/tx/${sent.hash}` : sent.error);
 await sleep(3000);
-a = await audit(VAULT, T);
+a = await audit(VAULT, T, undefined, undefined, { allowKeys: true });
 const waitOpen = Math.max(0, sale.opens_at_ms - Date.now());
 check('the audit now finds no kept signature', a.outstanding.length === 0 && a.mined === a.next, `mined ${a.mined}, next ${a.next}`);
 
@@ -121,7 +121,7 @@ if (waitOpen > 0) {
   console.log(`      waiting ${Math.ceil(waitOpen / 1000) + 5} s for the sale window to open...`);
   await sleep(waitOpen + 5000);
 }
-a = await audit(VAULT, T);
+a = await audit(VAULT, T, undefined, undefined, { allowKeys: true });
 check('with the window open the audit says SAFE', a.safe, a.problems.join(' | '));
 const nextBefore = await v('get_next_nonce', { token_id: T });
 // M8 review V1: a buyer who audited the first (vetoed) sale binds the transfer to it, and it fails,

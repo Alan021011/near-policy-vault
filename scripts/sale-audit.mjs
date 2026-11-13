@@ -98,13 +98,24 @@ async function allSigned(contract, tokenId, next) {
     if (page.length === 0) break;
     for (const r of page) seen.set(`${r.nonce}|${r.tx_hash}`, r);
     const last = page[page.length - 1].nonce;
-    from = page.length < 100 || page[0].nonce === last ? last + 1 : last;
+    if (page.length < 100) { from = last + 1; continue; }
+    if (page[0].nonce === last) {
+      // External review (round 3, H2): more than 100 versions of one nonce: read them all.
+      for (const r of await nearView(contract, 'get_signed_versions', { token_id: tokenId, nonce: last })) seen.set(`${r.nonce}|${r.tx_hash}`, r);
+      from = last + 1;
+    } else from = last;
   }
+  if (from < next) throw new Error('the signed history could not be read to the end');
   return [...seen.values()];
 }
 
 /** Returns { safe, lines[], problems[], outstanding[], allowances[], ... } for a vault. */
-export async function audit(contract, tokenId, ethRpc, expectCode) {
+// External review (round 3, H5): the deployed contract's published build, required by default for it.
+const DEFAULT_CONTRACT = 'm3.alan-vault-2026.testnet';
+const DEFAULT_CODE = '0ff14e796c977fb74a8ee976db940f799f6900d7303ee12fc31ee5b44edd958c';
+
+export async function audit(contract, tokenId, ethRpc, expectCode, { allowKeys = false } = {}) {
+  if (!expectCode && contract === DEFAULT_CONTRACT) expectCode = DEFAULT_CODE;
   const lines = [];
   const problems = [];
   const owner = (await nearView(contract, 'nft_token', { token_id: tokenId }))?.owner_id;
@@ -125,7 +136,9 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
   const keys = await nearRpc('query', { request_type: 'view_access_key_list', finality: 'final', account_id: contract });
   const fullKeys = keys.keys.filter((k) => k.access_key.permission === 'FullAccess').length;
   lines.push(`contract code sha256 ${codeHex}`);
-  if (fullKeys > 0) lines.push(`note: the contract still has ${fullKeys} full-access key(s): whoever holds one can change its code (threat 9)`);
+  // External review (round 3, H5): a key that can change the code is a problem, not a note (the
+  // one-off test scripts of earlier, unlocked deployments pass allowKeys).
+  if (fullKeys > 0) (allowKeys ? lines : problems).push(`the contract still has ${fullKeys} full-access key(s): whoever holds one can change its code (threat 9)`);
   else if (keys.keys.length === 0) lines.push('ok: the contract account has no access keys: nobody can change its code');
   if (expectCode && expectCode.toLowerCase() !== codeHex) problems.push(`the contract code is not the expected one (${expectCode})`);
 
@@ -157,9 +170,15 @@ export async function audit(contract, tokenId, ethRpc, expectCode) {
     if (age > 300) problems.push(`INCOMPLETE: the Ethereum node's newest block is ${age} s old; run the audit again or use another --eth-rpc`);
     else lines.push(`Ethereum read at block ${pinned} (node up to date)`);
   }
+  // External review (round 3, H6): the account's nonce must equal the contract's count exactly.
+  if (rpc && info.evm_address && next === 0) {
+    const used = Number(BigInt(await eth(rpc, 'eth_getTransactionCount', [info.evm_address, tag])));
+    if (used > 0) problems.push(`INCOMPLETE: Ethereum shows ${used} nonce(s) used, but the contract never signed anything: something it did not record was mined from this address`);
+  }
   if (next > 0) {
     if (!rpc) throw new Error(`no RPC known for chain ${chain}; pass --eth-rpc`);
     mined = Number(BigInt(await eth(rpc, 'eth_getTransactionCount', [info.evm_address, tag])));
+    if (mined > next) problems.push(`INCOMPLETE: Ethereum shows ${mined} nonces used, the contract signed only ${next}: something it did not record was mined from this address`);
     const pending = Number(BigInt(await eth(rpc, 'eth_getTransactionCount', [info.evm_address, 'pending'])));
     lines.push(`nonces: contract next = ${next}, mined on chain = ${mined}, pending in mempool = ${pending}`);
     for (let n = mined; n < next; n++) {
@@ -229,12 +248,16 @@ if (isMain) {
   const [contract, tokenId] = process.argv.slice(2);
   if (!tokenId) throw new Error('usage: node sale-audit.mjs <vault-contract> <token_id> [--eth-rpc <url>] [--expect-code <hex>]');
   const opt = (name) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : undefined; };
-  const r = await audit(contract, tokenId, opt('--eth-rpc'), opt('--expect-code'));
+  const r = await audit(contract, tokenId, opt('--eth-rpc'), opt('--expect-code'), { allowKeys: process.argv.includes('--allow-keys') });
   for (const l of r.lines) console.log('  ' + l);
   for (const p of r.problems) console.log('  ! ' + p);
+  // External review (round 3, H5): a sale that has not opened is WAITING, never SAFE (exit code 3).
+  if (r.safe && Date.now() < r.sale.opens_at_ms) {
+    console.log(`WAITING: everything checked out, but sale ${r.sale.sale_id} opens in ${Math.ceil((r.sale.opens_at_ms - Date.now()) / 1000)} s; run the audit again when it opens`);
+    process.exit(3);
+  }
   console.log(r.safe
     ? `SAFE for sale ${r.sale.sale_id}: no signature the seller holds can still be mined and no ERC-20 approval is left. ${r.sale.price ? `Buy with sale_id ${r.sale.sale_id}.` : `Pay only through a transfer bound to "sale:${r.sale.sale_id}".`}`
     : r.problems.every((p) => p.startsWith('INCOMPLETE')) ? 'INCOMPLETE: a check could not be completed; do not buy until the audit says SAFE' : 'NOT SAFE: see the points above');
-  if (r.safe && Date.now() < r.sale.opens_at_ms) console.log(`(the sale opens in ${Math.ceil((r.sale.opens_at_ms - Date.now()) / 1000)} s: the contract refuses a purchase before that; run the audit again then)`);
   process.exit(r.safe ? 0 : 2);
 }

@@ -113,9 +113,10 @@ async function decideByAi(text) {
   // amount become a proposal (the contract still checks everything).
   const to = String(d.to ?? '').toLowerCase();
   const amount = String(d.amount_eth ?? '');
-  if (d.pay && (!/^0x[0-9a-f]{40}$/.test(to) || !/^[0-9]+(\.[0-9]{1,18})?$/.test(amount)))
+  // External review (round 3, H9): only a real JSON true means pay; the text "false" must not.
+  if (d.pay === true && (!/^0x[0-9a-f]{40}$/.test(to) || !/^[0-9]+(\.[0-9]{1,18})?$/.test(amount)))
     return { pay: false, reason: `${model} gave a malformed address or amount` };
-  return { pay: !!d.pay, to, amount_eth: amount, reason: `${model}: ${String(d.reason ?? '').slice(0, 160)}` };
+  return { pay: d.pay === true, to, amount_eth: amount, reason: `${model}: ${String(d.reason ?? '').slice(0, 160)}` };
 }
 
 // ---------- subcommands ----------

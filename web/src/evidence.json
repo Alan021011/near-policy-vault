@@ -1,6 +1,7 @@
 {
   "contract": "m3.alan-vault-2026.testnet",
   "expected_code": "0ff14e796c977fb74a8ee976db940f799f6900d7303ee12fc31ee5b44edd958c",
+  "source_commit": "6a66b51",
   "eth_chain": 11155111,
   "eth": [
     {

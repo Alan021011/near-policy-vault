@@ -36,7 +36,8 @@ const keys = await rpc(NEAR_RPC, 'query', { request_type: 'view_access_key_list'
 line(keys.keys.length === 0, 'the contract account has no access keys (nobody can change the code)', `${keys.keys.length} key(s)`);
 const meta = await rpc(NEAR_RPC, 'query', { request_type: 'call_function', finality: 'final', account_id: data.contract, method_name: 'contract_source_metadata', args_base64: '' })
   .then((r) => JSON.parse(Buffer.from(r.result).toString())).catch(() => null);
-line(!!meta?.link, 'the contract publishes its source commit and build image', meta ? `${meta.link} · ${meta.build_info?.build_environment?.split('@')[0]}` : 'missing');
+// External review (round 3, D): the published link must name the expected commit, not just exist.
+line(!!meta?.link && meta.link.includes(data.source_commit), `the contract publishes its source commit (${data.source_commit}) and build image`, meta ? `${meta.link} · ${meta.build_info?.build_environment?.split('@')[0]}` : 'missing');
 
 // 2. Sepolia receipts (public nodes sometimes answer null: retry, then try another RPC)
 console.log(`\nSepolia transactions (${data.eth.length})`);

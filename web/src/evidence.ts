@@ -5,3 +5,5 @@ export interface EthProof { hash: string; what: string }
 export interface NearProof { hash: string; sender: string; what: string; expect: 'success' | 'failure' }
 export const ETH_PROOFS: EthProof[] = data.eth;
 export const NEAR_PROOFS: NearProof[] = data.near as NearProof[];
+/** The commit the deployed contract must name in contract_source_metadata. */
+export const SOURCE_COMMIT: string = data.source_commit;

@@ -32,7 +32,7 @@ async function decide(text) {
       const amount = String(d.amount_eth ?? '');
       // The same validation as scripts/agent.mjs: only a well-formed address and amount can be paid.
       const valid = /^0x[0-9a-f]{40}$/.test(to) && /^[0-9]+(\.[0-9]{1,18})?$/.test(amount);
-      return { pay: !!d.pay && valid, to: valid ? to : null, amount_eth: valid ? amount : null, reason: String(d.reason ?? '').slice(0, 200) + (d.pay && !valid ? ' [malformed address or amount: not paid]' : '') };
+      return { pay: d.pay === true && valid, to: valid ? to : null, amount_eth: valid ? amount : null, reason: String(d.reason ?? '').slice(0, 200) + (d.pay === true && !valid ? ' [malformed address or amount: not paid]' : '') };
     } catch (e) {
       if (i >= 4) return { pay: false, to: null, amount_eth: null, reason: `error: ${e.message.slice(0, 120)}`, error: true };
       await sleep(1500 * i);

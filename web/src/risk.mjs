@@ -148,20 +148,16 @@ export function decodeSignedTx(raw) {
 }
 
 /**
- * Payments a vault already signed, from list_signed records: one per nonce (the last version), and
- * none for a nonce that was cancelled (its payment can never be mined).
+ * Payments a vault already signed, from list_signed records (oldest version first): one per nonce,
+ * its last version, unless that last version is a cancellation. External review (round 3, H7): a
+ * cancellation signed before a later payment version does not hide that payment.
  */
 export function historyFromSigned(records) {
   const byNonce = new Map();
-  for (const r of records ?? []) {
-    const e = byNonce.get(r.nonce) ?? { cancelled: false, last: null };
-    if (Number(r.proposal_id) > 1e18) e.cancelled = true; // CANCEL_PROPOSAL_ID
-    else e.last = r;
-    byNonce.set(r.nonce, e);
-  }
+  for (const r of records ?? []) byNonce.set(r.nonce, r); // the last version of each nonce wins
   const out = [];
-  for (const { cancelled, last } of byNonce.values()) {
-    if (cancelled || !last) continue;
+  for (const last of byNonce.values()) {
+    if (Number(last.proposal_id) > 1e18) continue; // CANCEL_PROPOSAL_ID: the nonce ends in a cancellation
     try {
       out.push({ ...decodeSignedTx(last.signed_tx), ms: Number(last.signed_ms) });
     } catch {

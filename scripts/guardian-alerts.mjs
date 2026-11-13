@@ -14,7 +14,7 @@
 // Usage:
 //   TELEGRAM_BOT_TOKEN=... node guardian-alerts.mjs <vault-contract> --guardian <account>
 //   TELEGRAM_BOT_TOKEN=... node guardian-alerts.mjs <vault-contract> --vaults 78,77
-// Optional: TELEGRAM_CHAT_ID (otherwise the chat that last sent /start to the bot), --every 4
+// Required: TELEGRAM_CHAT_ID (run --test without it to list the chats that wrote to the bot). Optional: --every 4
 // (seconds), --test (send one test message and exit). The token is read from the environment
 // only and never printed.
 
@@ -85,13 +85,18 @@ async function tg(method, body) {
   if (!j.ok) throw new Error(`Telegram ${method}: ${j.description ?? r.status}`);
   return j.result;
 }
+// External review (round 3, H8): alerts go only to the chat set in TELEGRAM_CHAT_ID. Taking "the last
+// chat that sent /start" would send a guardian's alerts to anyone who found the bot. With --test and
+// no chat set, the script lists the chats that wrote to the bot so the guardian can pick their own.
+async function listChats() {
+  const updates = await tg('getUpdates', {});
+  const seen = new Map();
+  for (const c of updates.map((u) => u.message?.chat).filter((c) => c && c.type === 'private')) seen.set(c.id, c);
+  return [...seen.values()];
+}
 async function findChat() {
   if (chatId) return chatId;
-  const updates = await tg('getUpdates', {});
-  const priv = updates.map((u) => u.message?.chat).filter((c) => c && c.type === 'private');
-  if (!priv.length) throw new Error('No chat yet: open your bot in Telegram and send /start, then run again.');
-  chatId = String(priv[priv.length - 1].id);
-  return chatId;
+  throw new Error('Set TELEGRAM_CHAT_ID to your own chat id (run with --test to see the chats that wrote to the bot).');
 }
 async function send(text) {
   for (let i = 1; i <= 4; i++) {
@@ -170,6 +175,16 @@ async function check(id) {
   }
 }
 
+if (testOnly && !chatId) {
+  const chats = await listChats();
+  if (!chats.length) console.log('No chat has written to the bot yet: open it in Telegram, press Start, and run --test again.');
+  else {
+    console.log('Chats that wrote to the bot (pick yours by its name):');
+    for (const c of chats) console.log(`  TELEGRAM_CHAT_ID=${c.id}   ${[c.first_name, c.last_name].filter(Boolean).join(' ')}${c.username ? ` (@${c.username})` : ''}`);
+    console.log('Set TELEGRAM_CHAT_ID to yours, then run --test again to receive a test message.');
+  }
+  process.exit(chats.length ? 0 : 1);
+}
 if (testOnly) {
   const ok = await send(`✅ Policy Vault guardian alerts are connected.\nYou will get a message here when a vault you guard has a payment, a rule change or a handover waiting.\nThis bot only notifies: it holds no key and cannot act for you.`);
   console.log(ok ? 'test message sent' : 'test message NOT sent');

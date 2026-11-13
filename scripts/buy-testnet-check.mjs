@@ -141,7 +141,7 @@ check('the vault approves the seller to take 12345 WETH units, and it is mined',
   a.hash ? `https://sepolia.etherscan.io/tx/${a.hash}` : a.error);
 r = await call(SELLER, 'start_sale', { token_id: T, price: String(PRICE), buyer: BUYER }, '0.01 NEAR');
 const sale1 = events(r.logs, 'sale_started')[0]?.data[0];
-let au = await audit(VAULT, T);
+let au = await audit(VAULT, T, undefined, undefined, { allowKeys: true });
 check('every nonce is mined, yet the audit says NOT SAFE: the approval survives the sale (H2)',
   !au.safe && au.outstanding.length === 0 && au.allowances.some((x) => x.allowance === '12345'), au.problems.join(' | '));
 r = await call(SELLER, 'cancel_sale', { token_id: T }, '1 yoctoNEAR');
@@ -173,7 +173,7 @@ check('the lock was released when the transfer resolved: the sender can act agai
 
 // ---------- C. buy ----------
 await waitMs(sale2.opens_at_ms - Date.now() + 5000, 'for the sale window to open');
-au = await audit(VAULT, T);
+au = await audit(VAULT, T, undefined, undefined, { allowKeys: true });
 check('the audit now says SAFE for this sale', au.safe && au.sale.sale_id === sale2.sale_id, au.problems.join(' | '));
 r = await call(STRANGER, 'buy', { token_id: T, sale_id: sale2.sale_id }, '0.1 NEAR');
 check('a stranger cannot buy a reserved sale', r.panic === 'This sale is reserved for another buyer', r.panic);

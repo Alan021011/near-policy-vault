@@ -112,7 +112,7 @@ A guardian can only stop a payment it knows about. In the browser: connect the g
 
 ## Known limits
 
-The most important ones; the full list (33 items, each with its review reference) is in [docs/DETAILS.md](docs/DETAILS.md#known-limits), and [docs/V2.md](docs/V2.md) says how a next contract would remove the ones that come from the contract.
+The most important ones; the full list (37 items, each with its review reference) is in [docs/DETAILS.md](docs/DETAILS.md#known-limits), and [docs/V2.md](docs/V2.md) says how a next contract would remove the ones that come from the contract.
 
 - **No independent audit.** Two reviews by another AI model and the tests are evidence, not an audit. The sandbox uses a mock signer; the real MPC network is exercised by the live transactions.
 - **The contract is final.** Its account has no keys, so a bug cannot be fixed in place; a fix would be a new contract ([MIGRATION.md](docs/MIGRATION.md)).
@@ -123,4 +123,5 @@ The most important ones; the full list (33 items, each with its review reference
 - **A stuck nonce can block the vault for a day.** An agent can sign a payment with a fee too low to be mined; a cancellation needs room under the daily cap, so with the cap used up the owner waits for the window to reset (and removes the agent at once).
 - **The buyer's audit reads Ethereum through public nodes.** It fails closed (incomplete is never safe), but it trusts what an up-to-date node answers.
 - **Warning signs and benchmark are the author's own.** Simple rules, a synthetic dataset and a naive baseline; read the counts as an upper bound.
+- **Handover and agent edge cases (external review, round 3).** A price or reserved buyer binds only `buy` (the owner or an approved account can still transfer during the window; a buyer never pays without receiving); removing the agent does not stop a signature already in progress; revoking a token permission needs the token and spender still allowed. Details and V2 fixes in [docs/DETAILS.md](docs/DETAILS.md#known-limits).
 - **Testnet only, one EVM chain per vault, no real users.**

@@ -139,3 +139,13 @@ test('decodeSignedTx matches viem on 300 random transactions (short, long and em
     assert.equal(d.data, tx.data, `case ${i} data`);
   }
 });
+
+test('history: a payment signed after a cancellation of the same nonce is kept (round 3, H7)', () => {
+  const sig = { r: '0x' + '11'.repeat(32), s: '0x' + '22'.repeat(32), yParity: 0 };
+  const raw = (nonce, value) => serializeTransaction({ type: 'eip1559', chainId: 11155111, nonce, maxPriorityFeePerGas: 1n, maxFeePerGas: 2n, gas: 21000n, to: HOST, value, data: '0x', accessList: [] }, sig);
+  const h = historyFromSigned([
+    { nonce: 0, proposal_id: 18446744073709551615, signed_tx: raw(0, 0n), signed_ms: 5 }, // a cancellation first
+    { nonce: 0, proposal_id: 3, signed_tx: raw(0, 9n), signed_ms: 6 }, // then a payment with the same nonce
+  ]);
+  assert.deepEqual(h.map((x) => x.value), ['9']);
+});

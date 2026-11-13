@@ -78,19 +78,27 @@ async function getLogs(io: AuditIO, chain: number, filter: object): Promise<any[
 
 /** Every signed record of a vault, every version. `list_signed` pages by record count, so a page
  *  that ends inside a nonce is continued from that nonce (review M12, R12-8). */
-async function allSigned(io: AuditIO, tokenId: string, next: number): Promise<any[]> {
+async function allSigned(io: AuditIO, tokenId: string, next: number): Promise<{ records: any[]; complete: boolean }> {
   const seen = new Map<string, any>();
   let from = 0;
-  for (let guard = 0; from < next && guard < 1000; guard++) {
+  let guard = 0;
+  for (; from < next && guard < 1000; guard++) {
     const page = await io.view<any[]>('list_signed', { token_id: tokenId, from_nonce: from, limit: 100 });
     if (page.length === 0) break;
     for (const r of page) seen.set(`${r.nonce}|${r.tx_hash}`, r);
     const last = page[page.length - 1].nonce;
-    // A full page may have cut the last nonce's versions: read that nonce again (duplicates are
-    // dropped), unless the whole page is that one nonce.
-    from = page.length < 100 || page[0].nonce === last ? last + 1 : last;
+    if (page.length < 100) { from = last + 1; continue; }
+    if (page[0].nonce === last) {
+      // External review (round 3, H2): a nonce can have more than 100 signed versions, so a page that
+      // is all one nonce may have cut it. Read every version of that nonce, then go on.
+      for (const r of await io.view<any[]>('get_signed_versions', { token_id: tokenId, nonce: last })) seen.set(`${r.nonce}|${r.tx_hash}`, r);
+      from = last + 1;
+    } else {
+      // A full page may have cut the last nonce's versions: read that nonce again (duplicates are dropped).
+      from = last;
+    }
   }
-  return [...seen.values()];
+  return { records: [...seen.values()], complete: from >= next };
 }
 
 /** The verdict from the checks: anything failed → unsafe; else anything not completed → incomplete;
@@ -148,10 +156,17 @@ export async function auditCore(tokenId: string, io: AuditIO): Promise<AuditResu
 
   // Kept signatures: every nonce the contract signed must already be used on the vault's chain.
   let mined = 0;
-  const signed = next > 0 ? await allSigned(io, tokenId, next) : [];
-  if (next > 0) {
-    mined = Number(BigInt(await eth<string>(chain, 'eth_getTransactionCount', [info.evm_address, tag])));
-    if (mined >= next) {
+  const history = next > 0 ? await allSigned(io, tokenId, next) : { records: [], complete: true };
+  const signed = history.records;
+  if (!history.complete)
+    checks.push({ state: 'incomplete', title: 'The signed history could not be read to the end', detail: 'Some signed transactions were not read, so a kept signature or an approval could be missed. Run the check again.' });
+  // External review (round 3, H6): the account's nonce must equal the contract's count exactly. More
+  // nonces on Ethereum than the contract signed means activity the contract never recorded.
+  mined = Number(BigInt(await eth<string>(chain, 'eth_getTransactionCount', [info.evm_address, tag])));
+  if (mined > next) {
+    checks.push({ state: 'incomplete', title: `Ethereum shows ${mined} nonces used, the contract signed only ${next}`, detail: 'Something the contract did not record was mined from this address. Do not take over until it is explained.' });
+  } else if (next > 0) {
+    if (mined === next) {
       checks.push({ state: 'pass', title: `Every nonce the contract signed is used on chain ${chain}`, detail: `Contract next nonce ${next}, account nonce ${mined}: no signature the seller kept can still be mined.` });
     } else {
       for (let n = mined; n < next; n++) {
@@ -159,7 +174,7 @@ export async function auditCore(tokenId: string, io: AuditIO): Promise<AuditResu
       }
     }
   } else {
-    checks.push({ state: 'pass', title: 'The vault never signed anything', detail: 'No signature can be pending.' });
+    checks.push({ state: 'pass', title: 'The vault never signed anything', detail: 'No signature can be pending, and the account has never sent a transaction.' });
   }
 
   // Review M12 (R12-6): an uncertain nonce below the mined nonce means something was mined with

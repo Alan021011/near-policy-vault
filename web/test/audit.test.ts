@@ -54,6 +54,7 @@ function world(over: Partial<Record<string, any>> = {}) {
         case 'get_policy': return { policy: { tokens: w.tokens } } as any;
         case 'nft_token': return { metadata: { issued_at: String(NOW - 86_400_000) } } as any;
         case 'list_signed': return w.signed.filter((r) => r.nonce >= args.from_nonce).slice(0, args.limit) as any;
+        case 'get_signed_versions': return w.signed.filter((r) => r.nonce === args.nonce) as any;
         default: throw new Error(`unexpected view ${method}`);
       }
     },
@@ -172,4 +173,24 @@ test('verdict order: a failure beats an incomplete check, which beats waiting', 
   assert.equal(verdictOf([c('waiting'), c('incomplete'), c('pass')]), 'incomplete');
   assert.equal(verdictOf([c('waiting'), c('pass'), c('warn'), c('info')]), 'waiting');
   assert.equal(verdictOf([c('pass'), c('warn'), c('info')]), 'safe');
+});
+
+test('a nonce with more than 100 signed versions: the approval in the last one is still found (round 3, H2)', async () => {
+  for (const total of [101, 150, 200]) {
+    const versions = Array.from({ length: total }, (_, i) => ({ nonce: 0, tx_hash: 'v' + i, signed_tx: i === total - 1 ? signedTx(0, TOKEN, approveData) : signedTx(0, VAULT) }));
+    const r = await run({ next: 1, mined: 1, allowance: 5n, signed: versions });
+    assert.equal(r.verdict, 'unsafe', `${total} versions`);
+    assert.deepEqual(titles(r, 'fail'), ['An ERC-20 approval survives the sale'], `${total} versions`);
+  }
+});
+
+test('Ethereum shows more nonces than the contract signed: incomplete, never safe (round 3, H6)', async () => {
+  const r = await run({ next: 1, mined: 2, signed: [{ nonce: 0, tx_hash: 'a', signed_tx: signedTx(0, VAULT) }] });
+  assert.equal(r.verdict, 'incomplete');
+  assert.match(titles(r, 'incomplete')[0], /2 nonces used, the contract signed only 1/);
+});
+
+test('the vault never signed, but its address has sent a transaction: incomplete (round 3, H6)', async () => {
+  const r = await run({ next: 0, mined: 1 });
+  assert.equal(r.verdict, 'incomplete');
 });
