@@ -258,3 +258,8 @@ ul.signs li.info { color: var(--muted); }
 .section-menu a:hover { color: var(--text, inherit); border-color: var(--mint-line, var(--line-2)); }
 #s-pay, #s-card, #s-safety, #s-check, #s-agent, #s-history, #s-handover, #audit, #inside { scroll-margin-top: 110px; }
 @media (max-width: 720px) { .section-menu { position: static; } }
+
+/* M32: what the wallet is about to sign, in words */
+.sign-note { position: fixed; left: 50%; transform: translateX(-50%); bottom: 76px; width: min(560px, 92vw); z-index: 60; background: var(--surface); border: 1px solid var(--mint-line, var(--line-2)); border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.45; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); }
+.sign-note b { display: block; margin-bottom: 4px; }
+@media (max-width: 640px) { .sign-note { bottom: 84px; } }

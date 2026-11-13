@@ -39,9 +39,39 @@ function toast(msg: string, kind: 'ok' | 'bad' | '' = '', raw = '') {
 }
 toastEl.onclick = () => (toastEl.hidden = true);
 
+// M32: what each signature does, in plain words, shown while the wallet asks for it (no extra click).
+const WHAT_YOU_SIGN: Record<string, string> = {
+  'Create vault': 'Mints a new vault NFT to your account, with its own Ethereum address. Deposit: 0.1 NEAR for its storage. The vault has no rules yet, so it cannot pay anything.',
+  'Set policy': 'Saves these rules in the contract. Stricter rules apply at once; looser ones wait the current waiting time, and the guardian can stop them. Deposit: 0.05 NEAR, the unused part comes back.',
+  'Propose': 'Puts this payment in the queue. The contract checks the rules now and again before signing; nothing leaves the vault yet, and you can cancel it while it waits. Deposit: 0.05 NEAR, returned when the request ends.',
+  'Request a test payment': 'Puts a 0.0001 ETH payment to your first approved address in the queue. Nothing leaves the vault yet; it waits like any payment. Deposit: 0.05 NEAR, returned when the request ends.',
+  'Start sale': 'Opens a handover window: after at least 10 minutes (or the waiting time, if longer) the vault can change owner. Meanwhile it pays nothing, and the guardian can stop it. You can cancel it until someone takes over. Deposit: 0.01 NEAR.',
+  'Remove the agent': 'Removes the agent from the rules at once (a stricter rule). A payment the agent is already signing is not stopped; cancel its nonce if needed. Deposit: 0.05 NEAR, the unused part comes back.',
+  'Apply policy': 'Applies the rule change whose waiting time is over. Nothing is paid.',
+  'Cancel pending policy': 'Drops the rule change that is waiting; the rules in force stay as they are. 1 yoctoNEAR, to confirm it is you.',
+  'Veto policy change': 'As the guardian, you stop the waiting rule change: it will never apply. 1 yoctoNEAR, to confirm it is you.',
+  'Approve & send': "The contract checks the rules once more and asks NEAR's signing network to sign this payment for the vault's Ethereum account; the page then sends it to Ethereum. Once it is on Ethereum it cannot be undone. Deposit: 0.02 NEAR for the signer, the unused part comes back.",
+  'Cancel proposal': 'Removes this payment from the queue: nothing is paid, and its deposit comes back. 1 yoctoNEAR, to confirm it is you.',
+  'Veto proposal': 'As the guardian, you stop this payment: it leaves the queue and can never be signed. 1 yoctoNEAR, to confirm it is you.',
+  'Cancel nonce': 'Signs a 0-value transfer from the vault to itself with the same nonce: once it is on Ethereum, the earlier payment signed with that nonce can never go through. It costs a little ETH in gas, counted in the daily limit. Deposit: 0.02 NEAR for the signer.',
+  'Cancel sale': 'Closes the handover window: the vault stays yours and can pay again. 1 yoctoNEAR, to confirm it is you.',
+  'Veto sale': 'As the guardian, you stop this handover: the vault cannot change owner through it. 1 yoctoNEAR, to confirm it is you.',
+  'Buy': 'Pays the price and receives the vault NFT in the same step, bound to the handover you checked. If the seller restarted the handover, the purchase fails and your NEAR comes back.',
+};
+const signNote = document.createElement('div');
+signNote.className = 'sign-note';
+signNote.setAttribute('role', 'status');
+signNote.hidden = true;
+document.body.appendChild(signNote);
+
 /** Runs a contract call from the wallet, reports the outcome in plain words and re-renders. */
 async function act(label: string, f: () => Promise<{ failure?: string; value?: any; logs: string[] } | void>, after?: (r: any) => void) {
   toast(`${label}: confirm in your wallet…`);
+  const explain = WHAT_YOU_SIGN[label];
+  if (explain) {
+    signNote.innerHTML = `<b>What you are signing: ${esc(label)}</b><div>${esc(explain)}</div>`;
+    signNote.hidden = false;
+  }
   try {
     const r = await f();
     if (r && r.failure) toast(`${label}: ${human(r.failure)}`, 'bad', r.failure);
@@ -52,6 +82,8 @@ async function act(label: string, f: () => Promise<{ failure?: string; value?: a
   } catch (e: any) {
     const m = String(e?.message ?? e);
     toast(`${label} failed: ${human(m)}`, 'bad', m);
+  } finally {
+    signNote.hidden = true;
   }
   route();
 }
