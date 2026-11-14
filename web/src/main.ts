@@ -140,7 +140,9 @@ function route() {
   const id = ++renderId;
   const m = location.hash.match(/^#\/vault\/(\d+)/);
   (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : location.hash.startsWith('#/try') ? tryPage(id) : location.hash.startsWith('#/judges') ? judgesPage(app, () => id === renderId) : location.hash.startsWith('#/agents') ? agentsPage(app, () => id === renderId) : location.hash.startsWith('#/start') ? startPage(app, Number(location.hash.split('/')[2]), { act, connect, toast }) : homePage(id)).catch((e) => {
-    if (id === renderId) app.innerHTML = `<div class="card"><div class="body">Could not load: ${esc(e?.message ?? e)}</div></div>`;
+    if (id === renderId) app.innerHTML = `<p><a href="#/">← Home</a></p><div class="card"><div class="body"><h2 style="margin-top:0">This page could not load</h2>
+      <p class="muted">A public NEAR or Ethereum node did not answer. Reload the page in a moment.</p><p class="faint" style="font-size:12px">${esc(e?.message ?? e)}</p>
+      <button class="btn primary" onclick="location.reload()">Reload</button></div></div>`;
   });
 }
 
@@ -1041,6 +1043,15 @@ function safetySection(d: VaultData) {
 
 async function vaultPage(id: string, rid: number) {
   app.innerHTML = '<p class="faint">Loading vault…</p>';
+  // A vault number that does not exist (a typo in the finder or a link): say so plainly.
+  const exists = await view('nft_token', { token_id: id }).catch(() => undefined);
+  if (rid !== renderId) return;
+  if (exists === null) {
+    const total = await view<string>('nft_total_supply').catch(() => '');
+    app.innerHTML = `<p><a href="#/">← Home</a></p><div class="card"><div class="body"><h2 style="margin-top:0">Vault #${esc(id)} does not exist</h2>
+      <p class="muted">${total ? `This contract has ${esc(total)} vaults. ` : ''}Check the number, or open one of the demo vaults: <a href="#/vault/78">#78</a> (an AI agent), <a href="#/vault/77">#77</a> (an NFT), <a href="#/vault/75">#75</a> (handed over).</p></div></div>`;
+    return;
+  }
   const d = await loadVault(id);
   if (rid !== renderId) return;
   const isOwner = !!accountId && accountId === d.owner;
@@ -1052,7 +1063,7 @@ async function vaultPage(id: string, rid: number) {
     agent: ['agent', 'You are this vault’s agent: you can request and send payments. The rules and the guardian decide what goes through.'],
     guardian: ['guardian', 'You are this vault’s guardian. Nothing is paid before the waiting time ends — you can stop any payment.'],
     visitor: ['visitor', 'Anyone can look at this vault and check it. Only its owner, agent and guardian can act.'],
-    none: ['not connected', 'Anyone can look at this vault and check it, no wallet needed. To act on a vault, connect a free test wallet (see "Try it yourself" on the home page).'],
+    none: ['not connected', 'Anyone can look at this vault and check it, no wallet needed. To act on a vault, connect a free test wallet, or create your own with the guided set-up (Create a vault, at the top).'],
   };
   const role = isOwner ? 'owner' : isAgent ? 'agent' : isGuardian ? 'guardian' : accountId ? 'visitor' : 'none';
   const pills = [
