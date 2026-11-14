@@ -4,6 +4,7 @@ import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
 import { judgesPage } from './judges';
 import { agentsPage } from './agents';
+import { startPage } from './start';
 import { checkSignature, proofJson } from './proof';
 import { ETH_PROOFS, NEAR_PROOFS, SOURCE_COMMIT } from './evidence';
 import { TEMPLATES, changeOf, describeWait, ruleWarnings, safetyChecks, summarize, type TemplateKey } from './rules';
@@ -138,7 +139,7 @@ let renderId = 0;
 function route() {
   const id = ++renderId;
   const m = location.hash.match(/^#\/vault\/(\d+)/);
-  (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : location.hash.startsWith('#/try') ? tryPage(id) : location.hash.startsWith('#/judges') ? judgesPage(app, () => id === renderId) : location.hash.startsWith('#/agents') ? agentsPage(app, () => id === renderId) : homePage(id)).catch((e) => {
+  (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : location.hash.startsWith('#/try') ? tryPage(id) : location.hash.startsWith('#/judges') ? judgesPage(app, () => id === renderId) : location.hash.startsWith('#/agents') ? agentsPage(app, () => id === renderId) : location.hash.startsWith('#/start') ? startPage(app, Number(location.hash.split('/')[2]), { act, connect, toast }) : homePage(id)).catch((e) => {
     if (id === renderId) app.innerHTML = `<div class="card"><div class="body">Could not load: ${esc(e?.message ?? e)}</div></div>`;
   });
 }
@@ -409,7 +410,7 @@ async function homePage(id: number) {
       <p class="lead">Every payment follows rules you set: a daily limit, approved recipients, a waiting time, and a person who can say no. The NFT is the title deed of the account: whoever holds it holds the account and its rules, so you can hand it over without ever handing over a key.</p>
       <div class="row" style="margin-top:20px">
         <a class="btn primary big" href="#/vault/78">See the live agent vault (#78) →</a>
-        ${accountId ? '' : '<button class="btn big" data-home="connect">Connect wallet</button>'}
+        <a class="btn big" href="#/start">Create your first vault (guided) →</a>
         <a class="link-quiet" href="${REPO}/blob/main/docs/THREAT_MODEL.md" target="_blank" rel="noreferrer">Read the threat model ↗</a>
       </div>
     </section>
@@ -486,7 +487,7 @@ async function homePage(id: number) {
   if (!accountId) {
     const step = (n: number, title: string, text: string) => `<div class="jcard step"><div class="step-n mono">${n}</div><h3>${title}</h3><p>${text}</p></div>`;
     mine.innerHTML = `<div class="section-head col"><div class="eyebrow">Your own vault</div><h2 class="big-h">Try it yourself in 3 steps</h2>
-      <p class="muted" style="margin:0">You only need a free test wallet. Nothing here uses real money.</p></div>
+      <p class="muted" style="margin:0">You only need a free test wallet. Nothing here uses real money. <a href="#/start">Or follow the guided set-up →</a></p></div>
       <div class="pillars">
         ${step(1, 'Install a NEAR wallet', 'For example <a href="https://wallet.meteorwallet.app" target="_blank" rel="noreferrer">Meteor Wallet ↗</a>, and create a <b>testnet</b> account (free).')}
         ${step(2, 'Get free test NEAR', 'From a faucet such as <a href="https://near-faucet.io" target="_blank" rel="noreferrer">near-faucet.io ↗</a>, to pay small refundable deposits.')}
@@ -495,7 +496,7 @@ async function homePage(id: number) {
     return;
   }
   mine.innerHTML = `<div class="card"><header><h2>My vaults</h2><span class="spacer"></span>
-    <button class="btn primary" id="mint" title="0.1 NEAR deposit; the unused part is refunded">Create a vault</button></header>
+    <a class="btn" href="#/start">Guided set-up</a> <button class="btn primary" id="mint" title="0.1 NEAR deposit; the unused part is refunded">Create a vault</button></header>
     <div class="body"><div class="grid" id="mine-grid"><span class="faint">Loading…</span></div></div></div>`;
   document.getElementById('mint')!.onclick = () =>
     act('Create vault', () => call('mint_vault', {}, nearToYocto('0.1'), 100n), (r) => {
