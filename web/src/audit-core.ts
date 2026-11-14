@@ -27,10 +27,18 @@ export interface AuditIO {
 // the handover has not opened yet. Either one keeps the verdict from being SAFE (fail closed).
 export type CheckState = 'pass' | 'fail' | 'warn' | 'info' | 'incomplete' | 'waiting';
 export type Verdict = 'safe' | 'unsafe' | 'incomplete' | 'waiting';
+export type CheckGroup = 'sale' | 'nonces' | 'approvals' | 'code' | 'funds';
 export interface Check {
   state: CheckState;
   title: string;
   detail?: string;
+  /** Which part of the audit it belongs to (for display only). */
+  group?: CheckGroup;
+}
+/** The numbers behind the checks, for display (undefined when not read). */
+export interface AuditFacts {
+  chain: number; block?: number; contractNonce: number; accountNonce?: number;
+  approvalsFound?: number; tokensScanned?: number; accessKeys?: number; balanceWei?: string;
 }
 export interface AuditResult {
   /** True only when every required check passed: the only verdict that allows a purchase. */
@@ -40,6 +48,7 @@ export interface AuditResult {
   sale: any;
   codeHex: string;
   fullKeys: number;
+  facts: AuditFacts;
 }
 
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -111,6 +120,8 @@ export function verdictOf(checks: Check[]): Verdict {
 
 export async function auditCore(tokenId: string, io: AuditIO): Promise<AuditResult> {
   const checks: Check[] = [];
+  let marked = 0;
+  const mark = (g: CheckGroup) => { for (; marked < checks.length; marked++) checks[marked].group ??= g; };
   const { contract: CONTRACT, defaultChain: DEFAULT_CHAIN, expectedCode: EXPECTED_CODE, overridden: OVERRIDDEN } = io;
   const eth = io.eth.bind(io);
   const nearRpc = io.nearRpc.bind(io);
@@ -142,6 +153,7 @@ export async function auditCore(tokenId: string, io: AuditIO): Promise<AuditResu
   else if (now >= sale.closes_at_ms) checks.push({ state: 'fail', title: 'The sale window has closed' });
   else checks.push({ state: 'pass', title: `Sale #${sale.sale_id} is open`, detail: `Until ${new Date(sale.closes_at_ms).toUTCString()}.` });
   if (inflight) checks.push({ state: 'fail', title: `A signature is in flight (nonce ${inflight.nonce})`, detail: 'Wait for it to finish.' });
+  mark('sale');
 
   // Every Ethereum read below uses one block, a little behind the head (some public nodes are
   // load-balanced across servers that are not all at the same height), and only if that node is up
@@ -183,6 +195,8 @@ export async function auditCore(tokenId: string, io: AuditIO): Promise<AuditResu
     if (u.nonce < mined)
       checks.push({ state: 'fail', title: `Nonce ${u.nonce} was mined, but the contract never recorded what was signed`, detail: `Its signature outcome was uncertain (signing hash ${u.signing_hash}). Check that transaction on the explorer before buying.` });
   }
+
+  mark('nonces');
 
   // ERC-20 allowances (general review H2; review M12, R12-6): every token the vault's policy
   // names or its signed history touched, from approvals in the history and from Approval events.
@@ -227,6 +241,8 @@ export async function auditCore(tokenId: string, io: AuditIO): Promise<AuditResu
   if (!logsScanned)
     checks.push({ state: 'incomplete', title: 'Approval events could not be scanned', detail: 'A public RPC did not answer the Approval-event search, so this check is not complete (the approvals in the signed history were checked). Run the check again before taking over.' });
 
+  mark('approvals');
+
   // The contract itself (threat 9; review M12, R12-2: a different code hash is a failure).
   const acct = await nearRpc('query', { request_type: 'view_account', finality: 'final', account_id: CONTRACT });
   const codeHex = base58ToHex(acct.code_hash);
@@ -240,14 +256,22 @@ export async function auditCore(tokenId: string, io: AuditIO): Promise<AuditResu
     ? { state: 'pass', title: 'Nobody can change the contract', detail: 'Its account has no access keys, so its code is final.' }
     : { state: 'fail', title: `The contract account has ${keys.keys.length} access key(s) (${fullKeys} full-access)`, detail: 'Whoever holds a full-access key can change the contract code (threat 9).' });
 
+  mark('code');
+
   // Funds: only the vault's own chain can be moved by this vault.
   const bal = BigInt(await eth<string>(chain, 'eth_getBalance', [info.evm_address, tag]));
   checks.push({ state: 'info', title: `Balance on chain ${chain}: ${Number(bal) / 1e18} ETH`, detail: 'Funds at this address on other EVM chains cannot be moved by this vault.' });
 
+  mark('funds');
   const saleAfter = await v('get_sale', { token_id: tokenId });
   if (JSON.stringify(saleAfter) !== JSON.stringify(saleBefore))
     checks.push({ state: 'fail', title: 'The sale changed while auditing', detail: 'Run the audit again.' });
 
+  mark('sale');
   const verdict = verdictOf(checks);
-  return { safe: verdict === 'safe', verdict, checks, sale, codeHex, fullKeys };
+  const facts: AuditFacts = {
+    chain, block: pinned, contractNonce: next, accountNonce: mined, approvalsFound: pairs.size, tokensScanned: tokens.size,
+    accessKeys: keys.keys.length, balanceWei: bal.toString(),
+  };
+  return { safe: verdict === 'safe', verdict, checks, sale, codeHex, fullKeys, facts };
 }

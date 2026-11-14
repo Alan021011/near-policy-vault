@@ -3,6 +3,7 @@ import { formatEther, formatUnits, parseEther, parseTransaction, parseUnits } fr
 import { audit, type AuditResult } from './audit';
 import { AGENT_RUNS, human, type AgentStep } from './agent-run';
 import { judgesPage } from './judges';
+import { agentsPage } from './agents';
 import { checkSignature, proofJson } from './proof';
 import { ETH_PROOFS, NEAR_PROOFS, SOURCE_COMMIT } from './evidence';
 import { TEMPLATES, changeOf, describeWait, ruleWarnings, safetyChecks, summarize, type TemplateKey } from './rules';
@@ -137,7 +138,7 @@ let renderId = 0;
 function route() {
   const id = ++renderId;
   const m = location.hash.match(/^#\/vault\/(\d+)/);
-  (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : location.hash.startsWith('#/try') ? tryPage(id) : location.hash.startsWith('#/judges') ? judgesPage(app, () => id === renderId) : homePage(id)).catch((e) => {
+  (m ? vaultPage(m[1], id) : location.hash.startsWith('#/verify') ? verifyPage(id) : location.hash.startsWith('#/try') ? tryPage(id) : location.hash.startsWith('#/judges') ? judgesPage(app, () => id === renderId) : location.hash.startsWith('#/agents') ? agentsPage(app, () => id === renderId) : homePage(id)).catch((e) => {
     if (id === renderId) app.innerHTML = `<div class="card"><div class="body">Could not load: ${esc(e?.message ?? e)}</div></div>`;
   });
 }
@@ -442,6 +443,8 @@ async function homePage(id: number) {
       ${pillar('02', 'amber', ICON.clock, 'Waiting time', 'A payment waits in public before it is signed (the owner sets how long), so there is time to react.', 'Vault 78 waits', '60 seconds')}
       ${pillar('03', 'red', ICON.shield, 'Human veto', 'A guardian can stop any payment while it waits. Alerts by Telegram or an open browser tab are optional.', 'Guardian can', 'stop, not spend')}
     </div>
+    <a class="agents-cta" href="#/agents"><div><div class="eyebrow">For AI agents</div><b>Connect Claude Code, Cursor or your own agent through MCP.</b>
+      <span class="muted">Six tools: read a vault, ask the contract, propose a payment. None can sign on Ethereum or change the rules.</span></div><span class="btn">Open →</span></a>
     <div class="section-head"><div><div class="eyebrow">Live on testnet</div><h2 class="big-h">Demo vaults</h2></div></div>
     <div class="grid demo-grid">
       ${DEMO_VAULTS.map((v, i) => `<a class="card vault-card demo${i === 0 ? ' featured' : ''}" href="#/vault/${v.id}">
@@ -916,32 +919,98 @@ function saleSection(d: VaultData, isOwner: boolean, isGuardian: boolean) {
     ${approvals}${info}${form}</div></div>`;
 }
 
+// Buyer's check (M8) laid out as a verdict, four groups with their numbers, a purchase panel that
+// stays disabled until the check says safe, and the same check as a terminal command.
+const AUDIT_GROUPS = [
+  { g: 'sale', title: '1 · The handover window', why: 'The handover must be open, unchanged during the check, with no signature in progress.' },
+  { g: 'nonces', title: '2 · No payment the seller kept', why: 'Every transaction the contract ever signed must already be used on Ethereum, so none can be sent after you pay.' },
+  { g: 'approvals', title: '3 · No token permission left', why: 'An ERC-20 approval would let someone pull tokens from the vault after the handover.' },
+  { g: 'code', title: '4 · The contract cannot change', why: 'The deployed code must be the published build, and its account must have no keys.' },
+] as const;
+
+function buyPanel(d: VaultData, r?: AuditResult) {
+  const s = d.sale;
+  const active = s && Date.now() < s.closes_at_ms;
+  if (!active) return `<div class="buy-panel"><div class="label">Take over</div><p class="muted" style="margin:6px 0 0">No handover is open for this vault. When the owner opens one, its price and window appear here.</p></div>`;
+  const price = s.price ? `${yoctoToNear(s.price)} NEAR` : null;
+  const opens = Date.now() < s.opens_at_ms;
+  const canBuy = !!(r?.safe && r.sale?.price && accountId && accountId !== d.owner && (!r.sale.buyer || r.sale.buyer === accountId) && !opens);
+  const why = !r ? 'Run the check first: taking over stays disabled until it says safe.'
+    : r.verdict === 'waiting' ? 'The handover has not opened yet: run the check again when it opens.'
+    : !r.safe ? 'The check did not say safe, so taking over stays disabled.'
+    : !accountId ? 'Connect a wallet to take over.'
+    : accountId === d.owner ? 'You own this vault.'
+    : r.sale?.buyer && r.sale.buyer !== accountId ? `Reserved for ${esc(r.sale.buyer)}.`
+    : opens ? 'The handover has not opened yet.'
+    : 'If the owner restarts the handover, this fails and your NEAR comes back.';
+  return `<div class="buy-panel">
+    <div class="row"><div class="label">Take over · handover #${esc(s.sale_id)}</div><span class="spacer"></span><span class="badge ${opens ? 'warn' : 'ok'}">${opens ? 'not open yet' : 'open'}</span></div>
+    <div class="buy-price">${price ?? 'No price'}</div>
+    <div class="faint" style="font-size:12px">${s.buyer ? `Only ${esc(s.buyer)} can take over` : 'Anyone can take over'} · ${opens ? `opens in ${inTime(s.opens_at_ms)}` : `closes in ${inTime(s.closes_at_ms)}`}</div>
+    ${price ? `<div class="label" style="margin-top:12px">In this one transaction</div>
+    <ul class="buy-steps">
+      <li>The vault NFT, and with it the Ethereum account, moves to you.</li>
+      <li>The seller is paid ${price}; anything you attach above the price comes back.</li>
+      <li>The previous owner's rules, pending rule change and spending limits are removed: the vault signs nothing until you set your own rules.</li>
+      <li>Accounts the seller had approved to move the NFT lose that approval.</li>
+    </ul>
+    <button class="btn primary big buy-btn" data-action="buy" data-sale="${esc(s.sale_id)}" data-price="${esc(s.price)}" ${canBuy ? '' : 'disabled'}>Take over for ${price}</button>
+    <div class="faint" style="font-size:12px;margin-top:6px">${why}</div>`
+    : `<p class="muted" style="margin-top:10px">No on-chain price: the owner transfers the vault, and any payment is bound with memo <span class="mono">sale:${esc(s.sale_id)}</span>.</p>`}
+    <div class="buy-guard faint">During the window the vault pays nothing. ${d.policy.policy.guardian ? `Its guardian, ${esc(d.policy.policy.guardian)}, can stop the handover.` : 'This vault has no guardian, so only the owner can stop the handover.'}</div>
+  </div>`;
+}
+
 function auditSection(d: VaultData) {
-  return `<div class="card" id="audit"><header><h2>Check before you take over</h2><span class="spacer"></span><button class="btn" data-action="audit">Run the check</button></header>
-    <div class="body"><p class="muted">Runs in your browser, no wallet needed: no old payment the previous owner signed can still go through, nobody can still pull tokens from the vault, and the contract runs the published code.</p>
-    <div id="audit-out"></div></div></div>`;
+  const cmd = `cd scripts && npm ci\nnode sale-audit.mjs ${CONTRACT} ${d.id} --expect-code ${EXPECTED_CODE}`;
+  return `<div class="card" id="audit"><header><h2>Check before you take over</h2><span class="spacer"></span><button class="btn primary" data-action="audit">Run the check</button></header>
+    <div class="body"><div class="ho-grid">
+      <div><p class="muted" style="margin-top:0">Runs in your browser, no wallet needed. It answers one question: <b>after you pay, can the seller or anyone else still move this vault's money?</b></p>
+        <div id="audit-out">${AUDIT_GROUPS.map((x) => `<div class="agroup idle"><div class="agroup-head"><span class="pc">·</span><b>${x.title}</b><span class="spacer"></span><span class="badge">not run yet</span></div><div class="faint agroup-why">${x.why}</div></div>`).join('')}</div></div>
+      <div id="buy-panel-wrap">${buyPanel(d)}</div>
+    </div>
+    <div class="ho-foot">
+      <div class="ho-why"><b>Why this check exists.</b> <span class="muted">With an ordinary account, a seller can sign a payment before the sale and send it after you paid, or leave a token approval that drains the account later. Here the contract records every signature, so your browser can prove none is left. The waiting window also lets the guardian stop a handover started by someone who stole the owner's key.</span>
+        <a target="_blank" rel="noreferrer" href="${REPO}/blob/main/docs/THREAT_MODEL.md">Threat model ↗</a></div>
+      <div class="term"><div class="term-head"><span class="term-dots"><i></i><i></i><i></i></span><span>The same check from a terminal (Node 18+, read-only)</span><span class="spacer"></span><button class="btn small" data-action="copy-text" data-text="${esc(cmd)}">Copy</button></div><pre class="mono">${esc(cmd)}</pre></div>
+    </div></div></div>`;
 }
 
 function renderAudit(d: VaultData, r: AuditResult) {
   const out = document.getElementById('audit-out')!;
-  const icon = { pass: '✓', fail: '✕', warn: '!', info: 'i', incomplete: '?', waiting: '◷' } as const;
+  const icon: Record<string, string> = { pass: '✓', fail: '✕', warn: '!', info: 'i', incomplete: '?', waiting: '◷' };
+  const tone: Record<string, string> = { pass: 'ok', fail: 'bad', warn: 'warn', info: '', incomplete: 'warn', waiting: 'warn' };
   // Only a complete, passing audit allows a purchase (fail closed): an unanswered RPC or a handover
   // that has not opened yet is never shown as safe.
-  const canBuy = r.safe && r.sale?.price && accountId && accountId !== d.owner && (!r.sale.buyer || r.sale.buyer === accountId) && Date.now() >= r.sale.opens_at_ms;
   const head = {
     safe: [`Safe to take over (handover #${esc(r.sale?.sale_id)})`, 'Every check completed: no payment the previous owner signed can still go through, and no token permission is left.'],
     unsafe: ['Not safe yet', 'See the failed checks below.'],
     incomplete: ['Check incomplete: do not take over yet', 'A check could not be completed (a public RPC did not answer). Run it again; taking over stays disabled until every check completes.'],
     waiting: ['Not open yet', 'The handover has not opened. Run the check again when it opens; taking over is possible only then.'],
   }[r.verdict];
+  const f = r.facts;
+  const stats: Record<string, [string, string][]> = {
+    sale: r.sale ? [['Handover', `#${r.sale.sale_id}`], ['Closes', new Date(r.sale.closes_at_ms).toLocaleString()]] : [],
+    nonces: [['Signed by the contract', String(f.contractNonce)], ['Used on Ethereum', f.accountNonce === undefined ? '—' : String(f.accountNonce)], ['Read at block', f.block === undefined ? '—' : String(f.block)]],
+    approvals: [['Approvals found', String(f.approvalsFound ?? '—')], ['Tokens scanned', String(f.tokensScanned ?? '—')]],
+    code: [['Code sha256', short(r.codeHex, 8, 6)], ['Access keys', String(f.accessKeys ?? '—')]],
+  };
+  const groupState = (cs: AuditResult['checks']) =>
+    cs.some((c) => c.state === 'fail') ? 'fail' : cs.some((c) => c.state === 'incomplete') ? 'incomplete' : cs.some((c) => c.state === 'waiting') ? 'waiting' : cs.some((c) => c.state === 'warn') ? 'warn' : cs.length ? 'pass' : 'info';
+  const label: Record<string, string> = { pass: 'passed', fail: 'failed', incomplete: 'not complete', waiting: 'waiting', warn: 'check', info: 'nothing to check' };
+  const funds = r.checks.filter((c) => c.group === 'funds');
   out.innerHTML = `
-    <div class="verdict ${r.safe ? 'ok' : 'bad'}"><div class="big">${head[0]}</div>
-      <div class="muted">${head[1]}</div></div>
-    ${r.checks.map((c) => `<div class="check ${c.state === 'incomplete' || c.state === 'waiting' ? 'warn' : c.state}"><div class="icon">${icon[c.state]}</div><div><div>${esc(c.title)}</div>${c.detail ? `<div class="detail">${esc(c.detail)}</div>` : ''}</div></div>`).join('')}
-    ${r.safe && r.sale?.price ? `<div class="row" style="margin-top:14px">
-      <button class="btn primary" data-action="buy" data-sale="${esc(r.sale.sale_id)}" data-price="${esc(r.sale.price)}" ${canBuy ? '' : 'disabled'}>Take over for ${yoctoToNear(r.sale.price)} NEAR (handover #${esc(r.sale.sale_id)})</button>
-      <span class="faint">${!accountId ? 'Connect a wallet to take over.' : accountId === d.owner ? 'You own this vault.' : r.sale.buyer && r.sale.buyer !== accountId ? `Reserved for ${esc(r.sale.buyer)}.` : Date.now() < r.sale.opens_at_ms ? 'The handover has not opened yet.' : 'If the owner restarts the handover, this fails and your NEAR comes back.'}</span></div>`
-      : r.safe ? `<p class="muted">No on-chain price: pay only through a transfer bound with memo <span class="mono">sale:${esc(r.sale.sale_id)}</span>.</p>` : ''}`;
+    <div class="verdict ${r.safe ? 'ok' : 'bad'}"><div class="big">${r.safe ? '✓ ' : ''}${head[0]}</div><div class="muted">${head[1]}</div></div>
+    ${AUDIT_GROUPS.map((x) => {
+      const cs = r.checks.filter((c) => (c.group ?? 'sale') === x.g);
+      const st = groupState(cs);
+      return `<div class="agroup ${tone[st]}"><div class="agroup-head"><span class="pc ${tone[st]}">${icon[st]}</span><b>${x.title}</b><span class="spacer"></span><span class="badge ${tone[st]}">${label[st]}</span></div>
+        ${stats[x.g]?.length ? `<div class="astats">${stats[x.g].map(([k, v]) => `<div><span>${k}</span><b class="mono">${esc(v)}</b></div>`).join('')}</div>` : ''}
+        ${cs.map((c) => `<div class="check ${c.state === 'incomplete' || c.state === 'waiting' ? 'warn' : c.state}"><div class="icon">${icon[c.state]}</div><div><div>${esc(c.title)}</div>${c.detail ? `<div class="detail">${esc(c.detail)}</div>` : ''}</div></div>`).join('')}</div>`;
+    }).join('')}
+    ${funds.map((c) => `<p class="faint" style="font-size:12px;margin:8px 0 0">${esc(c.title)}. ${esc(c.detail ?? '')}</p>`).join('')}`;
+  const wrap = document.getElementById('buy-panel-wrap');
+  if (wrap) wrap.innerHTML = buyPanel(d, r);
 }
 
 // M30: what a rule change does, and when it applies (the contract's own rule, see rules.ts).
@@ -1363,6 +1432,9 @@ app.addEventListener('click', async (e) => {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       return;
     }
+    case 'copy-text':
+      await navigator.clipboard.writeText(el.dataset.text ?? '').catch(() => {});
+      return toast('Copied', 'ok');
     case 'copy':
       await navigator.clipboard.writeText(el.dataset.text ?? '').catch(() => {});
       return toast('Address copied', 'ok');

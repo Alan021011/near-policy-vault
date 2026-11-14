@@ -194,3 +194,12 @@ test('the vault never signed, but its address has sent a transaction: incomplete
   const r = await run({ next: 0, mined: 1 });
   assert.equal(r.verdict, 'incomplete');
 });
+
+test('every check has a group and the numbers behind them are returned (display only)', async () => {
+  const r = await run();
+  assert.ok(r.checks.every((c) => c.group), JSON.stringify(r.checks.filter((c) => !c.group)));
+  assert.deepEqual([...new Set(r.checks.map((c) => c.group))].sort(), ['approvals', 'code', 'funds', 'nonces', 'sale']);
+  assert.equal(r.facts.contractNonce, r.facts.accountNonce);
+  assert.equal(r.facts.accessKeys, 0);
+  assert.equal(typeof r.facts.block, 'number');
+});
