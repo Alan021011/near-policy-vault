@@ -26,7 +26,7 @@ The model resisted the injection but still approved an unknown supplier and a du
 
 The 60-second waiting time is for the demo, so a judge can watch it end to end. With a person as guardian, use hours, not seconds: the veto only works within the waiting time, and alerts only reach the guardian while the watcher runs.
 
-**Why an agent, if a human can veto?** The agent does the routine work: it reads invoices and pays the normal ones without anyone signing. The contract puts a hard ceiling on the worst case (a daily limit and approved recipients, whatever the agent decides), and the guardian only looks at what is unusual during the waiting time. Without the guardian, a fooled agent can still lose at most one day's limit, and only to approved addresses.
+**Why an agent, if a human can veto?** The agent does the routine work: it reads invoices and pays the normal ones without a person having to sign. The contract puts a hard ceiling on the worst case (a daily limit and approved recipients, whatever the agent decides), and the guardian only looks at what is unusual during the waiting time. Without the guardian, a fooled agent can still lose at most one day's limit, and only to approved addresses.
 
 ## Judges, start here (no wallet needed)
 
